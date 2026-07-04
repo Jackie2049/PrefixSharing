@@ -811,113 +811,7 @@ prefix_grouper:
 
 避免静默 fallback 掩盖问题。
 
-### 2.10 精度验证方案
-
-必须先做精度，再做性能。
-
-最小精度矩阵：
-
-| 场景 | 检查项 |
-|------|--------|
-| prompt-only PrefixGrouper | 不回退现有行为 |
-| arbitrary-prefix 单卡 | logprob / loss / grad 对齐 |
-| arbitrary-prefix FSDP | logprob / loss / grad 对齐 |
-| prefix-last restore | response first token logprob 对齐 |
-| 无共享 prefix | fallback 与 baseline 一致 |
-
-具体指标至少包括：
-
-- `log_probs` 与 baseline 对齐；
-- `entropy` 与 baseline 对齐；
-- `logits` 与 baseline 对齐，尤其是 provider prefix、reuser restored prefix、suffix-first 相关位置；
-- attention output 与 baseline 对齐，用于定位 attention 层内 KV injection / mask / position_ids 问题；
-- policy loss 对齐；
-- 关键参数 gradient 对齐；
-- provider prefix 相关参数梯度非空且与 baseline 对齐；
-- padding 位置不参与 loss。
-
-精度诊断应参考 `prefix-sharing/prefix_sharing/tools/` 下已有工具思路：先保存 baseline 与 prefix-sharing 的中间张量，再按 layer / token / row 定位差异。FSDP 首版不要求复用 Megatron 诊断工具代码，但应保持同等粒度的对齐能力。
-
-建议测试数据：
-
-```text
-prompt-only:
-  p + r1
-  p + r2
-
-arbitrary-prefix:
-  A B C D E
-  A B C X Y
-  A B Q R
-  Z Z Z
-
-nested prefix:
-  A B C D
-  A B C X
-  A B Y
-```
-
-首版 arbitrary-prefix 必须保留 PrefixSharing plan 的 provider/reuser 语义；测试需要覆盖不同 prefix_len、同一 provider 多 reuser、链式复用等场景。
-
-### 2.11 性能验证方案
-
-性能 benchmark 必须和 PrefixGrouper 对齐，而不是只和 baseline 对齐。
-
-对比三组：
-
-1. baseline FSDP；
-2. PrefixGrouper prompt-only；
-3. PrefixSharing arbitrary-prefix。
-
-指标：
-
-- old_log_prob time；
-- update_actor time；
-- full step time；
-- tokens/s；
-- peak memory；
-- prefix detection overhead；
-- KV store/load overhead；
-- restore overhead；
-- reused token ratio。
-
-数据分布：
-
-- GRPO `rollout.n > 1` same prompt；
-- step-mode synthetic；
-- tree-mode synthetic；
-- 不同 prefix length；
-- 不同 reuser fanout；
-- 不同 response length。
-
-验收标准建议：
-
-- prompt-only 场景不弱于现有 PrefixGrouper；
-- arbitrary-prefix 在 step/tree synthetic 上相对 prompt-only 有额外收益；
-- 当没有足够共享 prefix 时，fallback 或收益模型不应显著拖慢。
-
-### 2.12 首版验收边界
-
-FSDP 首版完成的判定标准如下。后续开发排期可以直接按这些条目拆任务。
-
-必须完成：
-
-1. `mode=prompt_only` 行为不变，现有 PrefixGrouper 示例和测试不回退。
-2. `mode=arbitrary_prefix` 能在单卡 HF causal LM 上完成 PrefixSharing runtime forward、logprob 计算和 backward。
-3. arbitrary-prefix 的 restored prefix logp / entropy / logits / attention output 与 baseline 对齐，覆盖 interior prefix restore 和 prefix-last restore。
-4. arbitrary-prefix 的 loss 与关键参数 gradient 和 baseline 对齐，且 prefix 相关梯度没有被 detach。
-5. FSDP actor `compute_log_prob` 和 `update_actor` 至少在小模型上跑通。
-6. 不支持场景有明确 guard 或 fallback，不允许静默产生错位输出。
-7. 形成 baseline / PrefixGrouper prompt-only / PrefixSharing arbitrary-prefix 三方性能数据。
-
-首版明确不做：
-
-1. Megatron / MindSpeed / NPU 路径合入 verl 社区主 PR。
-2. CP、PP、TP/SP packed THD 适配。
-3. Ulysses SP、ring attention、remove padding、fused kernels。
-4. 跨 DP rank 的 prefix hash balancing。
-
-### 2.13 风险与缓解
+### 2.10 风险与缓解
 
 1. 上游 PrefixGrouper 执行入口不完整。
    - 缓解：原型先接 `FSDPEngineWithLMHead.forward_step()`；RFC 中把 shared-prefix FSDP hook 作为明确诉求。
@@ -1017,38 +911,161 @@ New mode:
 5. benchmark/examples；
 6. 后续再讨论 Megatron backend。
 
-### 3.7 建议测试清单
+## Chapter 4：测试验证
 
-PrefixSharing 包内测试：
+测试验证分为四类：集成验证、功能验证、精度验证、性能验证。四类验证的目标不同，不能互相替代：集成验证证明能接入 verl，功能验证证明 FSDP 路径语义完整，精度验证证明不改变训练语义，性能验证证明该特性有实际收益。
+
+### 4.1 集成验证
+
+目标：验证 PrefixSharing 能否以社区可接受的方式集成到 verl FSDP 路径中，并且不破坏现有 PrefixGrouper prompt-only 行为。
+
+验证内容：
+
+1. `use_prefix_grouper=true + prefix_grouper.mode=prompt_only` 保持现有 PrefixGrouper 行为。
+2. `use_prefix_grouper=true + prefix_grouper.mode=arbitrary_prefix` 能正确导入 `prefix_sharing` 包并进入 PrefixSharing FSDP adapter。
+3. FSDP 主路径优先通过 `prefix_grouper_utils.py` 或现有 PrefixGrouper 调用入口接入；若该入口不完整，再通过 monkey patch 补齐 shared-prefix FSDP hook。
+4. 独立 attention patch 能正确安装、回滚，并且只在 PrefixSharing runtime context 存在时进入 prefix-sharing 路径。
+5. 缺少 `verl`、`prefix_grouper`、`prefix_sharing` 或不支持配置时，错误信息清晰；`strict=false` 时可 fallback 原始 FSDP forward。
+6. `compute_log_prob` 和 `update_actor` 两条 actor/ref 路径都能走通。
+
+建议测试：
+
+```text
+prefix-sharing/tests/integrated_test/test_verl_fsdp_integration.py
+prefix-sharing/tests/integrated_test/test_patch_integrations.py
+```
+
+本地 CPU 阶段先验证导入、patch handle、fallback 和 helper contract；真实 verl FSDP 小模型 smoke test 需要在 GPU 环境执行。
+
+### 4.2 功能验证
+
+目标：验证 PrefixSharing arbitrary-prefix 能在 FSDP 路径下完成核心功能，而不是只复用 PrefixGrouper 的 prompt-only group 能力。
+
+验证内容：
+
+1. 从 verl FSDP micro-batch 恢复有效 token 序列。
+2. `PrefixSharingPlanner` 能生成 provider/reuser 关系，不依赖 `uid`、`group_info` 或用户显式标记。
+3. `build_prefix_sharing_micro_batch_fsdp()` 返回 `(trimmed_micro_batch, PrefixSharingRuntimeState | None)`，与 Megatron 路线保持一致。
+4. reuser 的 Q path 输入、labels、loss_mask 按 `PrefixSharingPlan.input_keep_ranges` 裁剪。
+5. `position_ids` 按 `q_position_offsets` 保持原始绝对位置。
+6. attention runtime 执行 provider KV store、reuser KV load、expanded KV 拼接和 suffix Q attention。
+7. restore 同时覆盖 interior prefix 和 prefix-last。
+8. 无共享 prefix 时返回原始 batch 并 fallback。
+
+建议测试：
 
 ```text
 prefix-sharing/tests/unit_test/test_verl_fsdp_runtime_plan.py
-prefix-sharing/tests/unit_test/test_verl_fsdp_logprob.py
-prefix-sharing/tests/integrated_test/test_verl_fsdp_adapter.py
+prefix-sharing/tests/unit_test/test_verl_fsdp_adapter.py
+prefix-sharing/tests/unit_test/test_verl_fsdp_restore.py
 ```
 
 关键用例：
 
 1. 两条样本共享任意 prefix，生成 PrefixSharingPlan provider/reuser 关系。
 2. 多个 reuser 有不同 prefix_len 和不同 suffix_len。
-3. batch 中无可共享 prefix 时返回 `None` 并 fallback。
-4. response first token logprob 与 baseline 对齐。
-5. provider prefix 相关参数梯度与 baseline 对齐。
+3. 同一个 provider 服务多个 reuser。
+4. reuser 继续成为后续 provider，覆盖链式复用。
+5. batch 中无可共享 prefix 时返回 `None` 并 fallback。
 6. `strict=true` 下不支持 remove padding / Ulysses SP / ring attention 时抛错。
 7. `strict=false` 下不支持场景 fallback，输出与 baseline 对齐。
 
-verl 集成测试：
+### 4.3 精度验证
 
-1. `mode=prompt_only` 保持现有 PrefixGrouper 行为。
-2. `mode=arbitrary_prefix` 在 FSDP compute_log_prob 路径跑通。
-3. `mode=arbitrary_prefix` 在 FSDP update_actor 路径跑通。
-4. 小模型单进程和多进程 FSDP 都能通过 logprob/loss smoke test。
+目标：验证 PrefixSharing FSDP 不改变 RL 训练语义。精度验证必须参考 `prefix-sharing/prefix_sharing/tools/` 之前在 Megatron 路线上的单卡和多卡精度诊断方式，保留按 layer / row / token 定位差异的能力。
 
-建议本地命令按实际仓库测试框架调整，最低要求是先跑 PrefixSharing 包内单测，再跑 verl FSDP 小模型 smoke test。
+最小精度矩阵：
 
-## Chapter 4：当前决策结论
+| 场景 | 检查项 |
+|------|--------|
+| prompt-only PrefixGrouper | 不回退现有行为 |
+| arbitrary-prefix 单卡 | logp / entropy / logits / attention output / loss / grad 对齐 |
+| arbitrary-prefix FSDP 单机 | logp / entropy / logits / attention output / loss / grad 对齐 |
+| interior prefix restore | provider 到 reuser 的 prefix 内部位置复制正确 |
+| prefix-last restore | response first token logp 基于 provider logits + reuser label 重算正确 |
+| 无共享 prefix | fallback 与 baseline 一致 |
 
-### 4.1 已明确结论
+具体指标至少包括：
+
+- `log_probs` 与 baseline 对齐；
+- `entropy` 与 baseline 对齐；
+- `logits` 与 baseline 对齐，尤其是 provider prefix、reuser restored prefix、suffix-first 相关位置；
+- attention output 与 baseline 对齐，用于定位 attention 层内 KV injection / mask / position_ids 问题；
+- policy loss 对齐；
+- 关键参数 gradient 对齐；
+- provider prefix 相关参数梯度非空且与 baseline 对齐；
+- padding 位置不参与 loss。
+
+诊断方式：
+
+1. 保存 baseline forward 与 PrefixSharing forward 的中间张量。
+2. 按 layer 对齐 attention output / logits / logp / entropy。
+3. 按 row 和 token 定位第一个不一致位置。
+4. 对 restore 结果单独 dump interior prefix 与 prefix-last。
+5. 单卡精度通过后，再做 FSDP 多卡精度对齐。
+
+建议测试数据：
+
+```text
+prompt-only:
+  p + r1
+  p + r2
+
+arbitrary-prefix:
+  A B C D E
+  A B C X Y
+  A B Q R
+  Z Z Z
+
+nested prefix:
+  A B C D
+  A B C X
+  A B Y
+```
+
+首版 arbitrary-prefix 必须保留 PrefixSharing plan 的 provider/reuser 语义；测试需要覆盖不同 prefix_len、同一 provider 多 reuser、链式复用等场景。
+
+### 4.4 性能验证
+
+目标：证明 PrefixSharing arbitrary-prefix 相比 baseline FSDP 有实际收益，并与 PrefixGrouper prompt-only 形成清晰对比。性能验证不能替代精度验证，必须在精度对齐通过之后进行。
+
+对比三组：
+
+1. baseline FSDP；
+2. PrefixGrouper prompt-only；
+3. PrefixSharing arbitrary-prefix。
+
+指标：
+
+- old_log_prob time；
+- update_actor time；
+- full step time；
+- tokens/s；
+- peak memory；
+- prefix detection overhead；
+- KV store/load overhead；
+- restore overhead；
+- reused token ratio。
+
+数据分布：
+
+- GRPO `rollout.n > 1` same prompt；
+- step-mode synthetic；
+- tree-mode synthetic；
+- 不同 prefix length；
+- 不同 reuser fanout；
+- 不同 response length。
+
+验收标准建议：
+
+- prompt-only 场景不弱于现有 PrefixGrouper；
+- arbitrary-prefix 在 step/tree synthetic 上相对 prompt-only 有额外收益；
+- 当没有足够共享 prefix 时，fallback 或收益模型不应显著拖慢；
+- 最终 RFC/PR 应给出 baseline / PrefixGrouper / PrefixSharing 三方性能表格。
+
+## Chapter 5：当前决策结论
+
+### 5.1 已明确结论
 
 1. FSDP 首版配置应写 FSDP，不应写 transformers backend。
 2. PrefixGrouper 和 PrefixSharing 都应保持独立 Python 包形态。
@@ -1060,7 +1077,7 @@ verl 集成测试：
 8. Restore 在 FSDP 路径中必须同时覆盖 interior prefix 和 prefix-last；prefix-last 由 `PrefixSharingPlan.prefix_last_restore` 驱动，不能直接用 PrefixGrouper `include_prefix_last` 替代。
 9. FSDP 首版不支持 Megatron、CP、PP、Ulysses SP、ring attention、fused kernels、remove padding。
 
-### 4.2 仍需实测确认
+### 5.2 仍需实测确认
 
 1. 当前 verl 主仓 PrefixGrouper 完整执行入口是否已经闭环；
 2. `use_dynamic_bsz=True` 与 PrefixGrouper 文档限制的矛盾；
@@ -1069,7 +1086,7 @@ verl 集成测试：
 5. FSDP 下 attention_mask / position_ids / padding 与裁剪输入的兼容性；
 6. 社区更偏好的字段名是 `mode`、`algorithm` 还是 `strategy`。
 
-### 4.3 下一步最小行动
+### 5.3 下一步最小行动
 
 1. 写一个单卡 HF model 的 arbitrary-prefix PrefixSharing runtime forward 原型；
 2. 证明 PrefixSharing interior restore 与 prefix-last restore 下 logp / entropy / logits / attention output 对齐；
@@ -1080,7 +1097,7 @@ verl 集成测试：
 7. 基于上述结果起草 verl RFC。
 
 
-### 4.4 技术决策摘要
+### 5.4 技术决策摘要
 
 如果现在基于本文档做后续开发决策，建议选择以下路线：
 

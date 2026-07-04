@@ -11,6 +11,7 @@ from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreIntegration,
     prefix_sharing_enabled,
 )
+from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
 
 
 class Target:
@@ -77,6 +78,24 @@ def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
 
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = VerlMCoreIntegration(config=config)
+    with pytest.raises(IntegrationUnavailable, match="verl"):
+        integration.install(model_config={})
+
+
+def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
+    import importlib
+
+    _original_import = importlib.import_module
+
+    def _mock_import(name, package=None):
+        if name == "verl":
+            raise ModuleNotFoundError("No module named 'verl'")
+        return _original_import(name, package=package)
+
+    monkeypatch.setattr(importlib, "import_module", _mock_import)
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    integration = VerlFSDPIntegration(config=config)
     with pytest.raises(IntegrationUnavailable, match="verl"):
         integration.install(model_config={})
 

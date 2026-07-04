@@ -29,6 +29,11 @@ def test_enabled_config_accepts_phase_one_constraints():
     config.validate(ModelConfig())
 
 
+def test_enabled_config_accepts_verl_fsdp_integrate_mode():
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    config.validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
 @pytest.mark.parametrize("pp_size", [1, 2, 4, 8])
 def test_enabled_config_accepts_physical_pipeline_parallel_sizes(pp_size):
     config = PrefixSharingConfig(enable_prefix_sharing=True)
@@ -105,4 +110,4 @@ def test_enabled_config_rejects_non_phase_one_modes():
     with pytest.raises(PrefixSharingConfigError, match="boundary_strategy"):
         PrefixSharingConfig(enable_prefix_sharing=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="integrate_mode"):
-        PrefixSharingConfig(enable_prefix_sharing=True).validate(ModelConfig(), integrate_mode="verl_fsdp")
+        PrefixSharingConfig(enable_prefix_sharing=True).validate(ModelConfig(), integrate_mode="unknown")

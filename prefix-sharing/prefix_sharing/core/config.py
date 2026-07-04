@@ -132,10 +132,22 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
         active_mode = integrate_mode or self.integrate_mode
-        if active_mode != "verl_megatron_actor":
+        supported_integrate_modes = {"verl_megatron_actor", "verl_fsdp"}
+        if active_mode not in supported_integrate_modes:
             raise PrefixSharingConfigError(
-                "phase 1 supports only integrate_mode='verl_megatron_actor'"
+                "phase 1 supports only integrate_mode in "
+                f"{sorted(supported_integrate_modes)}"
             )
+
+        model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
+        if self.model_type == "text_only_causal_lm" and model_type != "text_only_causal_lm":
+            raise PrefixSharingConfigError(
+                f"[Config Error] 当前模型类型 '{model_type}' 不支持当前阶段。"
+                f"Phase 1 仅支持 model_type='text_only_causal_lm' (纯文本因果语言模型)，"
+                f"请使用支持的模型类型或禁用 prefix sharing。"
+            )
+        if active_mode == "verl_fsdp":
+            return
 
         pp_size = _read_config_value(
             model_config,
@@ -155,7 +167,6 @@ class PrefixSharingConfig:
         )
         rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
         fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
-        model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
 
         if int(pp_size) < 1:
             raise PrefixSharingConfigError(
@@ -192,12 +203,6 @@ class PrefixSharingConfig:
                 "[Config Error] fused_single_qkv_rope=True 不支持当前阶段。"
                 "Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
                 "请修改配置或禁用 prefix sharing。"
-            )
-        if self.model_type == "text_only_causal_lm" and model_type != "text_only_causal_lm":
-            raise PrefixSharingConfigError(
-                f"[Config Error] 当前模型类型 '{model_type}' 不支持当前阶段。"
-                f"Phase 1 仅支持 model_type='text_only_causal_lm' (纯文本因果语言模型)，"
-                f"请使用支持的模型类型或禁用 prefix sharing。"
             )
 
     def validate_for_engine(

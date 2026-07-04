@@ -19,6 +19,12 @@ from prefix_sharing.integrations.verl_mcore import (
     restore_reuser_prefix_columns_2d,
     read_ps_config_from_engine_config,
 )
+from prefix_sharing.integrations.verl_fsdp import (
+    PrefixSharingFSDPAttentionRuntime,
+    VerlFSDPIntegration,
+    build_prefix_sharing_micro_batch_fsdp,
+    restore_prefix_sharing_outputs_2d,
+)
 from prefix_sharing.integrations.megatron_runtime import (
     prefix_attention,
 )
@@ -42,4 +48,8 @@ __all__ = [
     "read_ps_config_from_engine_config",
     "prefix_attention",
     "get_megatron_parallel_info",
+    "PrefixSharingFSDPAttentionRuntime",
+    "VerlFSDPIntegration",
+    "build_prefix_sharing_micro_batch_fsdp",
+    "restore_prefix_sharing_outputs_2d",
 ]
