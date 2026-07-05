@@ -967,7 +967,7 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_restore.py
 3. 同一个 provider 服务多个 reuser。
 4. reuser 继续成为后续 provider，覆盖链式复用。
 5. batch 中无可共享 prefix 时返回 `None` 并 fallback。
-6. `strict=true` 下不支持 remove padding / Ulysses SP / ring attention 时抛错。
+6. `strict=true` 下不支持 Ulysses SP / ring attention / fused kernels 时抛错。
 7. `strict=false` 下不支持场景 fallback，输出与 baseline 对齐。
 
 ### 4.3 精度验证
@@ -1065,15 +1065,16 @@ nested prefix:
 
 ### 4.5 测试报告
 
-> **测试范围声明（重要）**：本报告所有测试均为 **CPU 合成张量单测**，没有运行任何真实模型或端到端训练。具体来说：
+> **测试范围声明（重要）**：本报告区分两个 ready 边界：
 >
-> - Ch4.2 功能测试用 2-6 个 token 的小 batch 验证 planner / trim / restore 的逻辑正确性，不是真实数据；
-> - Ch4.3 精度测试用手工构造的随机 Q/K/V 张量验证单层 attention 的数值对齐，不是真实模型某一层的输出；
-> - **未做**：真实 HF 模型（如 Qwen2.5-0.5B）多层 attention 累积的精度对齐、完整 forward 的 logp/loss/grad、KV store 跨层生命周期、verl FSDP `compute_log_prob` / `update_actor` 端到端训练验证。
+> - **ready for real-environment test**：代码层面已经具备 FSDP adapter、attention registry patch、显式 `verl080_fsdp` patch set、forward_step wrapper、dense / nested prepare、packed attention runtime 和 restore 链路，可以交给真实 verl / GPU 环境定位运行时问题。
+> - **ready for upstream merge**：仍未达到。真实 HF 小模型、真实 verl FSDP `compute_log_prob` / `update_actor`、多卡 FSDP 精度和性能 benchmark 还没有完成。
 >
-> 当前 FSDP 分支没有 verl 侧 patch set（见 4.5.2 Ch4.1），helper 函数未接入任何执行路径，因此**物理上无法运行端到端训练**。要覆盖端到端，需要先完成 Phase 3（FSDP patch set + engine 接入），或先做 Phase 2（单卡 HF 模型闭环，不依赖 verl）。本报告把这一缺口明确留给后续规划，**不假装已验证端到端语义**。
+> 当前分支达到第一个标准，但没有达到第二个标准。
 
-本小节记录对当前 `open-source_fsdp` 分支（commit `0b9a772`）按 Chapter 4 四类验证的实测结果，作为 Phase 1（TDD adapter）完成的证据，并标出尚未覆盖的缺口以驱动 Phase 2/3 排期。测试在两个环境交叉验证以消除单环境噪声：
+本小节记录对当前 `open-source_fsdp` 分支按 Chapter 4 四类验证的实测结果。早期报告曾记录 commit `0b9a772` 的 Phase 1 状态；后续已经补齐 FSDP patch set 和 forward_step wrapper，因此旧的“helper 未接入任何执行路径、不可安排外部端到端验收”结论已失效。当前应进入真实环境测试阶段，用 ClaudeCode / 4090 / verl 环境验证 runtime 兼容性。
+
+已验证环境：
 
 - 本地 macOS Darwin 25.4 / Python 3.9.6 / torch 2.8.0 / numpy 2.0.2（纯 CPU）；
 - 服务器 219.223.198.62 / Python 3.12 / `prefixsharing` conda env（含 verl 0.8.0.dev + megatron-core 0.16.1）。
@@ -1087,6 +1088,19 @@ nested prefix:
 
 服务器比本地多 25 个通过，是因为 `prefixsharing` env 装了 verl + megatron-core，部分 `integrated_test` 可运行。29 个 skip 全部为预期跳过：缺 GPU / NPU / `flash_attn` / `mindspeed`（CPU 阶段无法验证）。两环境均**零失败**。
 
+当前本地最新回归结果：
+
+```text
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefixsharing-fsdp-pycache python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/unit_test \
+  prefix-sharing/tests/integrated_test \
+  prefix-sharing/tests/system_test
+
+245 passed, 30 skipped
+```
+
+跳过项为本地缺少 `transformers`、`verl`、`torch_npu`、`flash_attn`、NPU / CUDA / MindSpeed 等 optional 环境。
+
 为支撑本报告，新增两份测试文件，可保留作为后续 PR 的一部分：
 
 ```text
@@ -1098,15 +1112,22 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 
 #### 4.5.2 Chapter 4 逐项结论
 
-**Ch4.1 集成验证 —— 部分达成，核心缺口未填。**
+**Ch4.1 集成验证 —— 代码链路已接入，真实环境待验证。**
 
-已通过：缺失依赖报错清晰（`VerlFSDPIntegration._ensure_verl_importable` 抛 `IntegrationUnavailable("verl")`，`test_verl_fsdp_integration_reports_missing_dependency_cleanly` 验证）。
+已通过：
 
-未达成（阻塞合入 verl）：
+1. 缺失依赖报错清晰（`VerlFSDPIntegration._ensure_verl_importable` 抛 `IntegrationUnavailable("verl")`）。
+2. `VerlFSDPIntegration.install()` 会 patch Transformers `ALL_ATTENTION_FUNCTIONS` registry，且支持 rollback。
+3. `prefix_sharing.setup.install("verl080_fsdp")` 可显式加载 FSDP patch set，避免混合 Megatron/MindSpeed 环境误选默认 patch set。
+4. `setup/patches/verl080_fsdp` 已包装 `FSDPEngineWithLMHead.forward_step`。
+5. fake FSDP engine 已覆盖 dense helper、真实 engine prepare-style nested 路径、disabled fallback 和 remove-padding 配置。
 
-1. **无 FSDP patch set**。`setup/patches/` 下只有 `verl080_mcore0161_ms0160`，没有任何 `*fsdp*` patch 目录。`PrefixSharingFSDPAttentionRuntime` 类已实现并要求 active context，但**没有安装到任何 attention 入口**，是孤岛 helper。
-2. **无 `prefix_grouper.mode` 配置分发**。文档 §2.1 设计的 `mode=prompt_only|arbitrary_prefix` 在代码中完全不存在。`PrefixSharingConfig` 只有 `integrate_mode`（`verl_megatron_actor` / `verl_fsdp`），不是用户面向的 mode 字段。
-3. **verl 侧 `FSDPEngineWithLMHead.forward_step` 无接入点**。Ch4.1 第 6 项要求的 `compute_log_prob` / `update_actor` 两条路径无法验证，需真实 verl FSDP 环境，Phase 3 未开始。
+真实环境待验证：
+
+1. `compute_log_prob` 和 `update_actor` 两条 actor/ref 路径是否都能完整进入 patched `forward_step`。
+2. 真实 verl FSDP 的 `prepare_model_inputs` / `prepare_model_outputs` 返回结构是否与 fake engine 完全一致。
+3. 真实 Transformers attention registry 的不同 attention 实现是否都能接收并传递 `prefix_sharing_runtime`。
+4. `prefix_grouper.mode=prompt_only|arbitrary_prefix` 的用户面配置分发尚未落地；当前真实环境测试应先用 `prefix_sharing_config` / `ENABLE_PREFIX_SHARING` 与显式 `install("verl080_fsdp")` 验证代码路径。
 
 **Ch4.2 功能验证 —— 全部通过。**
 
@@ -1142,7 +1163,7 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 
 精度测试构造 Q/K/V 时显式令前缀位置在各行 identical（模拟共享 token 产生的相同 hidden state），这是 PrefixSharing 复用成立的前提；若用完全随机的 Q/K/V，复用本身不成立（这是测试构造问题，不是代码 bug）。
 
-**未覆盖的精度项**（需真实模型，留待 Phase 2/3）：完整 HF/Transformers 模型端到端 forward 的 logp/loss/grad、多层 attention 累积（当前单层验证）、完整 verl FSDP actor/ref 路径。
+**未覆盖的精度项**（需真实模型，留待真实环境测试）：真实 HF/Transformers 模型端到端 forward 的 logp/loss/grad、多层 attention 累积、完整 verl FSDP actor/ref 路径。
 
 **Ch4.4 性能验证 —— 未执行。** 文档明确要求"在精度对齐通过之后进行"。当前精度核心已通过，但性能 benchmark 需 GPU 环境做 baseline / PrefixGrouper / PrefixSharing 三方对比，属 Phase 5 待办。
 
@@ -1151,25 +1172,25 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 | Phase | 目标 | 当前状态 |
 |-------|------|----------|
 | Phase 0 | 源码确认与测试设计 | ✅ 完成（本文档） |
-| Phase 1 | TDD 实现 FSDP adapter | ✅ 完成（`verl_fsdp.py` + 4 自带单测 + 本报告新增 18 测试） |
-| Phase 2 | 单卡 Transformers 闭环 | ⚠️ 部分（attention runtime 单层精度通过；完整 HF 模型未验证） |
-| Phase 3 | FSDP 闭环（compute_log_prob / update_actor） | ❌ 未开始 |
+| Phase 1 | TDD 实现 FSDP adapter | ✅ 完成（`verl_fsdp.py` + adapter / function / precision 测试） |
+| Phase 2 | 单卡 Transformers 闭环 | ⚠️ 代码 ready for test（fake HF-style dense model 与 fake native FSDP nested 闭环通过；真实 Transformers 小模型待测） |
+| Phase 3 | FSDP 闭环（compute_log_prob / update_actor） | ⚠️ 代码 ready for test（attention registry patch、dense/nested prepare、packed attention runtime、显式 `verl080_fsdp` patch set 与 `FSDPEngineWithLMHead.forward_step` wrapper 已实现；真实 verl FSDP smoke 待测） |
 | Phase 4 | 性能 benchmark | ❌ 未开始 |
 | Phase 5 | RFC 与 PR 拆分 | ❌ 未开始 |
 
 #### 4.5.4 发现的问题与建议
 
-**阻塞合入 verl 的三个缺口**（必须在 Phase 3 解决）：
+**阻塞合入 verl 的三个缺口**（不阻塞交给真实环境测试，但阻塞上游合入）：
 
-1. **无 FSDP patch set**。建议参照 `verl080_mcore0161_ms0160` 结构实现 `setup/patches/verl080_fsdp/`，patch `FSDPEngineWithLMHead.forward_step` 和 HF/Transformers attention 入口。
+1. **FSDP engine patch set 仍需真实环境 smoke**。当前已有 HF/Transformers attention registry patch、`forward_prefix_sharing_fsdp_micro_batch()` helper，以及显式 `prefix_sharing.setup.install("verl080_fsdp")` patch set；该 patch set 会包装 `FSDPEngineWithLMHead.forward_step`，在真实 engine 上复用 `prepare_model_inputs/prepare_model_outputs`，并在 fake engine 上走 dense helper。但还没有在真实 verl FSDP 环境验证 `compute_log_prob` / `update_actor` 是否能完整走通。
 2. **无 `prefix_grouper.mode` 配置分发**。建议二选一：要么在 `PrefixSharingConfig` 或 verl 侧 actor config 真正落地 mode 字段，要么修订文档明确首版直接用 `integrate_mode=verl_fsdp` 触发，移除 mode 设计避免文档与实现脱节。
-3. **无 verl FSDP smoke test**。建议在 GPU 环境增加 `test_verl_fsdp_e2e.py`，验证 `compute_log_prob` / `update_actor` 走通，可参照主仓已跑通的 megatron colocate 流程。
+3. **无真实 verl FSDP smoke test 结果**。建议在 GPU 环境增加 `test_verl_fsdp_e2e.py`，验证 `compute_log_prob` / `update_actor` 走通，可参照主仓已跑通的 megatron colocate 流程。
 
 **代码质量观察**（非阻塞，但需明确语义）：
 
-4. **`build_prefix_sharing_micro_batch_fsdp` 未物理裁剪 `input_ids` 和 `position_ids`**，只更新了 `attention_mask` 和 `loss_mask`。这与 Megatron 路径（`_trim_plain_batch_thd`）不一致，后者物理裁剪 input_ids。当前测试用 mask-only 语义通过，但真实 HF model forward 会读完整 `input_ids`（包括被 mask 掉的 prefix 位置），reuser 前缀位置的 KV 仍会被计算，可能与 Q-path 裁剪意图冲突。**建议明确 FSDP adapter 是 "mask-only 裁剪" 还是 "物理裁剪"，并在文档与实现中统一**。
+4. **`build_prefix_sharing_micro_batch_fsdp` 同时支持 dense mask-only 和 nested 物理裁剪**。dense 2D 输入保持原 shape，仅通过 mask 和 attention runtime 打包 kept QKV；jagged NestedTensor / remove-padding 输入会物理裁剪 reuser prefix，并保留原始 position ids 构建 packed layout。当前本地测试已覆盖 nested prepare 和 packed `[1, T, H, D]` attention runtime，但真实 verl `prepare_model_outputs` 后的 nested restore 仍需 smoke 验证。
 
-5. **`PrefixSharingFSDPAttentionRuntime.forward` 要求 dense `[B,L,H,D]` 且 Q/K/V shape 完全相同**，不支持 packed (THD) 输入。文档已声明 FSDP 首版不支持 remove_padding，与此一致，可接受。
+5. **`PrefixSharingFSDPAttentionRuntime.forward` 当前支持 dense `[B,L,H,D]` 和 packed single-batch `[1,T,H,D]` 输入**。dense 路径要求 Q/K/V batch/seq 维一致；packed 路径允许 GQA 下 Q/KV head 数不同。真实 HF attention 若传入其它布局，应在 smoke 阶段定位并补 adapter。
 
 **测试覆盖建议**（本报告未覆盖，留作后续）：
 
@@ -1178,7 +1199,137 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 
 #### 4.5.5 结论
 
-当前分支定位为 **Phase 1 完成的 FSDP adapter 骨架**：核心算法语义（plan、trim、restore、KV injection）在 CPU 单测层验证正确，精度不变量成立（reuser suffix attention 与 baseline 数值一致、梯度不 detach、restore 正确覆盖 interior + prefix-last）。但 **不可直接合入 verl**：缺少 verl 侧 FSDP engine 接入（Phase 3），helper 函数目前是"孤岛"。下一步应按 §5.3 的行动清单推进 Phase 2（完整 HF 模型精度闭环）和 Phase 3（FSDP engine 接入 + smoke test）。
+当前分支已经从 **Phase 1 FSDP adapter 骨架** 推进到 **ready for real-environment test**：核心算法语义（plan、trim、restore、KV injection）在 CPU 单测层验证正确，fake HF-style dense model 闭环可贯通 forward / restore / logp / entropy / attention output / grad，fake native FSDP engine 可贯通 prepare_model_inputs / prepare_model_outputs / nested restore，nested/remove-padding prepare 和 packed attention runtime 已有本地测试，HF/Transformers attention registry patch 可安装和回滚，显式 `verl080_fsdp` patch set 已能包装 `FSDPEngineWithLMHead.forward_step`。
+
+因此可以交给 ClaudeCode / 4090 / 真实 verl FSDP 环境做下一阶段测试。需要强调的是，这不是“已可合入 verl”的结论，而是“代码已具备真实环境测试条件”的结论；真实 Transformers 小模型、真实 verl FSDP `compute_log_prob` / `update_actor` 和性能 benchmark 仍需测试驱动定位。
+
+#### 4.5.6 后续收口修正记录
+
+在本报告之后，针对“adapter helper 未接入执行路径”的问题，已补充以下代码与测试：
+
+1. `forward_prefix_sharing_fsdp_micro_batch()`：提供 prepare → runtime context → model forward → logits/logprob/entropy → restore 的 dense FSDP helper。
+2. `VerlFSDPIntegration.install()`：不再返回空 patch handle，改为安装 HF/Transformers `ALL_ATTENTION_FUNCTIONS` registry wrapper；本地缺 `transformers` 时测试会 skip，服务器环境应执行安装/回滚验证。
+3. `PatchManager.patch_item()`：支持 dict registry patch 与 rollback。
+4. `prefix_sharing.setup.install("verl080_fsdp")`：新增显式 FSDP patch set，包装 `FSDPEngineWithLMHead.forward_step`，避免在同时安装 Megatron/MindSpeed 的环境中被默认兼容矩阵误选。
+5. fake HF-style dense model 闭环测试：验证 PrefixSharing 路径与 baseline 的 `logits`、`log_probs`、`entropy`、`attention_output` 对齐，并验证 reuser suffix loss 能反传到 provider prefix embedding，避免 KV restore / logits restore 破坏 autograd。
+6. fake native FSDP engine nested 闭环测试：验证 wrapper 复用 `prepare_model_inputs/prepare_model_outputs`，输出 jagged NestedTensor 经 restore 后恢复到原始 row lengths，且 loss 保留 autograd。
+
+新增本地回归结果：
+
+```text
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefixsharing-fsdp-pycache python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/unit_test \
+  prefix-sharing/tests/integrated_test \
+  prefix-sharing/tests/system_test
+
+245 passed, 30 skipped
+```
+
+跳过项为本地缺少 `transformers`、`verl`、`torch_npu`、`flash_attn`、NPU / CUDA / MindSpeed 等 optional 环境。
+
+### 4.6 真实环境测试指引
+
+本节用于交付 ClaudeCode / 4090 / 真实 verl FSDP 环境测试。目标不是一次性证明可合入，而是验证代码链路是否能在真实运行时闭环，并快速定位不兼容点。
+
+#### 4.6.1 安装与使能
+
+在真实 verl 0.8 FSDP 环境中，优先显式安装 FSDP patch set：
+
+```python
+import prefix_sharing.setup
+
+prefix_sharing.setup.install("verl080_fsdp")
+```
+
+不要依赖默认兼容矩阵自动选择 patch set，因为真实环境可能同时安装 Megatron / MindSpeed，默认探测容易误选 Megatron patch set。
+
+PrefixSharing 功能开关可以继续沿用当前内部配置：
+
+```yaml
+prefix_sharing_config:
+  enable_prefix_sharing: true
+```
+
+或使用环境变量：
+
+```bash
+export ENABLE_PREFIX_SHARING=1
+```
+
+当前 `prefix_grouper.mode=prompt_only|arbitrary_prefix` 还没有落地到用户面配置分发，所以真实环境测试先不要依赖该字段。
+
+#### 4.6.2 最小 smoke 流程
+
+建议按以下顺序测试：
+
+1. **导入与 patch 安装**
+   - 验证 `prefix_sharing.setup.install("verl080_fsdp")` 无异常；
+   - 验证日志中出现 FSDP patch set 安装信息；
+   - 验证 disabled 配置下仍走原始 FSDP forward。
+
+2. **单卡 FSDP compute_log_prob**
+   - 使用小模型、小 batch、短序列；
+   - 打开 `enable_prefix_sharing=true`；
+   - 构造至少两条有共享前缀的样本；
+   - 验证 `FSDPEngineWithLMHead.forward_step` 被 patch 后进入 PrefixSharing 路径；
+   - 检查输出包含 `log_probs`，shape 与原始 batch 对齐。
+
+3. **单卡 FSDP update_actor**
+   - 在训练态跑一次最小 actor update；
+   - 验证 loss 可反传；
+   - 检查 provider prefix 相关参数梯度非空；
+   - 对比关闭 PrefixSharing 时的 loss/logp 是否在可接受 tolerance 内。
+
+4. **remove-padding / jagged NestedTensor 路径**
+   - 若业务 FSDP 配置开启 remove padding，重点验证 `prepare_model_inputs` 输出的 packed shape；
+   - 检查 packed attention runtime 是否接收到 `[1, T, H, D]` 形态；
+   - 检查 `prepare_model_outputs` 后 restore 是否恢复到原始 row lengths。
+
+5. **不支持配置 guard**
+   - `ulysses_sequence_parallel_size > 1` 应显式报错；
+   - `use_fused_kernels=true` 应显式报错；
+   - 报错信息应说明当前 FSDP PrefixSharing 不支持该路径。
+
+#### 4.6.3 精度测试流程
+
+精度测试必须至少覆盖：
+
+1. baseline FSDP vs PrefixSharing FSDP 的 `log_probs`；
+2. `entropy`；
+3. `logits`；
+4. attention output；
+5. policy loss；
+6. embedding / attention projection 等关键参数梯度；
+7. provider prefix 梯度不被 detach；
+8. interior prefix restore 与 prefix-last restore 的单独 dump。
+
+建议先跑单卡小模型，再扩展到多卡 FSDP。若出现差异，按以下顺序定位：
+
+```text
+attention output -> logits -> log_probs/entropy -> restore -> loss -> grad
+```
+
+其中 prefix-last 位置必须特别检查：reuser 的第一个 suffix token logprob 应来自 provider prefix-last logits 与 reuser label 的重算，而不是简单拷贝 provider logprob。
+
+#### 4.6.4 性能测试流程
+
+性能测试必须在精度通过后进行。建议三方对比：
+
+1. baseline FSDP；
+2. PrefixGrouper prompt-only；
+3. PrefixSharing arbitrary-prefix。
+
+核心指标：
+
+- old_log_prob time；
+- update_actor time；
+- full step time；
+- tokens/s；
+- peak memory；
+- reused token ratio；
+- prefix detection / KV store-load / restore 开销。
+
+数据分布至少包含 prompt-only、step-mode synthetic、tree-mode synthetic。没有共享前缀或共享比例很低时，也要验证 PrefixSharing 不应显著拖慢 baseline。
 
 ## Chapter 5：当前决策结论
 
@@ -1192,7 +1343,7 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 6. 当前 core 暂不需要为 PrefixGrouper `group_info` 做适配；若 FSDP 发现通用语义缺口，再补 core。
 7. 不建议新增独立 `fsdp` 模块；优先新增 `integrations.verl_fsdp`。
 8. Restore 在 FSDP 路径中必须同时覆盖 interior prefix 和 prefix-last；prefix-last 由 `PrefixSharingPlan.prefix_last_restore` 驱动，不能直接用 PrefixGrouper `include_prefix_last` 替代。
-9. FSDP 首版不支持 Megatron、CP、PP、Ulysses SP、ring attention、fused kernels、remove padding。
+9. FSDP 首版不支持 Megatron、CP、PP、Ulysses SP、ring attention、fused kernels；remove-padding / jagged NestedTensor 已有代码路径和 fake engine 测试，但真实 verl 环境仍需 smoke。
 
 ### 5.2 仍需实测确认
 
@@ -1205,13 +1356,12 @@ prefix-sharing/tests/unit_test/test_verl_fsdp_ch4_precision.py    # 6 tests，�
 
 ### 5.3 下一步最小行动
 
-1. 写一个单卡 HF model 的 arbitrary-prefix PrefixSharing runtime forward 原型；
-2. 证明 PrefixSharing interior restore 与 prefix-last restore 下 logp / entropy / logits / attention output 对齐；
-3. 实现 `integrations.verl_fsdp` 的最小 batch adapter；
-4. 接入 verl FSDP `forward_step` 或现有 `prefix_grouper_utils.py`；
-5. 补 logprob / loss / grad 精度测试；
-6. 跑一个 Qwen small + synthetic step/tree benchmark；
-7. 基于上述结果起草 verl RFC。
+1. 用真实 Transformers 小模型（优先 Qwen2.5-0.5B 或更小 causal LM）完成单卡 forward 闭环，验证 `logits / log_probs / entropy / attention_output / loss / grad` 对齐。
+2. 在真实 verl 0.8 FSDP 环境验证 `FSDPEngineWithLMHead.forward_step` patch，覆盖 `compute_log_prob` 和 `update_actor` 两条路径。
+3. 落地 `prefix_grouper.mode=arbitrary_prefix` 或等价配置分发，保持 `prompt_only` 继续走 PrefixGrouper。
+4. 补真实 FSDP smoke test，至少证明 prefix-sharing path 被触发、fallback 可用、unsupported 配置报错清晰。
+5. 在 GPU 环境跑 Qwen small + synthetic step/tree benchmark，形成 baseline / PrefixGrouper / PrefixSharing 三方对比。
+6. 基于上述结果起草 verl RFC。
 
 
 ### 5.4 技术决策摘要

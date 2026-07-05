@@ -46,6 +46,22 @@ def test_patch_manager_context_manager_restores_original():
     assert target.method() == "original"
 
 
+def test_patch_manager_installs_and_disables_dict_item_patch():
+    registry = {"eager": lambda: "original"}
+    original = registry["eager"]
+    manager = PatchManager()
+
+    def replacement():
+        return "patched"
+
+    manager.patch_item(registry, "eager", replacement)
+    handle = manager.handle()
+    assert registry["eager"]() == "patched"
+
+    handle.disable()
+    assert registry["eager"] is original
+
+
 def test_megatron_integration_reports_missing_dependency_cleanly(monkeypatch):
     import importlib
 
@@ -98,6 +114,16 @@ def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
     integration = VerlFSDPIntegration(config=config)
     with pytest.raises(IntegrationUnavailable, match="verl"):
         integration.install(model_config={})
+
+
+def test_setup_can_load_explicit_verl080_fsdp_patch_set():
+    from prefix_sharing.setup import _load_patch_set
+
+    patch_set = _load_patch_set("verl080_fsdp")
+
+    assert len(patch_set) == 1
+    assert patch_set[0].module_name == "verl.workers.engine.fsdp.transformer_impl"
+    assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():

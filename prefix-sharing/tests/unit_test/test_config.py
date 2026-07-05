@@ -17,6 +17,9 @@ class ModelConfig:
     apply_rope_fusion: bool = False
     fused_single_qkv_rope: bool = False
     model_type: str = "text_only_causal_lm"
+    use_remove_padding: bool = False
+    ulysses_sequence_parallel_size: int = 1
+    use_fused_kernels: bool = False
 
 
 def test_disabled_config_does_not_validate_model_constraints():
@@ -32,6 +35,19 @@ def test_enabled_config_accepts_phase_one_constraints():
 def test_enabled_config_accepts_verl_fsdp_integrate_mode():
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     config.validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"ulysses_sequence_parallel_size": 2}, "ulysses_sequence_parallel_size=2"),
+        ({"use_fused_kernels": True}, "use_fused_kernels=True"),
+    ],
+)
+def test_verl_fsdp_config_rejects_unsupported_runtime_modes(kwargs, message):
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    with pytest.raises(PrefixSharingConfigError, match=message):
+        config.validate(ModelConfig(**kwargs), integrate_mode="verl_fsdp")
 
 
 @pytest.mark.parametrize("pp_size", [1, 2, 4, 8])

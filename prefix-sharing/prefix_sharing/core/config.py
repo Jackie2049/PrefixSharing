@@ -147,6 +147,18 @@ class PrefixSharingConfig:
                 f"请使用支持的模型类型或禁用 prefix sharing。"
             )
         if active_mode == "verl_fsdp":
+            ulysses_sp_size = _read_config_value(model_config, "ulysses_sequence_parallel_size", 1)
+            use_fused_kernels = _read_config_value(model_config, "use_fused_kernels", False)
+            if int(ulysses_sp_size) != 1:
+                raise PrefixSharingConfigError(
+                    f"[Config Error] verl_fsdp 当前不支持 ulysses_sequence_parallel_size={ulysses_sp_size}。"
+                    "请关闭 Ulysses SP 或等待专门适配。"
+                )
+            if use_fused_kernels:
+                raise PrefixSharingConfigError(
+                    "[Config Error] verl_fsdp 当前不支持 use_fused_kernels=True。"
+                    "请关闭 fused kernels 或等待专门适配。"
+                )
             return
 
         pp_size = _read_config_value(
