@@ -1285,6 +1285,41 @@ KV reuse 指标：全 24 层触发，`store_count=4`, `reuse_hit=3`, `matches_ex
 
 suffix 区域的 1.5% 差异**不是 bug**：fp32 下相同计算得到 5e-5 的机器精度。bf16 差异来自 FlashAttention 对 layout 变化的 reduction order sensitivity，且位置 4-6（prefix 边界附近）diff=0，位置 7-11（suffix 内部）约 1.5%。
 
+#### 2026.07.06周一14:30: FSDP 路径 cmp_diag_verl080 端到端精度对比
+
+**目标：** 将 `diagnostic_dump_verl080` 集成到 FSDP `forward_step` 路径（此前仅 Megatron 路径有），用 `cmp_diag_verl080.py` 做 PS-on/off 端到端精度对比。
+
+**代码改动：**
+- `prefix_sharing/setup/patches/verl080_fsdp/forward_step.py`：在 `_forward_step_with_engine_prepare`（ON 路径）和 disable early-return（OFF baseline 路径）集成 `PREFIX_SHARING_DIAG_DUMP` 触发的诊断 dump，覆盖元数据 / attention_mask / label_mask / 2D logprobs / 2D entropy。
+- 新增 `_dump_fsdp_baseline()`：OFF 路径专用，从 verl 原生 `forward_step` 返回的 `(loss, output_dict)` 提取 NestedTensor logprobs/entropy，用 `nested_to_2d_full` 展开到 `[B, L_max]`。
+
+**测试配置：** verldir + verl080 env + Qwen2.5-0.5B + GRPO no-critic + packed path + GC off，`data.shuffle=False` `data.seed=42` 固定 dataloader，两次 run 分别 `ENABLE_PREFIX_SHARING=0/1`。
+
+**结果：**
+
+| 指标 | PS-on | PS-off | 备注 |
+|------|-------|--------|------|
+| entropy | 1.3721 | 1.3401 | step-level，差异来自 rollout 随机性 |
+| KV reuse | 全 24 层 `store_count=4 reuse_hit=3 matches_expected=True` | — | PS 正常触发 |
+| prefix_lens | [0, 4, 17, 17] | [0,0,0,0] | seq0 provider，seq1 共享前4，seq2/3 共享前17 |
+
+**分区精度对比（关键结论）：**
+
+| 区域 | abs_mean | abs_max | 分析 |
+|------|----------|---------|------|
+| **prompt 区（pos 0-16，restore 区）** | **0.09** | **0.65** | ✅ **bf16 级对齐**，PS restore 正确（从 provider 拷贝 logp/entropy） |
+| response 区 seq2/seq3 | 0.03 | 0.22 | ✅ 两条恰好两次 run 采到相同 response → 整序列对齐到 bf16 级 |
+| response 区 seq0/seq1 | 2.33 | 12.31 | ❌ 两次 run 的 vLLM rollout 采到不同 response（非 PS bug） |
+
+**结论：**
+1. **PS restore 逻辑正确**：prompt 区（restore 区）的 logp/entropy 与 baseline 对齐到 bf16 级（abs_mean=0.09），这覆盖了 PrefixSharing 最关键的 interior prefix restore 和 prefix-last restore。
+2. **response 区差异完全来自 vLLM rollout 随机性**：vLLM V1 异步采样 + GPU 非确定性导致即使固定 seed，两次 run 的 response 也不同。seq2/seq3 恰好采到相同 response 时，整序列对齐到 bf16 级（abs_max=0.22），证明 PS suffix attention 也正确。
+3. **逐元素 ON-vs-OFF 对齐在真实随机 rollout 下不成立是预期内的**；要严格逐元素验证 suffix 区，需固定 rollout 输出（temperature=0 但会让 batch 退化）或用 synthetic 固定 batch（即之前 4.6.5/4.6.7 的 fp32 验证方式）。
+
+**诊断 dump 流程已打通：** `PREFIX_SHARING_DIAG_DUMP=<dir>` + `cmp_diag_verl080.py --dir-on --dir-off --tag train` 可正常采集和对比 FSDP 路径的 logprobs/entropy/masks/prefix_lens/cu_seqlens。FSDP 路径暂未 dump logits.pt / attn_outputs.pt（packed 对齐），留作后续。
+
+**日志：** `ps_off_seed.log`、`ps_on_seed.log`；**dump 目录：** `~/prefix-sharing/dump_off`、`~/prefix-sharing/dump_on`
+
 ## Chapter 5：当前决策结论
 
 ### 5.1 已明确结论

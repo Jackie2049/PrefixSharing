@@ -202,15 +202,28 @@ def _forward_step_with_engine_prepare(
         # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
         import os as _os_diag2
         if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
             from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
+                dump_logprobs_2d_verl080, dump_entropy_2d_verl080, nested_to_2d_full,
             )
             _lp_diag = model_output.get("log_probs")
-            if _lp_diag is not None and _lp_diag.dim() == 2:
-                dump_logprobs_2d_verl080(_lp_diag, "train")
-                _ent_diag = model_output.get("entropy")
-                if _ent_diag is not None and _ent_diag.dim() == 2:
-                    dump_entropy_2d_verl080(_ent_diag, "train")
+            if _lp_diag is not None:
+                if _is_nested_tensor(_lp_diag):
+                    _ol_diag = list(ps_state.prefix_sharing_plan.original_lengths)
+                    _Lmax_diag = max(_ol_diag) if _ol_diag else 0
+                    _lp_diag = nested_to_2d_full(_lp_diag, _ol_diag, _Lmax_diag)
+                if _lp_diag.dim() == 2:
+                    dump_logprobs_2d_verl080(_lp_diag, "train")
+                    _ent_diag = model_output.get("entropy")
+                    if _ent_diag is not None:
+                        if _is_nested_tensor(_ent_diag):
+                            _ent_diag = nested_to_2d_full(
+                                _ent_diag,
+                                list(ps_state.prefix_sharing_plan.original_lengths),
+                                max(ps_state.prefix_sharing_plan.original_lengths) if ps_state.prefix_sharing_plan.original_lengths else 0,
+                            )
+                        if _ent_diag.dim() == 2:
+                            dump_entropy_2d_verl080(_ent_diag, "train")
         # ##### [PS-diag] dump 2D logprobs/entropy end #####
 
         if loss_function is not None:
@@ -372,48 +385,71 @@ def _read_temperature(micro_batch: Any) -> float:
 
 
 def _dump_fsdp_baseline(micro_batch: Any, result: Any) -> None:
-    """Dump FSDP OFF baseline diagnostics (no prefix-sharing)."""
+    """Dump FSDP OFF baseline diagnostics (no prefix-sharing).
+
+    OFF 路径走原生 verl ``forward_step``，返回 ``(loss, output_dict)``，
+    ``output_dict["model_output"]`` 里的 ``log_probs``/``entropy`` 在 ``use_remove_padding=True`` 下
+    是 NestedTensor（jagged），用 :func:`nested_to_2d_full` 展开到 ``[B, L_max]``。
+    """
     import torch
 
+    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
     from prefix_sharing.tools.diagnostic_dump_verl080 import (
-        build_attention_mask_2d, build_label_mask_2d,
+        build_attention_mask_2d, build_label_mask_2d, nested_to_2d_full,
         dump_attention_mask_verl080, dump_entropy_2d_verl080,
         dump_label_mask_verl080, dump_logprobs_2d_verl080, dump_meta_verl080,
     )
 
-    if isinstance(result, tuple) and len(result) >= 2:
-        output_dict = result[1] if isinstance(result[1], dict) else result[0]
+    # result = (loss, output_dict); output_dict["model_output"] holds log_probs/entropy
+    if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[1], dict):
+        output_dict = result[1]
     else:
-        output_dict = {}
+        return
     model_output = output_dict.get("model_output", {})
     if not model_output:
         return
 
-    # original_lengths from micro_batch (full sequence lengths before trimming)
+    # original_lengths from micro_batch["input_ids"] (pre-trim full lengths)
     _ids = micro_batch.get("input_ids")
-    if _ids is not None and hasattr(_ids, "shape") and _ids.dim() == 2:
-        _orig_lens = [int(s) for s in _ids.shape[1:2] * 0 + _ids.shape[1]]
-    elif _ids is not None and hasattr(_ids, "is_nested") and _ids.is_nested:
+    if _is_nested_tensor(_ids):
         _orig_lens = [int(d) for d in _ids.offsets().diff().tolist()]
+    elif _ids is not None and hasattr(_ids, "dim") and _ids.dim() == 2:
+        # Dense [B, L]: all rows share the same length L (right-padded).
+        _orig_lens = [int(_ids.shape[1])] * int(_ids.shape[0])
     else:
         return
 
     _prefix_lens = [0] * len(_orig_lens)
     _cu = torch.zeros(len(_orig_lens) + 1, dtype=torch.int64)
-    for i, l in enumerate(_orig_lens):
-        _cu[i + 1] = _cu[i] + l
+    for _i, _l in enumerate(_orig_lens):
+        _cu[_i + 1] = _cu[_i] + _l
     dump_meta_verl080(_prefix_lens, _cu)
 
     _Lmax = max(_orig_lens) if _orig_lens else 0
     dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens, _Lmax), "train")
     _lm = micro_batch.get("loss_mask")
     if _lm is not None:
-        _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
+        if _is_nested_tensor(_lm):
+            _off = _lm.offsets()
+            _val = _lm.values()
+            _response_lens = [int(_val[_off[i]:_off[i + 1]].sum()) for i in range(len(_orig_lens))]
+        else:
+            _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
         dump_label_mask_verl080(build_label_mask_2d(_response_lens, _orig_lens, _Lmax), "train")
 
     _lp = model_output.get("log_probs")
-    if _lp is not None and _lp.dim() == 2:
-        dump_logprobs_2d_verl080(_lp, "train")
-        _ent = model_output.get("entropy")
-        if _ent is not None and _ent.dim() == 2:
+    if _lp is None:
+        return
+    if _is_nested_tensor(_lp):
+        _lp_2d = nested_to_2d_full(_lp, _orig_lens, _Lmax)
+    elif _lp.dim() == 2:
+        _lp_2d = _lp
+    else:
+        return
+    dump_logprobs_2d_verl080(_lp_2d, "train")
+    _ent = model_output.get("entropy")
+    if _ent is not None:
+        if _is_nested_tensor(_ent):
+            _ent = nested_to_2d_full(_ent, _orig_lens, _Lmax)
+        if _ent.dim() == 2:
             dump_entropy_2d_verl080(_ent, "train")
