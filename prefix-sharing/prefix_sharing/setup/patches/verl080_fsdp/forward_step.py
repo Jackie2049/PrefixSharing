@@ -177,6 +177,8 @@ def _forward_step_with_engine_prepare(
         if _lm_diag is not None:
             _response_lens_diag = _lm_diag.sum(dim=-1).long().cpu().tolist()
             dump_label_mask_verl080(build_label_mask_2d(_response_lens_diag, _orig_lens_diag, _Lmax_diag), "train")
+        # dump 原始（未 trim）input_ids 到 2D，供 ON/OFF batch 内容直接对比
+        _dump_input_ids_2d(micro_batch, _orig_lens_diag, _Lmax_diag, "train")
     # ##### [PS-diag] dump end #####
 
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
@@ -437,6 +439,9 @@ def _dump_fsdp_baseline(micro_batch: Any, result: Any) -> None:
             _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
         dump_label_mask_verl080(build_label_mask_2d(_response_lens, _orig_lens, _Lmax), "train")
 
+    # dump 原始 input_ids 到 2D，供 ON/OFF batch 内容直接对比
+    _dump_input_ids_2d(micro_batch, _orig_lens, _Lmax, "train")
+
     _lp = model_output.get("log_probs")
     if _lp is None:
         return
@@ -453,3 +458,30 @@ def _dump_fsdp_baseline(micro_batch: Any, result: Any) -> None:
             _ent = nested_to_2d_full(_ent, _orig_lens, _Lmax)
         if _ent.dim() == 2:
             dump_entropy_2d_verl080(_ent, "train")
+
+
+def _dump_input_ids_2d(micro_batch: Any, orig_lens: list[int], l_max: int, tag: str) -> None:
+    """Dump 原始（未 trim）input_ids 到 2D ``[B, L_max]``，文件名 ``input_ids_{tag}.pt``。
+
+    用于 ON/OFF 两次 run 的 batch 内容直接逐 token 对比——这是判定 cmp_diag 逐行对比
+    是否成立的前提（只有 batch 内容字节级一致，逐元素 logp/entropy 对比才有意义）。
+    NestedTensor input_ids 按 original_lengths 展开到统一 [B, L_max]；dense 2D 直接存。
+    """
+    import torch
+
+    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+    from prefix_sharing.tools.diagnostic_dump import _get_dump_dir, _save_tensor
+
+    if _get_dump_dir() is None:
+        return
+    _ids = micro_batch.get("input_ids")
+    if _ids is None:
+        return
+    if _is_nested_tensor(_ids):
+        from prefix_sharing.tools.diagnostic_dump_verl080 import nested_to_2d_full
+        ids_2d = nested_to_2d_full(_ids, orig_lens, l_max)
+    elif hasattr(_ids, "dim") and _ids.dim() == 2:
+        ids_2d = _ids
+    else:
+        return
+    _save_tensor(f"input_ids_{tag}.pt", ids_2d.long().cpu(), _get_dump_dir())
