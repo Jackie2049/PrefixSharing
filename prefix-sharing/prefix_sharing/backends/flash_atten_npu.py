@@ -1,37 +1,18 @@
-"""CANN/NPU Flash Attention backend for prefix sharing.
+"""CANN/NPU Flash Attention backend for prefix sharing (s_packed mode).
 
-Uses MindSpeed's ``npu_fusion_attention`` fused kernel in **BSH layout**
-with **per-sample padded tensors** and a batched 4-D mask.
+Uses MindSpeed's ``npu_fusion_attention`` fused kernel in **BSH layout** with a
+**s_packed custom causal mask**.
 
-Why BSH instead of TND (varlen)
--------------------------------
-The TND / varlen forward kernel ``aclnnFlashAttentionVarLenScoreV2``
-accepts attention masks with irregular dimensions, but the corresponding
-gradient kernel ``aclnnFlashAttentionUnpaddingScoreGradV2`` requires the
-mask dimensions to be multiples of the tile-block size (128).  There is
-no ``aclnnFlashAttentionVarLenScoreGrad`` in CANN 8.5.0, and the
-UnpaddingScoreGrad V2/V3/V4/V5 all route through the same
-``s1s2_bn2gs1s2_sab`` tiling path which enforces this constraint.
+s_packed Mode
+-------------
+All inputs are packed into a single s_packed sequence with deduplicated KV
+storage (shared prefixes are stored once). A global custom causal mask
+(built from plan.s_packed_kv_ranges) controls visibility.
 
-By converting the per-sample THD tokens into padded BSHD tensors and
-omitting ``actual_seq_qlen`` / ``actual_seq_kvlen``, the kernel dispatches
-to the non-varlen pair:
-
-  Forward:  ``aclnnFlashAttentionScoreV2``  (no 128 constraint)
-  Backward: ``aclnnFlashAttentionScoreGradV2`` (no 128 constraint)
-
-The small cost of split / pad / stack is negligible compared to the NPU
-fused attention kernel time.
-
-Mask semantics
---------------
-``atten_mask``: True = masked (not participate), False = visible.
-Shape = ``(batch_size, 1, max_q, max_kv)`` — per-sample, prefix-aware:
-
-  - **Provider** → standard causal (upper-tri True).
-  - **Reuser**   → prefix KV columns all-visible, suffix KV columns causal.
-  - Padding rows / cols (past valid lengths) are left ``True`` so the
-    kernel sees them as invisible.
+Mask semantics: ``atten_mask``: True = masked (not participate), False = visible.
+Shape = ``(batch_size, 1, max_q, s_packed_length)``:
+  - Each batch's visible KV positions come from plan.s_packed_kv_ranges.
+  - Padding rows/cols are left ``True`` so the kernel ignores them.
 """
 
 from __future__ import annotations
@@ -81,57 +62,39 @@ def _torch() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Per-sample pad-mask builder
+# s_packed mask builder
 # ---------------------------------------------------------------------------
 
-def _build_per_sample_mask(
+def _build_s_packed_mask(
     plan: PrefixSharingPlan,
     valid_lens: List[int],
-    expanded_kv_lens: List[int],
     max_q: int,
-    max_kv: int,
+    s_packed_length: int,
     device: Any,
 ) -> Any:
-    """Build ``(batch_size, 1, max_q, max_kv)`` mask for the full batch.
+    """Build BSHD mask from s_packed plan.
 
-    Each sample *i* occupies rows ``[0, valid_lens[i])`` and columns
-    ``[0, expanded_kv_lens[i])`` within its own ``[max_q, max_kv]``
-    per-sample sub-tensor.  Padding rows/cols outside valid ranges stay
-    ``True`` (hidden).
+    Returns mask of shape (batch_size, 1, max_q, s_packed_length) where:
+    - True = visible (attended to), False = masked (invisible)
+    - Each batch's visible KV positions come from plan.s_packed_kv_ranges
     """
     torch = _torch()
     batch_size = plan.batch_size
-    mask = torch.ones(batch_size, 1, max_q, max_kv, dtype=torch.bool, device=device)
+    mask = torch.zeros(batch_size, 1, max_q, s_packed_length, dtype=torch.bool, device=device)
 
     for i in range(batch_size):
-        q_val = valid_lens[i]
-        kv_val = expanded_kv_lens[i]
-        if q_val == 0 or kv_val == 0:
+        q_len = valid_lens[i]
+        if q_len == 0:
             continue
 
-        if plan.is_reuser(i):
-            prefix_len = int(plan.prefix_lens[i])
-            # Prefix KV columns: all Q tokens see all prefix KV tokens.
-            if prefix_len > 0:
-                mask[i, 0, :q_val, :prefix_len] = False
-
-            # Suffix KV columns: causal.
-            suffix_len = kv_val - prefix_len
-            if suffix_len > 0:
-                suffix_block = torch.ones(q_val, suffix_len, dtype=torch.bool, device=device)
-                # tril(0) → lower-tri visible → ~ → upper masked
-                mask[i, 0, :q_val, prefix_len:prefix_len + suffix_len] = \
-                    ~suffix_block.tril(diagonal=0)
-        else:
-            # Provider: standard causal within [q_val, kv_val].
-            block = torch.ones(q_val, kv_val, dtype=torch.bool, device=device)
-            if q_val <= kv_val:
-                mask[i, 0, :q_val, :kv_val] = torch.triu(block, diagonal=1)
-            else:
-                # Tall block: shift causal diagonal by (q_val - kv_val) rows.
-                mask[i, 0, :q_val, :kv_val] = torch.triu(
-                    block, diagonal=q_val - kv_val + 1,
-                )
+        for kv_pos in range(s_packed_length):
+            # Check if kv_pos belongs to input i's s_packed ranges
+            visible = False
+            for (kv_lo, kv_hi) in plan.s_packed_kv_ranges[i]:
+                if kv_lo <= kv_pos < kv_hi:
+                    visible = True
+                    break
+            mask[i, 0, :q_len, kv_pos] = visible
 
     return mask
 
@@ -141,7 +104,7 @@ def _build_per_sample_mask(
 # ---------------------------------------------------------------------------
 
 class NpuFlashAttentionBackend(FlashAttentionMixin):
-    """Ascend NPU backend via ``npu_fusion_attention`` (BSH, single batched call)."""
+    """Ascend NPU backend via ``npu_fusion_attention`` (BSH, s_packed mode)."""
 
     capabilities = BackendCapabilities(
         name="flash_atten_npu",
@@ -182,13 +145,6 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         tp_rank: int = 0,
         stats: Any | None = None,
     ) -> tuple[Any, Any]:
-        """Delegate KV expansion to the torch reference backend.
-
-        Returns per-sample expanded K/V concatenated in THD order.  The
-        caller (megatron_runtime) still passes the THD-concatenated result
-        to ``attention()``, where we split it back into per-sample rows for
-        the BSHD conversion.
-        """
         return self._torch_ref.build_kv(
             key,
             value,
@@ -201,7 +157,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         )
 
     # ------------------------------------------------------------------
-    # attention — THD → BSHD → npu_fusion_attention → THD
+    # attention — s_packed mode via BSHD npu_fusion_attention
     # ------------------------------------------------------------------
     def attention(
         self,
@@ -211,20 +167,15 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         prefix_sharing_plan: PrefixSharingPlan,
         **kwargs: Any,
     ) -> Any:
-        """Run prefix-sharing attention via BSH-mode ``npu_fusion_attention``.
+        """Run prefix-sharing attention via BSHD ``npu_fusion_attention`` in s_packed mode.
 
-        1. Split incoming THD Q/K/V into per-sample rows.
-        2. Pad each row to ``(max_q, ...)`` / ``(max_kv, ...)`` and stack
-           into BSHD layout.
-        3. Build per-sample ``(batch_size, 1, max_q, max_kv)`` prefix-aware causal mask.
-        4. Invoke ``npu_fusion_attention`` once with ``input_layout="BSH"``
-           and **no** ``actual_seq_qlen`` / ``actual_seq_kvlen`` so that
-           both forward and backward route through the non-varlen CANN APIs.
-        5. Unpack the BSHD output back to THD.
+        Q: (total_q, n_heads, d) — per-input suffix tokens, padded per input
+        K/V: (s_packed_length, n_kv_heads, d) — s_packed unique KV (去重)
+        mask: (batch_size, 1, max_q, s_packed_length) — global custom causal
         """
         layer_id = kwargs.get('layer_id', '?')
         print(
-            f"[PS][backend] flash_atten_npu attention: "
+            f"[PS][backend][s_packed] flash_atten_npu attention: "
             f"layer={layer_id}, "
             f"q_shape={tuple(query.shape)}, k_shape={tuple(key.shape)}, "
             f"v_shape={tuple(value.shape)}"
@@ -233,9 +184,9 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         torch = _torch()
         npu_fusion_attention = _import_npu_fusion_attention()
 
-        q = self._ensure_3d_thd(query, "query")        # [T_q, n_heads, d]
-        k = self._ensure_3d_thd(key, "key")              # [T_kv, n_kv_heads, d]
-        v = self._ensure_3d_thd(value, "value")          # [T_kv, n_kv_heads, d]
+        q = self._ensure_3d_thd(query, "query")
+        k = self._ensure_3d_thd(key, "key")
+        v = self._ensure_3d_thd(value, "value")
 
         packed_layout: PackedBatchLayout = kwargs.get("packed_batch_layout")
         if packed_layout is None:
@@ -245,26 +196,21 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
 
         plan = prefix_sharing_plan
         batch_size = plan.batch_size
+        s_packed_length = plan.s_packed_length
+        valid_lens = packed_layout.valid_lengths
+        max_q = max(valid_lens)
 
-        # --- metadata ---
-        q_cus = packed_layout.cu_seqlens                      # cumulative padded
-        kv_cus = plan.cu_seqlens_kv                            # cumulative expanded
-        valid_lens = packed_layout.valid_lengths               # per-sample valid Q
-        kv_lens = plan.expanded_lengths_kv                     # per-sample expanded KV
-
-        total_q = q_cus[-1]
-        total_kv = kv_cus[-1]
-
+        total_q = sum(plan.s_packed_q_lengths)
         if q.shape[0] != total_q:
             raise FlashBackendValidationError(
                 f"q.shape[0]={q.shape[0]} != total_q={total_q}"
             )
-        if k.shape[0] != total_kv:
+        if k.shape[0] != s_packed_length:
             raise FlashBackendValidationError(
-                f"k.shape[0]={k.shape[0]} != total_kv={total_kv}"
+                f"k.shape[0]={k.shape[0]} != s_packed_length={s_packed_length}"
             )
 
-        if total_q == 0 or total_kv == 0:
+        if total_q == 0 or s_packed_length == 0:
             return torch.zeros_like(q)
 
         num_q_heads = q.shape[1]
@@ -275,35 +221,27 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
 
         # --- Step 1: split THD → per-sample rows ---
         q_rows = _split_packed(q, packed_layout.padded_lengths)
-        k_rows = _split_packed(k, kv_lens)
-        v_rows = _split_packed(v, kv_lens)
-
-        max_q = max(valid_lens)
-        max_kv = max(kv_lens)
+        k_rows = _split_packed(k, [s_packed_length] * batch_size)
+        v_rows = _split_packed(v, [s_packed_length] * batch_size)
 
         # --- Step 2: pad & stack → BSH ---
-        # Q: (T_q, nq, d) → split → pad → (batch_size, max_q, nq*d)
-        # K: (T_kv, nkv, d) → split → pad → (batch_size, max_kv, nkv*d)
         q_bsh = torch.zeros(batch_size, max_q, hidden_q, dtype=q.dtype, device=q.device)
-        k_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=k.dtype, device=k.device)
-        v_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=v.dtype, device=v.device)
+        k_bsh = torch.zeros(batch_size, s_packed_length, hidden_kv, dtype=k.dtype, device=k.device)
+        v_bsh = torch.zeros(batch_size, s_packed_length, hidden_kv, dtype=v.dtype, device=v.device)
 
         for i in range(batch_size):
             if valid_lens[i] > 0:
                 q_bsh[i, :valid_lens[i], :] = \
                     q_rows[i][:valid_lens[i]].reshape(valid_lens[i], hidden_q)
-            if kv_lens[i] > 0:
-                k_bsh[i, :kv_lens[i], :] = \
-                    k_rows[i].reshape(kv_lens[i], hidden_kv)
-                v_bsh[i, :kv_lens[i], :] = \
-                    v_rows[i].reshape(kv_lens[i], hidden_kv)
+            k_bsh[i, :, :] = k_rows[i].reshape(s_packed_length, hidden_kv)
+            v_bsh[i, :, :] = v_rows[i].reshape(s_packed_length, hidden_kv)
 
-        # --- Step 3: build per-sample mask ---
-        atten_mask = _build_per_sample_mask(
-            plan, valid_lens, kv_lens, max_q, max_kv, q.device,
+        # --- Step 3: build s_packed custom mask ---
+        atten_mask = _build_s_packed_mask(
+            plan, valid_lens, max_q, s_packed_length, q.device,
         )
 
-        # --- Step 4: invoke npu_fusion_attention (BSH, non-varlen) ---
+        # --- Step 4: invoke npu_fusion_attention (BSH) ---
         scale = kwargs.get("softmax_scale") or (1.0 / math.sqrt(head_dim))
         dropout_p = kwargs.get("dropout_p", 0.0)
         keep_prob = kwargs.get("keep_prob", 1.0 - dropout_p)
@@ -320,18 +258,18 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
             )
         except Exception as exc:
             raise FlashBackendValidationError(
-                f"npu_fusion_attention (BSH) failed: q={tuple(q_bsh.shape)}, "
+                f"npu_fusion_attention (BSH s_packed) failed: q={tuple(q_bsh.shape)}, "
                 f"k={tuple(k_bsh.shape)}, v={tuple(v_bsh.shape)}, "
                 f"mask={tuple(atten_mask.shape)}, batch_size={batch_size}, "
-                f"max_q={max_q}, max_kv={max_kv}"
+                f"max_q={max_q}, s_packed_length={s_packed_length}"
             ) from exc
 
         output_bsh = result[0] if isinstance(result, (tuple, list)) else result
-        # output_bsh: (batch_size, max_q, nq*d)
 
         # --- Step 5: unpack BSHD → THD ---
         output_thd = torch.zeros(total_q, num_q_heads, head_dim,
                                  dtype=q.dtype, device=q.device)
+        q_cus = packed_layout.cu_seqlens
         for i in range(batch_size):
             vlen = valid_lens[i]
             if vlen == 0:

@@ -13,10 +13,8 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import (
-    PREFIX_STATE_TYPE_ATTENTION_KV,
     PREFIX_STATE_TYPE_DELTANET_STATE,
     PrefixActivationSlotId,
-    PrefixAttentionStore,
     PrefixDeltanetStore,
 )
 
@@ -32,6 +30,19 @@ class TorchReferenceBackend:
         supports_gated_attention=True,
         supports_deltanet_state_reuse=True,
     )
+
+    # ------------------------------------------------------------------
+    # Shape helpers
+    # ------------------------------------------------------------------
+    def _ensure_3d_thd(self, tensor: Any, name: str) -> Any:
+        if tensor.dim() == 3:
+            return tensor
+        if tensor.dim() == 2:
+            raise ValueError(
+                f"{name} has 2 dims {tuple(tensor.shape)}; expected "
+                "(total_tokens, num_heads, head_dim)"
+            )
+        raise ValueError(f"{name} has unexpected rank {tensor.dim()}")
 
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         config.validate(model_config=model_config)
@@ -53,7 +64,7 @@ class TorchReferenceBackend:
         self,
         key: Any,
         value: Any,
-        store: PrefixAttentionStore,
+        store: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
         packed_batch_layout: Any | None = None,
@@ -61,119 +72,56 @@ class TorchReferenceBackend:
         tp_rank: int = 0,
         stats: PrefixSharingStats | None = None,
     ) -> tuple[Any, Any]:
+        """构建去重 s_packed KV。
+
+        框架传入的 key/value 包含所有 tokens 的 K/V（含 prefix 和 suffix）。
+        逐 input 提取 suffix K/V，拼接为 s_packed KV，无需 torch.cat 或 store。
+        """
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        # Input K/V still follow the framework's padded packed layout; only
-        # valid tokens may enter the store or expanded KV.
         key_rows = _split_packed(key, layout.padded_lengths)
         value_rows = _split_packed(value, layout.padded_lengths)
-        expanded_keys = []
-        expanded_values = []
-        store_count = 0
-        reuse_count = 0
-        reuse_hit_count = 0
-        reuse_miss_count = 0
+
+        s_packed_k = []
+        s_packed_v = []
         stored_tokens = 0
-        reused_prefix_tokens = 0
-        # This loop relies on the current online detector invariant that a provider
-        # appears before every reuser that loads from it. All rows' QKV tensors have
-        # already been produced in parallel by this point; the ordering here only
-        # controls KV assembly before attention. Do not reorder or parallelize this
-        # loop unless provider dependencies are handled explicitly, e.g. by a
-        # topology-aware build phase.
-        for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
+
+        for batch_index in range(prefix_sharing_plan.batch_size):
             valid_length = layout.valid_lengths[batch_index]
-            valid_key_row = key_row[:valid_length]
-            valid_value_row = value_row[:valid_length]
+            if valid_length == 0:
+                continue
+
+            prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+            suffix_len = valid_length
+            suffix_k = key_rows[batch_index][:suffix_len]
+            suffix_v = value_rows[batch_index][:suffix_len]
+
             if not prefix_sharing_plan.is_reuser(batch_index):
-                slot_id = PrefixActivationSlotId(
-                    prefix_sharing_plan.forward_id,
-                    prefix_sharing_plan.micro_batch_id,
-                    layer_id,
-                    batch_index,
-                    PREFIX_STATE_TYPE_ATTENTION_KV,
-                    tp_rank,
-                )
-                # Publish this row's KV so later reusers in this micro-batch can load it.
-                store.store(
-                    slot_id,
-                    key_tensor=valid_key_row,
-                    value_tensor=valid_value_row,
-                    prefix_len=valid_key_row.shape[0],
-                    overwrite=True,
-                )
-                store_count += 1
-                stored_tokens += int(valid_key_row.shape[0])
-                expanded_keys.append(valid_key_row)
-                expanded_values.append(valid_value_row)
+                # Provider: 整行 K/V 都是 unique suffix
+                s_packed_k.append(suffix_k)
+                s_packed_v.append(suffix_v)
+                stored_tokens += suffix_len
             else:
-                provider = prefix_sharing_plan.provider_index[batch_index]
-                provider_slot_id = PrefixActivationSlotId(
-                    prefix_sharing_plan.forward_id,
-                    prefix_sharing_plan.micro_batch_id,
-                    layer_id,
-                    provider,
-                    PREFIX_STATE_TYPE_ATTENTION_KV,
-                    tp_rank,
-                )
-                # Load the already-published provider KV before building this reuser's expanded KV.
-                reuse_count += 1
-                try:
-                    entry = store.load(provider_slot_id)
-                except KeyError:
-                    reuse_miss_count += 1
-                    if stats is not None:
-                        stats.record_attention_kv_build(
-                            layer_id=layer_id,
-                            store_count=store_count,
-                            reuse_count=reuse_count,
-                            reuse_hit_count=reuse_hit_count,
-                            reuse_miss_count=reuse_miss_count,
-                            stored_tokens=stored_tokens,
-                            reused_prefix_tokens=reused_prefix_tokens,
-                            expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
-                            valid_q_tokens=layout.total_valid_length,
-                            padded_q_tokens=layout.total_padded_length,
-                        )
-                    raise
-                reuse_hit_count += 1
-                prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
-                reused_prefix_tokens += int(prefix_len)
-                expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
-                expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
-                own_slot_id = PrefixActivationSlotId(
-                    prefix_sharing_plan.forward_id,
-                    prefix_sharing_plan.micro_batch_id,
-                    layer_id,
-                    batch_index,
-                    PREFIX_STATE_TYPE_ATTENTION_KV,
-                    tp_rank,
-                )
-                # Publish the expanded reuser KV because a later row may reuse this longer prefix.
-                store.store(
-                    own_slot_id,
-                    key_tensor=expanded_key,
-                    value_tensor=expanded_value,
-                    prefix_len=expanded_key.shape[0],
-                    overwrite=True,
-                )
-                store_count += 1
-                stored_tokens += int(expanded_key.shape[0])
-                expanded_keys.append(expanded_key)
-                expanded_values.append(expanded_value)
+                # Reuser: prefix 在 s_packed 中已存在（由之前的 provider/reuser 构建），
+                # 只追加 suffix
+                s_packed_k.append(suffix_k)
+                s_packed_v.append(suffix_v)
+                stored_tokens += suffix_len
+
         if stats is not None:
             stats.record_attention_kv_build(
                 layer_id=layer_id,
-                store_count=store_count,
-                reuse_count=reuse_count,
-                reuse_hit_count=reuse_hit_count,
-                reuse_miss_count=reuse_miss_count,
+                store_count=prefix_sharing_plan.batch_size,
+                reuse_count=0,
+                reuse_hit_count=0,
+                reuse_miss_count=0,
                 stored_tokens=stored_tokens,
-                reused_prefix_tokens=reused_prefix_tokens,
-                expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                reused_prefix_tokens=0,
+                expanded_kv_tokens=stored_tokens,
                 valid_q_tokens=layout.total_valid_length,
                 padded_q_tokens=layout.total_padded_length,
             )
-        return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
+
+        return torch.cat(s_packed_k, dim=0), torch.cat(s_packed_v, dim=0)
 
     def attention(
         self,
@@ -185,36 +133,68 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         **_: Any,
     ) -> Any:
-        batch_layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        
-        # QKV从batch拆分到单条序列，便于精度问题定位
-        query_rows = _split_packed(query, batch_layout.padded_lengths)
-        key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
-        value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
+        """s_packed 模式下的统一 attention。
 
-        # 逐条序列进行注意力计算
-        outputs = []
-        for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
-            valid_length = batch_layout.valid_lengths[batch_index]
-            # padding不参与注意力计算
-            q_valid = q_row[:valid_length]
-            prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
-            if valid_length == 0:
-                outputs.append(torch.zeros_like(q_row))
-                continue
-            mask = _causal_q_kv_mask(
-                q_len=q_valid.shape[0],
-                kv_len=k_row.shape[0],
-                q_start=prefix_len,
-                device=q_valid.device,
+        Q: (total_q, n_heads, d) — per-input suffix tokens, padded per input
+        K/V: (s_packed_length, n_kv_heads, d) — s_packed unique KV (去重)
+        mask: (total_q, s_packed_length) — 全局 custom causal mask
+        """
+        plan = prefix_sharing_plan
+        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+
+        q = self._ensure_3d_thd(query, "query")
+        k = self._ensure_3d_thd(key, "key")
+        v = self._ensure_3d_thd(value, "value")
+
+        # Q total = sum of padded lengths (since input Q is padded)
+        total_q = sum(layout.padded_lengths)
+        if q.shape[0] != total_q:
+            raise ValueError(
+                f"query.shape[0]={q.shape[0]} != total_q={total_q}"
             )
-            valid_output = _attention_row(q_valid, k_row, v_row, mask)
-            if valid_length == q_row.shape[0]:
-                outputs.append(valid_output)
+        if k.shape[0] != plan.s_packed_length:
+            raise ValueError(
+                f"key.shape[0]={k.shape[0]} != s_packed_length={plan.s_packed_length}"
+            )
+        if total_q == 0 or plan.s_packed_length == 0:
+            return torch.zeros_like(q)
+
+        # 全局 custom causal mask (sparse, only for valid Q tokens)
+        mask = plan.build_global_custom_mask(q.device)
+
+        # 逐行 attention（每行对应 layout.padded_lengths 中一个元素）
+        padded_offset = 0
+        valid_q_offset = 0  # 累积的 s_packed Q 位置（仅 valid tokens）
+        outputs: list[Any] = []
+        for batch_index in range(plan.batch_size):
+            padded_len = layout.padded_lengths[batch_index]
+            q_len = plan.s_packed_q_lengths[batch_index]
+
+            if q_len == 0:
+                # 无 Q token: 全是 padding
+                outputs.append(q[padded_offset:padded_offset + padded_len])
+                padded_offset += padded_len
                 continue
-            padded_output = torch.zeros_like(q_row)
-            padded_output[:valid_length] = valid_output
-            outputs.append(padded_output)
+
+            # 提取 valid Q tokens (从 padded 区间中提取 valid 部分)
+            q_valid = q[padded_offset:padded_offset + q_len]
+            k_row = k
+            v_row = v
+
+            mask_row = mask[valid_q_offset:valid_q_offset + q_len]
+            out_valid = _attention_row(q_valid, k_row, v_row, mask_row)
+
+            # Repad to padded_len if needed
+            if q_len == padded_len:
+                outputs.append(out_valid)
+            else:
+                padded = torch.zeros(padded_len, *out_valid.shape[1:], dtype=out_valid.dtype, device=out_valid.device)
+                padded[:q_len] = out_valid
+                outputs.append(padded)
+
+            padded_offset += padded_len
+            valid_q_offset += q_len
+
         return torch.cat(outputs, dim=0)
 
     def gated_attention(

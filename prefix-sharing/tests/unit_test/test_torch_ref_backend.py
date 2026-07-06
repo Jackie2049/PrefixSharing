@@ -96,7 +96,7 @@ def test_apply_rope_with_fn_delegates():
 
 
 def test_build_kv_provider_stores_and_reuser_concatenates_prefix():
-    """Core KV assembly: provider publishes valid KV, reuser concatenates prefix."""
+    """Core KV assembly (s_packed mode): provider publishes valid KV, reuser publishes its suffix."""
     plan = _make_plan([6, 5], [0, 3])  # provider len=6, reuser prefix=3+suffix=2
     layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
@@ -113,22 +113,14 @@ def test_build_kv_provider_stores_and_reuser_concatenates_prefix():
         packed_batch_layout=layout, layer_id=0, tp_rank=0,
     )
 
-    # Expanded KV should follow plan.expanded_lengths_kv
-    expected_total_kv = sum(plan.expanded_lengths_kv)
-    assert expanded_k.shape[0] == expected_total_kv
-    assert expanded_v.shape[0] == expected_total_kv
-
-    # Provider row: expanded = valid tokens only (no padding, no prefix)
-    provider_len = plan.expanded_lengths_kv[0]
-    assert provider_len == 6  # full sequence
-
-    # Reuser row: expanded = prefix (from provider) + suffix (own valid tokens)
-    reuser_len = plan.expanded_lengths_kv[1]
-    assert reuser_len == 5  # 3 prefix + 2 suffix
+    # s_packed KV is deduplicated
+    expected_s_packed_kv = plan.s_packed_length
+    assert expanded_k.shape[0] == expected_s_packed_kv
+    assert expanded_v.shape[0] == expected_s_packed_kv
 
 
 def test_build_kv_with_padding_strips_to_valid():
-    """When layout has TP padding, build_kv strips padding from K/V rows."""
+    """When layout has TP padding, build_kv strips padding from K/V rows (s_packed mode)."""
     plan = _make_plan([5, 4], [0, 3])
     align_size = 4
     rows = [torch.zeros(plan.kept_lengths_q[i], dtype=torch.long)
@@ -148,19 +140,12 @@ def test_build_kv_with_padding_strips_to_valid():
         packed_batch_layout=layout, layer_id=0, tp_rank=0,
     )
 
-    # Expanded length must follow semantic lengths, not padded lengths
-    expected_total = sum(plan.expanded_lengths_kv)
-    assert expanded_k.shape[0] == expected_total
+    # Expanded length follows s_packed_length (semantic deduplicated KV)
+    assert expanded_k.shape[0] == plan.s_packed_length
 
 
 def test_build_kv_transitive_reuse():
-    """Reuser row 2 reuses from row 1 which reused from row 0 (transitive chain)."""
-    # Use a valid transitive reuse: row0=provider, row1=reuse(prefix=3), row2=reuse(prefix=5)
-    # Row 2 shares a longer prefix with row 1 (which is row 1's expanded prefix + suffix)
-    # batch_sizes must be >= prefix_lens for each row:
-    #   row0: len=8, prefix=0 (provider)
-    #   row1: len=7, prefix=3 (reuse from row0)
-    #   row2: len=6, prefix=5 (reuse from row1's expanded)
+    """Transitive reuse: reuser rows deduplicate prefix in s_packed."""
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
@@ -176,10 +161,10 @@ def test_build_kv_transitive_reuse():
         packed_batch_layout=layout, layer_id=0, tp_rank=0,
     )
 
-    # Verify expanded lengths match plan
-    assert expanded_k.shape[0] == sum(plan.expanded_lengths_kv)
-    # Row 2 (reuser with prefix=5): expanded_len = prefix + kept_suffix
-    assert plan.expanded_lengths_kv[2] == 6  # prefix=5 + suffix=1
+    # Verify s_packed deduplication
+    assert expanded_k.shape[0] == plan.s_packed_length
+    # s_packed should be smaller than sum of original_lengths (deduplication)
+    assert plan.s_packed_length < sum(plan.original_lengths)
 
 
 # ------------------------------------------------------------------
@@ -188,14 +173,14 @@ def test_build_kv_transitive_reuse():
 
 
 def test_attention_provider_only_matches_manual():
-    """Provider-only attention: output matches manual scaled-dot-product."""
+    """Provider-only attention (s_packed mode): output matches manual scaled-dot-product."""
     plan = _make_plan([4], [0])
     layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
 
     num_heads, head_dim = 2, 8
-    q_len = plan.kept_lengths_q[0]
-    kv_len = plan.expanded_lengths_kv[0]
+    q_len = plan.s_packed_q_lengths[0]  # = 4 for single provider
+    kv_len = plan.s_packed_length  # = 4
 
     q = torch.randn(q_len, num_heads, head_dim)
     k = torch.randn(kv_len, num_heads, head_dim)
@@ -215,14 +200,15 @@ def test_attention_provider_only_matches_manual():
 
 
 def test_attention_reuser_sees_full_prefix():
-    """Reuser Q[0] must attend to all prefix KV + suffix KV[0]."""
+    """Reuser Q[0] must attend to all prefix KV + suffix KV[0] (s_packed mode)."""
     plan = _make_plan([6, 5], [0, 3])
     layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
 
     num_heads, head_dim = 2, 8
-    total_q = sum(plan.kept_lengths_q)
-    total_kv = sum(plan.expanded_lengths_kv)
+    # s_packed Q: total kept Q tokens across all inputs
+    total_q = sum(plan.s_packed_q_lengths)
+    total_kv = plan.s_packed_length  # = 8 (input0: 6 + input1 suffix: 2)
 
     q = torch.randn(total_q, num_heads, head_dim)
     k = torch.randn(total_kv, num_heads, head_dim)
@@ -231,13 +217,11 @@ def test_attention_reuser_sees_full_prefix():
     out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
 
     # Reuser row output should exist and be non-zero
-    reuser_q_len = plan.kept_lengths_q[1]
-    reuser_kv_len = plan.expanded_lengths_kv[1]
+    reuser_q_len = plan.s_packed_q_lengths[1]  # 2
     assert reuser_q_len == 2  # suffix only: 5 - 3
-    assert reuser_kv_len == 5  # prefix + suffix
 
     # The reuser output segment should have shape (reuser_q_len, num_heads, head_dim)
-    q_lo = plan.cu_seqlens_q[1]
+    q_lo = plan.s_packed_q_starts[1]
     reuser_out = out[q_lo:q_lo + reuser_q_len]
     assert reuser_out.shape == (reuser_q_len, num_heads, head_dim)
     # Should not be all zeros (real attention output)
@@ -245,7 +229,7 @@ def test_attention_reuser_sees_full_prefix():
 
 
 def test_attention_padding_slots_are_zeroed():
-    """When layout has padding, output at padding positions must be zero."""
+    """When layout has padding, output at padding positions must be zero (s_packed mode)."""
     plan = _make_plan([5], [0])
     rows = [torch.zeros(5, dtype=torch.long)]
     layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=8)
@@ -254,9 +238,10 @@ def test_attention_padding_slots_are_zeroed():
 
     num_heads, head_dim = 2, 8
     total_padded = layout.total_padded_length  # 8 (5 padded to 8)
-    kv_len = plan.expanded_lengths_kv[0]  # 5 (no padding on KV)
+    total_q = total_padded  # = padded q (because alignment)
+    kv_len = plan.s_packed_length  # 5 (no padding on KV)
 
-    q = torch.randn(total_padded, num_heads, head_dim)
+    q = torch.randn(total_q, num_heads, head_dim)
     k = torch.randn(kv_len, num_heads, head_dim)
     v = torch.randn(kv_len, num_heads, head_dim)
 

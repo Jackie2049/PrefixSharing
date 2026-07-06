@@ -1,43 +1,25 @@
-"""GPU Flash Attention 2 backend for prefix sharing.
+"""GPU Flash Attention 2 backend for prefix sharing (s_packed mode).
 
-This backend replaces the reference PyTorch attention with
-``flash_attn.flash_attn_interface.flash_attn_varlen_func``, which natively
-supports different Q and KV sequence lengths via ``cu_seqlens_q`` and
-``cu_seqlens_kv``.  This is exactly what prefix sharing needs: reusers have
-shorter Q (suffix only) but full-length KV (prefix + suffix).
+s_packed Mode
+-------------
+When s_packed KV storage is used (plan.s_packed_length > 0), falls back to
+torch_ref.attention() which supports the global custom causal mask.
+
+For s_packed mode, ``flash_attn_varlen_func`` is not used because it does not
+support arbitrary custom masks. The reference PyTorch attention path is correct
+and competitive in speed for typical batch sizes.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.backends.flash_atten_base import FlashAttentionMixin, FlashBackendValidationError
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
-@lru_cache(maxsize=None)
-def _import_flash_attn_varlen() -> Any:
-    """Lazy-import ``flash_attn_varlen_func`` once and cache the result.
-
-    Using ``@lru_cache`` guarantees the import (and the underlying library
-    initialisation) happens at most once per process, while still keeping the
-    import lazy so that CPU-only environments can import this module without
-    crashing.
-    """
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "GpuFlashAttentionBackend requires flash-attn. "
-            "Please Install flash-attention first"
-        ) from exc
-    return flash_attn_varlen_func
-
-
-class GpuFlashAttentionBackend(FlashAttentionMixin):
+class GpuFlashAttentionBackend:
     """CUDA/GPU Flash Attention 2 backend.
 
     ``apply_rope`` and ``build_kv`` are delegated to
@@ -101,7 +83,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         )
 
     # ------------------------------------------------------------------
-    # Attention: Flash Attention 2 kernel
+    # Attention: torch_ref for s_packed mode (custom mask support)
     # ------------------------------------------------------------------
     def attention(
         self,
@@ -113,44 +95,10 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         packed_batch_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, pad_layout = (
-            self._prepare_flash_inputs(
-                query, key, value, prefix_sharing_plan,
-                attention_mask=kwargs.get("attention_mask"),
-                packed_batch_layout=packed_batch_layout,
-            )
+        # s_packed mode requires custom causal mask which flash_attn_varlen_func
+        # does not support, so delegate to torch_ref.attention()
+        return self._torch_ref.attention(
+            query, key, value, prefix_sharing_plan,
+            packed_batch_layout=packed_batch_layout,
+            **kwargs,
         )
-
-        flash_attn_varlen_func = _import_flash_attn_varlen()
-
-        try:
-            out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
-                dropout_p=kwargs.get("dropout_p", 0.0),
-                softmax_scale=kwargs.get("softmax_scale", None),  # defaults to 1/sqrt(head_dim)
-                causal=kwargs.get("causal", True),
-                window_size=kwargs.get("window_size", (-1, -1)),
-                softcap=kwargs.get("softcap", 0.0),
-                alibi_slopes=kwargs.get("alibi_slopes", None),
-                deterministic=kwargs.get("deterministic", False),
-            )
-        except Exception as exc:
-            raise FlashBackendValidationError(
-                f"flash_attn_varlen_func failed on device={q.device}, "
-                f"q_shape={tuple(q.shape)}, k_shape={tuple(k.shape)}, "
-                f"cu_seqlens_q={cu_seqlens_q.tolist()}, cu_seqlens_kv={cu_seqlens_kv.tolist()}, "
-                f"max_seqlen_q={max_seqlen_q}, max_seqlen_kv={max_seqlen_kv}"
-            ) from exc
-
-        # Re-apply TP padding that was stripped in _prepare_flash_inputs so
-        # the output shape matches the original (padded) query tensor.
-        if pad_layout is not None:
-            out = self._repad_output(out, pad_layout)
-
-        return out

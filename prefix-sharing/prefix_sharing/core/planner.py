@@ -55,6 +55,8 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Sequence
 
+import torch
+
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 
@@ -134,6 +136,22 @@ class PrefixSharingPlan:
     # 恢复点信息（用于logprob恢复）
     prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)  # reuser的suffix-first位置恢复规范
 
+    # --- s_packed 去重存储（sparse_mode=1 新增）---
+    # 去重拼接后 s_packed 的总长度
+    s_packed_length: int = 0
+    # 每个输入在 s_packed 中的 KV 位置区间（可能跨多段：[prefix_range, suffix_range]）
+    # s_packed_kv_ranges[i] = [(start, end), ...]  — s_packed 中的闭区间
+    s_packed_kv_ranges: list[list[tuple[int, int]]] = field(default_factory=list)
+    # 每个输入的 Q 长度（= original_len - prefix_len，即 suffix 长度）
+    s_packed_q_lengths: list[int] = field(default_factory=list)
+    # 每个输入的 Q 在 s_packed 中的起始位置（用于构建 mask 时的 Q 位置索引）
+    s_packed_q_starts: list[int] = field(default_factory=list)
+    # 每个输入的 prefix 在 s_packed 中的结束位置（用于区分 prefix/suffix 区间）
+    s_packed_prefix_end: list[int] = field(default_factory=list)
+
+    # 内部缓存（不在 __post_init__ 验证）
+    _global_custom_mask: torch.Tensor | None = field(default=None, repr=False)
+
     def __post_init__(self) -> None:
         expected = self.batch_size
         fields: Sequence[tuple[str, list[object]]] = (
@@ -150,6 +168,9 @@ class PrefixSharingPlan:
             ("input_keep_ranges", self.input_keep_ranges),
             ("label_keep_ranges", self.label_keep_ranges),
             ("loss_mask_keep_ranges", self.loss_mask_keep_ranges),
+            ("s_packed_q_lengths", self.s_packed_q_lengths),
+            ("s_packed_q_starts", self.s_packed_q_starts),
+            ("s_packed_prefix_end", self.s_packed_prefix_end),
         )
         for name, value in fields:
             if len(value) != expected:
@@ -177,6 +198,95 @@ class PrefixSharingPlan:
             if spec.reuse_idx_in_batch == idx_in_batch:
                 return spec
         return None
+
+    # ------------------------------------------------------------------
+    # s_packed 去重构建 & custom causal mask（sparse_mode=1）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_s_packed(
+        input_ids: Sequence[Sequence[int]],
+        prefix_lens: Sequence[int],
+        original_lengths: Sequence[int],
+    ) -> tuple[list[tuple[int, int]], int]:
+        """构建去重 s_packed，返回每个输入在 s_packed 中的 KV 区间。
+
+        Returns:
+            s_packed_kv_ranges: list，每个元素是 input_i 的 KV 在 s_packed 中的区间列表
+            s_packed_length: s_packed 总长度
+        """
+        n = len(input_ids)
+        s_packed: list[int] = []
+        s_packed_kv_ranges: list[list[tuple[int, int]]] = []
+
+        for i in range(n):
+            seq = list(input_ids[i])
+            prefix_len = prefix_lens[i]
+            suffix_len = original_lengths[i] - prefix_len
+            ranges: list[tuple[int, int]] = []
+
+            # Prefix: 与当前 s_packed 做前缀匹配，找复用区间
+            if prefix_len > 0:
+                prefix = tuple(seq[:prefix_len])
+                matched = 0
+                for pos in range(len(s_packed) - prefix_len + 1):
+                    if tuple(s_packed[pos:pos + prefix_len]) == prefix:
+                        matched = prefix_len
+                        ranges.append((pos, pos + matched))
+                        break
+                if matched == 0:
+                    # Prefix 未匹配到，全部追加
+                    ranges.append((len(s_packed), len(s_packed) + prefix_len))
+                    s_packed.extend(seq[:prefix_len])
+
+            # Suffix: 总是追加到 s_packed 尾部
+            if suffix_len > 0:
+                suffix_start = len(s_packed)
+                s_packed.extend(seq[prefix_len:])
+                ranges.append((suffix_start, len(s_packed)))
+
+            s_packed_kv_ranges.append(ranges)
+
+        return s_packed_kv_ranges, len(s_packed)
+
+    def build_global_custom_mask(self, device: torch.device) -> torch.Tensor:
+        """构建全局 custom causal mask: (total_q, s_packed_length)。
+
+        Semantics: True = visible (consistent with _causal_q_kv_mask legacy convention)。
+        """
+        if self._global_custom_mask is not None:
+            return self._global_custom_mask
+
+        total_q = sum(self.s_packed_q_lengths)
+        T = self.s_packed_length
+        # Default invisible (False), matches _causal_q_kv_mask convention
+        mask = torch.zeros(total_q, T, dtype=torch.bool, device=device)
+
+        for batch_idx in range(self.batch_size):
+            q_offset = self.s_packed_q_starts[batch_idx]
+            q_len = self.s_packed_q_lengths[batch_idx]
+            prefix_len = self.prefix_lens[batch_idx]
+            prefix_end = self.s_packed_prefix_end[batch_idx]
+
+            for qi in range(q_len):
+                q_s_packed_pos = q_offset + qi
+
+                for (kv_lo, kv_hi) in self.s_packed_kv_ranges[batch_idx]:
+                    is_prefix_range = kv_hi <= prefix_end
+                    if is_prefix_range:
+                        # Within prefix: causal within prefix, position qi
+                        visible_hi = min(kv_hi, kv_lo + qi + 1)
+                        if kv_lo < visible_hi:
+                            mask[q_s_packed_pos, kv_lo:visible_hi] = True
+                    else:
+                        # Suffix range: causal within suffix
+                        suffix_rel = qi - prefix_len
+                        visible_hi = min(kv_hi, kv_lo + suffix_rel + 1)
+                        if kv_lo < visible_hi:
+                            mask[q_s_packed_pos, kv_lo:visible_hi] = True
+
+        object.__setattr__(self, "_global_custom_mask", mask)
+        return mask
 
 
 _forward_ids = itertools.count(1)
@@ -302,6 +412,30 @@ class PrefixSharingPlanner:
             loss_mask_keep_ranges.append(keep_range)
 
         cu_seqlens_q = _cumsum(kept_lengths_q)
+
+        # --- s_packed 去重构建（sparse_mode=1） ---
+        s_packed_kv_ranges, s_packed_length = PrefixSharingPlan.build_s_packed(
+            input_ids, prefix_lens, original_lengths,
+        )
+        # Q 长度 = suffix_len，Q 位置 = 展平的 suffix 区间
+        s_packed_q_lengths: list[int] = []
+        s_packed_q_starts: list[int] = []
+        s_packed_prefix_ends: list[int] = []
+        q_cumsum = 0
+        for i in range(batch_size):
+            q_len = kept_lengths_q[i]  # = suffix_len
+            s_packed_q_lengths.append(q_len)
+            s_packed_q_starts.append(q_cumsum)
+            q_cumsum += q_len
+            # prefix 在 s_packed 中的结束位置 = 第一段 prefix 区间的 hi
+            prefix_end = 0
+            for (lo, hi) in s_packed_kv_ranges[i]:
+                if hi - lo == prefix_lens[i]:
+                    prefix_end = hi
+                    break
+            s_packed_prefix_ends.append(prefix_end)
+        total_q = q_cumsum
+
         cu_seqlens_kv = _cumsum(expanded_lengths_kv)
 
         return PrefixSharingPlan(
@@ -327,4 +461,9 @@ class PrefixSharingPlanner:
             label_keep_ranges=label_keep_ranges,
             loss_mask_keep_ranges=loss_mask_keep_ranges,
             prefix_last_restore=restore_specs,
+            s_packed_length=s_packed_length,
+            s_packed_kv_ranges=s_packed_kv_ranges,
+            s_packed_q_lengths=s_packed_q_lengths,
+            s_packed_q_starts=s_packed_q_starts,
+            s_packed_prefix_end=s_packed_prefix_ends,
         )
