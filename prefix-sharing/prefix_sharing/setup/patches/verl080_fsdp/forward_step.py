@@ -22,7 +22,13 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
-            return original_forward_step(self, micro_batch, loss_function, forward_only)
+            result = original_forward_step(self, micro_batch, loss_function, forward_only)
+            # ##### [PS-diag] OFF dump: FSDP baseline #####
+            import os as _os_diag_off
+            if _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+                _dump_fsdp_baseline(micro_batch, result)
+            # ##### [PS-diag] end #####
+            return result
 
         if hasattr(micro_batch, "to"):
             try:
@@ -148,6 +154,31 @@ def _forward_step_with_engine_prepare(
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
 
+    # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
+    import os as _os_diag
+    if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import (
+            dump_meta_verl080,
+            dump_attention_mask_verl080, dump_label_mask_verl080,
+            build_attention_mask_2d, build_label_mask_2d,
+        )
+        _plan_diag = ps_state.prefix_sharing_plan
+        _prefix_lens_diag = list(_plan_diag.prefix_lens)
+        _orig_lens_diag = list(_plan_diag.original_lengths)
+        # FSDP packed path: cu_seqlens = cumsum of kept_lengths_q,  [B+1] int64
+        _kept = _plan_diag.kept_lengths_q
+        _cu_diag = torch.zeros(len(_kept) + 1, dtype=torch.int64)
+        for _i_diag, _l_diag in enumerate(_kept):
+            _cu_diag[_i_diag + 1] = _cu_diag[_i_diag] + _l_diag
+        dump_meta_verl080(_prefix_lens_diag, _cu_diag)
+        _Lmax_diag = max(_orig_lens_diag) if _orig_lens_diag else 0
+        dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens_diag, _Lmax_diag), "train")
+        _lm_diag = micro_batch.get("loss_mask")
+        if _lm_diag is not None:
+            _response_lens_diag = _lm_diag.sum(dim=-1).long().cpu().tolist()
+            dump_label_mask_verl080(build_label_mask_2d(_response_lens_diag, _orig_lens_diag, _Lmax_diag), "train")
+    # ##### [PS-diag] dump end #####
+
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
@@ -167,6 +198,20 @@ def _forward_step_with_engine_prepare(
             logits_processor_func=loss_function,
         )
         model_output = _restore_engine_model_output(model_output)
+
+        # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
+        import os as _os_diag2
+        if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
+            )
+            _lp_diag = model_output.get("log_probs")
+            if _lp_diag is not None and _lp_diag.dim() == 2:
+                dump_logprobs_2d_verl080(_lp_diag, "train")
+                _ent_diag = model_output.get("entropy")
+                if _ent_diag is not None and _ent_diag.dim() == 2:
+                    dump_entropy_2d_verl080(_ent_diag, "train")
+        # ##### [PS-diag] dump 2D logprobs/entropy end #####
 
         if loss_function is not None:
             loss, metrics = loss_function(
@@ -324,3 +369,51 @@ def _read_temperature(micro_batch: Any) -> float:
         return float(value)
     except Exception:
         return 1.0
+
+
+def _dump_fsdp_baseline(micro_batch: Any, result: Any) -> None:
+    """Dump FSDP OFF baseline diagnostics (no prefix-sharing)."""
+    import torch
+
+    from prefix_sharing.tools.diagnostic_dump_verl080 import (
+        build_attention_mask_2d, build_label_mask_2d,
+        dump_attention_mask_verl080, dump_entropy_2d_verl080,
+        dump_label_mask_verl080, dump_logprobs_2d_verl080, dump_meta_verl080,
+    )
+
+    if isinstance(result, tuple) and len(result) >= 2:
+        output_dict = result[1] if isinstance(result[1], dict) else result[0]
+    else:
+        output_dict = {}
+    model_output = output_dict.get("model_output", {})
+    if not model_output:
+        return
+
+    # original_lengths from micro_batch (full sequence lengths before trimming)
+    _ids = micro_batch.get("input_ids")
+    if _ids is not None and hasattr(_ids, "shape") and _ids.dim() == 2:
+        _orig_lens = [int(s) for s in _ids.shape[1:2] * 0 + _ids.shape[1]]
+    elif _ids is not None and hasattr(_ids, "is_nested") and _ids.is_nested:
+        _orig_lens = [int(d) for d in _ids.offsets().diff().tolist()]
+    else:
+        return
+
+    _prefix_lens = [0] * len(_orig_lens)
+    _cu = torch.zeros(len(_orig_lens) + 1, dtype=torch.int64)
+    for i, l in enumerate(_orig_lens):
+        _cu[i + 1] = _cu[i] + l
+    dump_meta_verl080(_prefix_lens, _cu)
+
+    _Lmax = max(_orig_lens) if _orig_lens else 0
+    dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens, _Lmax), "train")
+    _lm = micro_batch.get("loss_mask")
+    if _lm is not None:
+        _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
+        dump_label_mask_verl080(build_label_mask_2d(_response_lens, _orig_lens, _Lmax), "train")
+
+    _lp = model_output.get("log_probs")
+    if _lp is not None and _lp.dim() == 2:
+        dump_logprobs_2d_verl080(_lp, "train")
+        _ent = model_output.get("entropy")
+        if _ent is not None and _ent.dim() == 2:
+            dump_entropy_2d_verl080(_ent, "train")

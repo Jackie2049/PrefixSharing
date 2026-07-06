@@ -121,9 +121,11 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
 
     patch_set = _load_patch_set("verl080_fsdp")
 
-    assert len(patch_set) == 1
+    assert len(patch_set) == 2
     assert patch_set[0].module_name == "verl.workers.engine.fsdp.transformer_impl"
     assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
+    assert patch_set[1].module_name == "transformers.modeling_utils"
+    assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():
