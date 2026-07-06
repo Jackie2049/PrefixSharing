@@ -1,0 +1,38 @@
+{
+  "dir_on": "/home/zxw/prefix-sharing/dump_on",
+  "dir_off": "/home/zxw/prefix-sharing/dump_off",
+  "tag": "train",
+  "results": [
+    {
+      "shape": [
+        4,
+        49
+      ],
+      "active": 128,
+      "abs_max": 12.41064453125,
+      "abs_mean": 1.2439581155776978,
+      "rel_max": 0.9999418258666992,
+      "rel_mean": 0.42710381746292114,
+      "pearson_r": 0.36311985005247993,
+      "atol": 1e-05,
+      "name": "logp_train",
+      "passed": false
+    },
+    {
+      "shape": [
+        4,
+        49
+      ],
+      "active": 128,
+      "abs_max": 5.844482421875,
+      "abs_mean": 0.7652584910392761,
+      "rel_max": 0.999294102191925,
+      "rel_mean": 0.3531123697757721,
+      "pearson_r": 0.31408395934121625,
+      "atol": 1e-05,
+      "name": "entropy_train",
+      "passed": false
+    }
+  ],
+  "all_passed": false
+}
