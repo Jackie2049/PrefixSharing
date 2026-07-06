@@ -59,9 +59,19 @@ _patch_handle = None  # module-level reference for introspection / rollback
 def _auto_install_patches() -> None:
     """Install monkey patches on import.
 
-    Always attempts patch installation. Each patch wrapper checks the runtime
-    switch (PrefixSharingConfig.from_raw, which respects both config file and
-    env var) — when disabled, the wrapper passes through to the native path.
+    Patch set selection order (first match wins):
+
+    1. ``PREFIX_SHARING_PATCHSET`` env var — explicit patch set id (e.g.
+       ``verl080_fsdp``). Recommended for environments that install multiple
+       backends (Megatron + FSDP) where auto-detection would be ambiguous.
+       Aligns with docs/feature-fsdp.md §4.6.1 guidance.
+    2. Compat matrix auto-detection — picks a patch set based on detected
+       verl / megatron-core / mindspeed versions. Default path when no env
+       var is set.
+
+    Each patch wrapper checks the runtime switch (PrefixSharingConfig.from_raw,
+    which respects both config file and env var) — when disabled, the wrapper
+    passes through to the native path.
 
     Only runs once per process. Incompatible version combos are caught and
     logged without halting training.
@@ -72,10 +82,21 @@ def _auto_install_patches() -> None:
         print("[PS] Patches already installed, skipping.")
         return
 
+    import os
+
+    explicit_patch_set = os.getenv("PREFIX_SHARING_PATCHSET")
     try:
         from prefix_sharing.setup import install
-        _patch_handle = install()
-        print(f"[PS] Auto-activation succeeded: {_patch_handle.describe()}")
+
+        if explicit_patch_set:
+            _patch_handle = install(explicit_patch_set)
+            print(
+                f"[PS] Auto-activation via PREFIX_SHARING_PATCHSET={explicit_patch_set}: "
+                f"{_patch_handle.describe()}"
+            )
+        else:
+            _patch_handle = install()
+            print(f"[PS] Auto-activation succeeded: {_patch_handle.describe()}")
     except Exception as exc:
         # IncompatibleEnvironment or import errors — log and continue
         # Training proceeds normally without prefix-sharing patches.

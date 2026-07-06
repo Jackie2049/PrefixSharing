@@ -11,6 +11,7 @@ Patch 目标：
 from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
+from .attention import patch_transformers_attention
 
 
 PATCH_SET: list[PatchSpec] = [
@@ -22,5 +23,19 @@ PATCH_SET: list[PatchSpec] = [
         ),
         patch_factory=patch_fsdp_forward_step,
         description="FSDPEngineWithLMHead.forward_step → PrefixSharing dense FSDP helper",
+        eager=True,  # verl FSDP engine 仅在 actor 实例化时 lazy-load，必须 eager 触发
+    ),
+    PatchSpec(
+        module_name="transformers.modeling_utils",
+        target_getter=lambda mod: (
+            mod.ALL_ATTENTION_FUNCTIONS,
+            "get_interface",
+        ),
+        patch_factory=patch_transformers_attention,
+        description=(
+            "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
+            "(HF attention KV store/load on Q-path kept tokens)"
+        ),
+        # transformers 在 worker 启动早期就加载，无需 eager；context 不激活时透传。
     ),
 ]
