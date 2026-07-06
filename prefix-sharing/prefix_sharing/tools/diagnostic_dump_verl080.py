@@ -203,3 +203,158 @@ def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str) -> None:
     if dump_dir is None or ent_2d is None:
         return
     _save_tensor(f"entropy_{tag}.pt", ent_2d, dump_dir)
+
+
+def dump_raw_logits_verl080(raw_output: Any) -> None:
+    """从 HF/verl model raw output 中提取 logits 并 dump。
+
+    ON 路径中 logits 是裁剪后的 packed logits；OFF 路径中 logits 是完整 packed
+    logits。二者都由 ``cmp_diag_verl080`` 根据 ``prefix_lens`` / ``cu_seqlens`` 做
+    suffix 对齐。
+    """
+    if _get_dump_dir() is None:
+        return
+    logits = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
+    dump_logits_verl080(logits)
+
+
+def dump_fsdp_on_metadata_verl080(micro_batch: Any, prefix_sharing_plan: Any, tag: str) -> None:
+    """Dump FSDP PrefixSharing ON 路径的元数据和原始 batch 对齐锚点。"""
+    if _get_dump_dir() is None:
+        return
+
+    prefix_lens = list(prefix_sharing_plan.prefix_lens)
+    original_lengths = list(prefix_sharing_plan.original_lengths)
+    kept_lengths = list(prefix_sharing_plan.kept_lengths_q)
+
+    cu_seqlens = torch.zeros(len(kept_lengths) + 1, dtype=torch.int64)
+    for index, length in enumerate(kept_lengths):
+        cu_seqlens[index + 1] = cu_seqlens[index] + length
+    dump_meta_verl080(prefix_lens, cu_seqlens)
+
+    max_length = max(original_lengths) if original_lengths else 0
+    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag)
+
+    loss_mask = micro_batch.get("loss_mask")
+    if loss_mask is not None:
+        response_lengths = _response_lengths_from_loss_mask(loss_mask, len(original_lengths))
+        dump_label_mask_verl080(
+            build_label_mask_2d(response_lengths, original_lengths, max_length),
+            tag,
+        )
+    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag)
+
+
+def dump_fsdp_model_output_2d_verl080(
+    model_output: dict[str, Any],
+    original_lengths: list[int],
+    tag: str,
+) -> None:
+    """Dump restore 后的 FSDP log_probs / entropy 到统一 2D 坐标系。"""
+    if _get_dump_dir() is None:
+        return
+    max_length = max(original_lengths) if original_lengths else 0
+    log_probs = model_output.get("log_probs")
+    if log_probs is None:
+        return
+    log_probs_2d = _maybe_nested_to_2d(log_probs, original_lengths, max_length)
+    if log_probs_2d is None or log_probs_2d.dim() != 2:
+        return
+    dump_logprobs_2d_verl080(log_probs_2d, tag)
+
+    entropy = model_output.get("entropy")
+    if entropy is not None:
+        entropy_2d = _maybe_nested_to_2d(entropy, original_lengths, max_length)
+        if entropy_2d is not None and entropy_2d.dim() == 2:
+            dump_entropy_2d_verl080(entropy_2d, tag)
+
+
+def dump_fsdp_baseline_verl080(micro_batch: Any, result: Any, tag: str) -> None:
+    """Dump FSDP OFF baseline diagnostics (no prefix-sharing).
+
+    OFF 路径返回 ``(loss, output_dict)``，``output_dict["model_output"]`` 里的
+    ``log_probs`` / ``entropy`` 在 ``use_remove_padding=True`` 下通常是 jagged
+    NestedTensor；这里统一展开到 ``[B, L_max]``。
+    """
+    if _get_dump_dir() is None:
+        return
+    if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[1], dict):
+        output_dict = result[1]
+    else:
+        return
+    model_output = output_dict.get("model_output", {})
+    if not model_output:
+        return
+
+    original_lengths = _original_lengths_from_input_ids(micro_batch.get("input_ids"))
+    if original_lengths is None:
+        return
+
+    prefix_lens = [0] * len(original_lengths)
+    cu_seqlens = torch.zeros(len(original_lengths) + 1, dtype=torch.int64)
+    for index, length in enumerate(original_lengths):
+        cu_seqlens[index + 1] = cu_seqlens[index] + length
+    dump_meta_verl080(prefix_lens, cu_seqlens)
+
+    max_length = max(original_lengths) if original_lengths else 0
+    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag)
+
+    loss_mask = micro_batch.get("loss_mask")
+    if loss_mask is not None:
+        response_lengths = _response_lengths_from_loss_mask(loss_mask, len(original_lengths))
+        dump_label_mask_verl080(
+            build_label_mask_2d(response_lengths, original_lengths, max_length),
+            tag,
+        )
+    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag)
+    dump_fsdp_model_output_2d_verl080(model_output, original_lengths, tag)
+
+
+def dump_input_ids_2d_verl080(
+    micro_batch: Any,
+    original_lengths: list[int],
+    max_length: int,
+    tag: str,
+) -> None:
+    """Dump 原始 input_ids 到 2D ``[B, L_max]`` 作为 ON/OFF batch 对齐锚。"""
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    input_ids = micro_batch.get("input_ids")
+    if input_ids is None:
+        return
+    if _is_nested_tensor(input_ids):
+        ids_2d = nested_to_2d_full(input_ids, original_lengths, max_length)
+    elif hasattr(input_ids, "dim") and input_ids.dim() == 2:
+        ids_2d = input_ids
+    else:
+        return
+    _save_tensor(f"input_ids_{tag}.pt", ids_2d.long().cpu(), dump_dir)
+
+
+def _maybe_nested_to_2d(value: Any, original_lengths: list[int], max_length: int) -> Any | None:
+    if _is_nested_tensor(value):
+        return nested_to_2d_full(value, original_lengths, max_length)
+    if hasattr(value, "dim"):
+        return value
+    return None
+
+
+def _original_lengths_from_input_ids(input_ids: Any) -> list[int] | None:
+    if _is_nested_tensor(input_ids):
+        return [int(length) for length in input_ids.offsets().diff().tolist()]
+    if input_ids is not None and hasattr(input_ids, "dim") and input_ids.dim() == 2:
+        return [int(input_ids.shape[1])] * int(input_ids.shape[0])
+    return None
+
+
+def _response_lengths_from_loss_mask(loss_mask: Any, batch_size: int) -> list[int]:
+    if _is_nested_tensor(loss_mask):
+        offsets = loss_mask.offsets()
+        values = loss_mask.values()
+        return [int(values[offsets[i]:offsets[i + 1]].sum()) for i in range(batch_size)]
+    return loss_mask.sum(dim=-1).long().cpu().tolist()
+
+
+def _is_nested_tensor(value: Any) -> bool:
+    return hasattr(value, "offsets") and hasattr(value, "values")

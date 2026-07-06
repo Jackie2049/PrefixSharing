@@ -14,6 +14,7 @@ from prefix_sharing.integrations.verl_fsdp import (
     restore_prefix_sharing_outputs_2d,
 )
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+from prefix_sharing.setup.patches.verl080_fsdp.attention import patch_transformers_attention
 from prefix_sharing.setup.patches.verl080_fsdp.forward_step import patch_fsdp_forward_step
 
 
@@ -530,6 +531,84 @@ def test_verl080_fsdp_forward_step_patch_falls_back_when_disabled():
     result = patched(engine, {}, None, forward_only=True)
 
     assert result == ("loss", {"model_output": {"fallback": True}})
+
+
+def test_verl080_fsdp_forward_step_disabled_native_engine_uses_original_forward_step():
+    class NativeLikeEngine(_FakeFSDPEngine):
+        def prepare_model_inputs(self, micro_batch):
+            raise AssertionError("prepare_model_inputs must not run when prefix sharing is disabled")
+
+        def prepare_model_outputs(self, output, output_args, micro_batch, logits_processor_func):
+            raise AssertionError("prepare_model_outputs must not run when prefix sharing is disabled")
+
+    def original_forward_step(self, micro_batch, loss_function, forward_only):
+        del self, micro_batch, loss_function, forward_only
+        return "native-loss", {"model_output": {"native": True}}
+
+    patched = patch_fsdp_forward_step(original_forward_step)
+    engine = NativeLikeEngine(
+        _TinyHFStyleModel(vocab_size=32),
+        _EngineConfig({"enable_prefix_sharing": False}),
+    )
+
+    result = patched(engine, {"sentinel": True}, None, forward_only=True)
+
+    assert result == ("native-loss", {"model_output": {"native": True}})
+
+
+def test_transformers_attention_patch_passthrough_and_runtime_layout(monkeypatch):
+    calls = []
+
+    def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
+        calls.append(("original", query.shape, key.shape, value.shape, attention_mask))
+        return query.transpose(1, 2), "weights"
+
+    def original_get_interface(attn_implementation, default=None):
+        del attn_implementation, default
+        return original_attention
+
+    patched_get_interface = patch_transformers_attention(original_get_interface)
+    patched_attention = patched_get_interface("eager")
+
+    query = torch.randn(2, 4, 3, 5)
+    key = torch.randn(2, 2, 3, 5)
+    value = torch.randn(2, 2, 3, 5)
+    attention_mask = object()
+
+    output, weights = patched_attention(object(), query, key, value, attention_mask)
+
+    assert output.shape == (2, 3, 4, 5)
+    assert weights == "weights"
+    assert calls == [("original", query.shape, key.shape, value.shape, attention_mask)]
+
+    runtime_calls = []
+
+    class FakeRuntime:
+        def __init__(self, *, layer_id):
+            self.layer_id = layer_id
+
+        def forward(self, attn_func, query_ld, key_ld, value_ld):
+            del attn_func
+            runtime_calls.append((self.layer_id, query_ld.shape, key_ld.shape, value_ld.shape))
+            return query_ld.new_zeros(query_ld.shape)
+
+    class FakeModule:
+        layer_idx = 7
+
+    monkeypatch.setattr(
+        "prefix_sharing.integrations.context.current_prefix_sharing_context",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "prefix_sharing.integrations.verl_fsdp.PrefixSharingFSDPAttentionRuntime",
+        FakeRuntime,
+    )
+
+    output, weights = patched_attention(FakeModule(), query, key, value, attention_mask)
+
+    assert output.shape == (2, 3, 4, 5)
+    assert weights is None
+    assert runtime_calls == [(7, (2, 3, 4, 5), (2, 3, 2, 5), (2, 3, 2, 5))]
 
 
 def test_verl080_fsdp_forward_step_patch_allows_remove_padding_config_without_engine_prepare():

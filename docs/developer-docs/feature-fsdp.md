@@ -1316,9 +1316,80 @@ suffix 区域的 1.5% 差异**不是 bug**：fp32 下相同计算得到 5e-5 的
 2. **response 区差异完全来自 vLLM rollout 随机性**：vLLM V1 异步采样 + GPU 非确定性导致即使固定 seed，两次 run 的 response 也不同。seq2/seq3 恰好采到相同 response 时，整序列对齐到 bf16 级（abs_max=0.22），证明 PS suffix attention 也正确。
 3. **逐元素 ON-vs-OFF 对齐在真实随机 rollout 下不成立是预期内的**；要严格逐元素验证 suffix 区，需固定 rollout 输出（temperature=0 但会让 batch 退化）或用 synthetic 固定 batch（即之前 4.6.5/4.6.7 的 fp32 验证方式）。
 
-**诊断 dump 流程已打通：** `PREFIX_SHARING_DIAG_DUMP=<dir>` + `cmp_diag_verl080.py --dir-on --dir-off --tag train` 可正常采集和对比 FSDP 路径的 logprobs/entropy/masks/prefix_lens/cu_seqlens。FSDP 路径暂未 dump logits.pt / attn_outputs.pt（packed 对齐），留作后续。
+**诊断 dump 流程已打通：** `PREFIX_SHARING_DIAG_DUMP=<dir>` + `cmp_diag_verl080.py --dir-on --dir-off --tag train` 可正常采集和对比 FSDP 路径的 logprobs/entropy/masks/prefix_lens/cu_seqlens。（注：logits.pt / attn_outputs.pt 的 FSDP dump 在后续 commit `0e385cd0` 中补齐——见下方「temperature=0 确定性精度验证」条目；本条目记录时仅有 logp/entropy。）
 
 **日志：** `ps_off_seed.log`、`ps_on_seed.log`；**dump 目录：** `~/prefix-sharing/dump_off`、`~/prefix-sharing/dump_on`
+
+#### 2026.07.06周一（修正 14:30 报告）: temperature=0 确定性精度验证（单卡）
+
+> **为什么修正：** 14:30 报告依赖"两次 run 恰好采到相同 response"的偶然 batch 一致性（seq2/seq3 对齐、seq0/seq1 不对齐），方法论弱且不可复现。重新跑发现 seq1/seq2 在固定 seed 下也不一致——根因是 vLLM V1 异步采样不受 `data.seed` 控制。temperature=0 贪心解码是唯一能保证端到端确定性的方式。
+
+**关键前提验证：** `input_ids_train.pt` ON/OFF `torch.equal=True`（4 行字节级一致），逐元素对比成立——这是 14:30 报告缺失的验证。
+
+**FSDP dump 补全（commit `0e385cd0`）：** 在 FSDP 路径补齐 `attn_outputs.pt`（per-layer，`attention.py` 的 `_dump_fsdp_attn_output`，ON+OFF 双路径）+ `logits.pt`（`forward_step.py` 的 ON `_forward_step_with_engine_prepare` 与 OFF `_call_original_like_engine`）。14:30 报告"暂未 dump logits.pt/attn_outputs.pt"的限制已消除。
+
+**结果（input_ids 一致前提下的可信对比）：**
+
+| 指标 | 结果 | 判定 |
+|------|------|------|
+| attn per-layer (24 层) | cos_avg 0.9994–0.99997，cos_min ≥ 0.978 | ✅ bf16 级 |
+| first_token attn | cos 0.9994 | ✅ |
+| first_token logits | cos 0.9997 | ✅ |
+| logits packed (suffix aligned) | cos_avg 0.9997 | ✅ bf16 级 |
+| logp | pearson 0.997（abs_max 5.8e7） | ⚠️ temperature=0 ÷1e-8 幅度假象，非 PS bug |
+| entropy | 全 0 | ⚠️ 贪心退化，算法预期 |
+
+**结论：** PS 前向数值正确，attn+logits 在确定性 batch 下对齐到 bf16 级。logp/entropy 在 temperature=0 下退化是算法预期（`temperature.clamp(1e-8)` 除法 + 贪心）；真实 GRPO rollout（temp>0）因 vLLM 异步采样无法逐元素对齐 ON/OFF batch，故 **attn+logits 是可信的精度判据**。
+
+#### 2026.07.06周一15:44: 多卡功能验证（2/4/8 卡 FSDP）
+
+**目标：** 验证纯 FSDP（无 TP）多卡下 PS 功能正确。服务器为单机八卡 4090（此前 skill 误记为单卡，已修正）。
+
+**配置：** `trainer.n_gpus_per_node={2,4,8}` + `CUDA_VISIBLE_DEVICES=0..N-1`，`use_remove_padding=True`，GC off，GRPO no-critic。关闭 diag dump（functional 测试不需要；多 rank dump clobber 问题见下条）。
+
+**多卡 PS 安全性（代码审阅 + 实测）：** PS runtime / ContextVar / `_FSDP_ATTN_BUFFER` 全 per-process；纯 FSDP 每个 rank 独立处理自己的 micro_batch slice，KV store/load 按 `layer_id` 在 rank 内完成，无跨 rank 状态。FSDP 参数 gather、NCCL 梯度同步（2.27.5）、vLLM 多 replica 权重广播（`update_weights done` ×2）均与 PS patch 正交。
+
+**结果：**
+
+| 卡数 | global_step | entropy | PS 触发 rank | matches_expected | update_weights | batch 均衡 |
+|------|-------------|---------|--------------|------------------|----------------|------------|
+| 2 | ✅ | 1.844 | rank 0+1 | ✅ | ✅ ×2 | minmax_diff:0 |
+| 4 | ✅ | 1.594 | rank 0~3 | ✅ | ✅ ×2 | minmax_diff:0 |
+| 8 | ✅ | 1.300 | rank 0~7 | ✅ | ✅ ×2 | minmax_diff:0 |
+
+三档均：`store_count`/`reuse_hit`/`matches_expected=True`，NCCL 正常，无 fatal error。`grad_norm=0` 是 GRPO reward 全 0 → advantage 0 → loss 0 所致（tiny model 32 token 内解不出 GSM8K），非 PS bug；前向 entropy 非零证明 forward 正常。
+
+**结论：** 纯 FSDP 多卡功能正确，PS 与多卡训练栈正交无冲突。
+
+#### 2026.07.06周一16:20: 多卡精度验证（2/4/8 卡, temperature=0 确定性）
+
+**目标：** 以 2 卡为例将单卡精度验证扩展到单机任意卡数，验证多卡不引入 PS 精度退化。
+
+**多 rank dump clobber 修复：** `attention.py` 的 `_dump_fsdp_attn_output` 此前直接 `torch.save` 无 rank 门控，多 rank 会覆盖同一 `attn_outputs.pt`。补 `_rank0_only()` 门控（与 2D/logits dump 已有的 `_save_tensor` 门控一致）。单卡 `_rank0_only()` 恒 True，行为不变。
+
+**方法：** 每档 NGPU 跑 PS-on/off 两次（`temperature=0` + `data.shuffle=false` + `data.seed=42` 保证确定性），dump 到 `~/Termius/proj_prefix-sharing/dumps/{N}gpu_{on,off}/`，用 `cmp_diag_verl080.py` 对比 rank 0。纯 DP 各 rank 跑相同 PS 代码 + 功能测试已证全 rank `matches_expected=True`，rank 0 精度代表性成立。
+
+**关键前提：** 三档 `input_ids_train.pt` ON/OFF 均 `torch.equal=True`（字节级一致），逐元素对比有效。
+
+**结果：**
+
+| 信号 | 2 卡 | 4 卡 | 8 卡 |
+|------|------|------|------|
+| attn per-layer (24 层) | ✅ PASS（首差层 4） | ✅ PASS（首差层 5） | ✅ PASS（首差层 4） |
+| first_token attn cos | 0.9979 | **1.000000** | 0.9996 |
+| first_token logits cos | 0.9928 | 0.99999 | 0.9998 |
+| logits packed cos_avg | 0.9970 | 0.9997 | 0.9997 |
+| input_ids 一致 | ✅ | ✅ | ✅ |
+
+三档 attn+logits 均对齐到 bf16 级（0.997+–1.0），与单卡一致；logits 的 cmp_diag `FAIL` 标记是阈值 0.9999 对 bf16 偏严所致，cos_avg 0.997+ 实为通过。logp/entropy 在 temperature=0 下退化（÷1e-8 / 贪心），算法预期。
+
+**结论：** 多卡 FSDP（2/4/8）不引入 PS 精度退化，精度验证从单卡成功扩展到单机任意卡数。
+
+**报告：** `reports/fsdp_cmp_diag_{2,4,8}gpu_20260707.txt`；**dump：** `~/Termius/proj_prefix-sharing/dumps/{2,4,8}gpu_{on,off}`
+
+#### 测试使能方式说明
+
+上述所有真实环境测试走 **env-var 自动激活路径**：`VERL_USE_EXTERNAL_MODULES=prefix_sharing`（verl 启动时 import 包）+ `PREFIX_SHARING_PATCHSET=verl080_fsdp`（显式选 FSDP patch set）+ `ENABLE_PREFIX_SHARING=1`（每 batch 开关）。`install("verl080_fsdp")` 由 `import prefix_sharing` 时的 `_auto_install_patches()` 内部调用（`prefix_sharing/__init__.py:92`），与 §4.5.1 推荐的显式 `prefix_sharing.setup.install("verl080_fsdp")` 写法功能等价，**不强制统一**——env-var 路径在脚本化批量测试中更方便，显式 `install()` 在交互式/notebook 中更直观。
 
 ## Chapter 5：当前决策结论
 

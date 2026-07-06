@@ -22,18 +22,21 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
-            # 真实 engine（有 prepare_model_inputs/outputs）：走 _call_original_like_engine，
-            # 它与 verl 原生 forward_step forward 逻辑等价，但暴露 raw_output 使 OFF logits dump 可达；
-            # fake engine / 非 prepare 风格：仍走原生 original_forward_step 保持兼容。
-            if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
+            import os as _os_diag_off
+
+            # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
+            # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
+            if (
+                _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+                and hasattr(self, "prepare_model_inputs")
+                and hasattr(self, "prepare_model_outputs")
+            ):
                 result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
+                from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_baseline_verl080
+
+                dump_fsdp_baseline_verl080(micro_batch, result, "train")
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
-            # ##### [PS-diag] OFF dump: FSDP baseline 2D logp/entropy/masks #####
-            import os as _os_diag_off
-            if _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                _dump_fsdp_baseline(micro_batch, result)
-            # ##### [PS-diag] end #####
             return result
 
         if hasattr(micro_batch, "to"):
@@ -160,32 +163,11 @@ def _forward_step_with_engine_prepare(
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
 
-    # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
     import os as _os_diag
     if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import (
-            dump_meta_verl080,
-            dump_attention_mask_verl080, dump_label_mask_verl080,
-            build_attention_mask_2d, build_label_mask_2d,
-        )
-        _plan_diag = ps_state.prefix_sharing_plan
-        _prefix_lens_diag = list(_plan_diag.prefix_lens)
-        _orig_lens_diag = list(_plan_diag.original_lengths)
-        # FSDP packed path: cu_seqlens = cumsum of kept_lengths_q,  [B+1] int64
-        _kept = _plan_diag.kept_lengths_q
-        _cu_diag = torch.zeros(len(_kept) + 1, dtype=torch.int64)
-        for _i_diag, _l_diag in enumerate(_kept):
-            _cu_diag[_i_diag + 1] = _cu_diag[_i_diag] + _l_diag
-        dump_meta_verl080(_prefix_lens_diag, _cu_diag)
-        _Lmax_diag = max(_orig_lens_diag) if _orig_lens_diag else 0
-        dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens_diag, _Lmax_diag), "train")
-        _lm_diag = micro_batch.get("loss_mask")
-        if _lm_diag is not None:
-            _response_lens_diag = _lm_diag.sum(dim=-1).long().cpu().tolist()
-            dump_label_mask_verl080(build_label_mask_2d(_response_lens_diag, _orig_lens_diag, _Lmax_diag), "train")
-        # dump 原始（未 trim）input_ids 到 2D，供 ON/OFF batch 内容直接对比
-        _dump_input_ids_2d(micro_batch, _orig_lens_diag, _Lmax_diag, "train")
-    # ##### [PS-diag] dump end #####
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_on_metadata_verl080
+
+        dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
 
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
@@ -198,13 +180,11 @@ def _forward_step_with_engine_prepare(
     )
     with prefix_sharing_runtime_context(ps_state), autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
-        # ##### [PS-diag] dump packed logits（ON = 裁剪后 packed，必须在 logp 消耗前） #####
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
-            _logits_on = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
-            dump_logits_verl080(_logits_on)
-        # ##### [PS-diag] dump logits end #####
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+
+            dump_raw_logits_verl080(raw_output)
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -214,32 +194,15 @@ def _forward_step_with_engine_prepare(
         )
         model_output = _restore_engine_model_output(model_output)
 
-        # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
         import os as _os_diag2
         if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-            from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                dump_logprobs_2d_verl080, dump_entropy_2d_verl080, nested_to_2d_full,
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_model_output_2d_verl080
+
+            dump_fsdp_model_output_2d_verl080(
+                model_output,
+                list(ps_state.prefix_sharing_plan.original_lengths),
+                "train",
             )
-            _lp_diag = model_output.get("log_probs")
-            if _lp_diag is not None:
-                if _is_nested_tensor(_lp_diag):
-                    _ol_diag = list(ps_state.prefix_sharing_plan.original_lengths)
-                    _Lmax_diag = max(_ol_diag) if _ol_diag else 0
-                    _lp_diag = nested_to_2d_full(_lp_diag, _ol_diag, _Lmax_diag)
-                if _lp_diag.dim() == 2:
-                    dump_logprobs_2d_verl080(_lp_diag, "train")
-                    _ent_diag = model_output.get("entropy")
-                    if _ent_diag is not None:
-                        if _is_nested_tensor(_ent_diag):
-                            _ent_diag = nested_to_2d_full(
-                                _ent_diag,
-                                list(ps_state.prefix_sharing_plan.original_lengths),
-                                max(ps_state.prefix_sharing_plan.original_lengths) if ps_state.prefix_sharing_plan.original_lengths else 0,
-                            )
-                        if _ent_diag.dim() == 2:
-                            dump_entropy_2d_verl080(_ent_diag, "train")
-        # ##### [PS-diag] dump 2D logprobs/entropy end #####
 
         if loss_function is not None:
             loss, metrics = loss_function(
@@ -287,13 +250,11 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     )
     with autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
-        # ##### [PS-diag] dump packed logits（OFF baseline = 完整 packed） #####
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
-            _logits_off = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
-            dump_logits_verl080(_logits_off)
-        # ##### [PS-diag] dump logits end #####
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+
+            dump_raw_logits_verl080(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
@@ -413,104 +374,3 @@ def _read_temperature(micro_batch: Any) -> float:
         return float(value)
     except Exception:
         return 1.0
-
-
-def _dump_fsdp_baseline(micro_batch: Any, result: Any) -> None:
-    """Dump FSDP OFF baseline diagnostics (no prefix-sharing).
-
-    OFF 路径走原生 verl ``forward_step``，返回 ``(loss, output_dict)``，
-    ``output_dict["model_output"]`` 里的 ``log_probs``/``entropy`` 在 ``use_remove_padding=True`` 下
-    是 NestedTensor（jagged），用 :func:`nested_to_2d_full` 展开到 ``[B, L_max]``。
-    """
-    import torch
-
-    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-    from prefix_sharing.tools.diagnostic_dump_verl080 import (
-        build_attention_mask_2d, build_label_mask_2d, nested_to_2d_full,
-        dump_attention_mask_verl080, dump_entropy_2d_verl080,
-        dump_label_mask_verl080, dump_logprobs_2d_verl080, dump_meta_verl080,
-    )
-
-    # result = (loss, output_dict); output_dict["model_output"] holds log_probs/entropy
-    if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[1], dict):
-        output_dict = result[1]
-    else:
-        return
-    model_output = output_dict.get("model_output", {})
-    if not model_output:
-        return
-
-    # original_lengths from micro_batch["input_ids"] (pre-trim full lengths)
-    _ids = micro_batch.get("input_ids")
-    if _is_nested_tensor(_ids):
-        _orig_lens = [int(d) for d in _ids.offsets().diff().tolist()]
-    elif _ids is not None and hasattr(_ids, "dim") and _ids.dim() == 2:
-        # Dense [B, L]: all rows share the same length L (right-padded).
-        _orig_lens = [int(_ids.shape[1])] * int(_ids.shape[0])
-    else:
-        return
-
-    _prefix_lens = [0] * len(_orig_lens)
-    _cu = torch.zeros(len(_orig_lens) + 1, dtype=torch.int64)
-    for _i, _l in enumerate(_orig_lens):
-        _cu[_i + 1] = _cu[_i] + _l
-    dump_meta_verl080(_prefix_lens, _cu)
-
-    _Lmax = max(_orig_lens) if _orig_lens else 0
-    dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens, _Lmax), "train")
-    _lm = micro_batch.get("loss_mask")
-    if _lm is not None:
-        if _is_nested_tensor(_lm):
-            _off = _lm.offsets()
-            _val = _lm.values()
-            _response_lens = [int(_val[_off[i]:_off[i + 1]].sum()) for i in range(len(_orig_lens))]
-        else:
-            _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
-        dump_label_mask_verl080(build_label_mask_2d(_response_lens, _orig_lens, _Lmax), "train")
-
-    # dump 原始 input_ids 到 2D，供 ON/OFF batch 内容直接对比
-    _dump_input_ids_2d(micro_batch, _orig_lens, _Lmax, "train")
-
-    _lp = model_output.get("log_probs")
-    if _lp is None:
-        return
-    if _is_nested_tensor(_lp):
-        _lp_2d = nested_to_2d_full(_lp, _orig_lens, _Lmax)
-    elif _lp.dim() == 2:
-        _lp_2d = _lp
-    else:
-        return
-    dump_logprobs_2d_verl080(_lp_2d, "train")
-    _ent = model_output.get("entropy")
-    if _ent is not None:
-        if _is_nested_tensor(_ent):
-            _ent = nested_to_2d_full(_ent, _orig_lens, _Lmax)
-        if _ent.dim() == 2:
-            dump_entropy_2d_verl080(_ent, "train")
-
-
-def _dump_input_ids_2d(micro_batch: Any, orig_lens: list[int], l_max: int, tag: str) -> None:
-    """Dump 原始（未 trim）input_ids 到 2D ``[B, L_max]``，文件名 ``input_ids_{tag}.pt``。
-
-    用于 ON/OFF 两次 run 的 batch 内容直接逐 token 对比——这是判定 cmp_diag 逐行对比
-    是否成立的前提（只有 batch 内容字节级一致，逐元素 logp/entropy 对比才有意义）。
-    NestedTensor input_ids 按 original_lengths 展开到统一 [B, L_max]；dense 2D 直接存。
-    """
-    import torch
-
-    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-    from prefix_sharing.tools.diagnostic_dump import _get_dump_dir, _save_tensor
-
-    if _get_dump_dir() is None:
-        return
-    _ids = micro_batch.get("input_ids")
-    if _ids is None:
-        return
-    if _is_nested_tensor(_ids):
-        from prefix_sharing.tools.diagnostic_dump_verl080 import nested_to_2d_full
-        ids_2d = nested_to_2d_full(_ids, orig_lens, l_max)
-    elif hasattr(_ids, "dim") and _ids.dim() == 2:
-        ids_2d = _ids
-    else:
-        return
-    _save_tensor(f"input_ids_{tag}.pt", ids_2d.long().cpu(), _get_dump_dir())
