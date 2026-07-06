@@ -22,8 +22,14 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
-            result = original_forward_step(self, micro_batch, loss_function, forward_only)
-            # ##### [PS-diag] OFF dump: FSDP baseline #####
+            # 真实 engine（有 prepare_model_inputs/outputs）：走 _call_original_like_engine，
+            # 它与 verl 原生 forward_step forward 逻辑等价，但暴露 raw_output 使 OFF logits dump 可达；
+            # fake engine / 非 prepare 风格：仍走原生 original_forward_step 保持兼容。
+            if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
+                result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
+            else:
+                result = original_forward_step(self, micro_batch, loss_function, forward_only)
+            # ##### [PS-diag] OFF dump: FSDP baseline 2D logp/entropy/masks #####
             import os as _os_diag_off
             if _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 _dump_fsdp_baseline(micro_batch, result)
@@ -192,6 +198,13 @@ def _forward_step_with_engine_prepare(
     )
     with prefix_sharing_runtime_context(ps_state), autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
+        # ##### [PS-diag] dump packed logits（ON = 裁剪后 packed，必须在 logp 消耗前） #####
+        import os as _os_logits_on
+        if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
+            _logits_on = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
+            dump_logits_verl080(_logits_on)
+        # ##### [PS-diag] dump logits end #####
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -255,6 +268,15 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     import torch
     from contextlib import nullcontext
 
+    # 对齐 verl 原生 forward_step：先把 micro_batch 搬到 device（disable 路径绕过了
+    # patched_forward_step 里那段 .to(device)，这里补上，否则 prepare_model_outputs
+    # 里 logits/temperature device 不一致）。
+    if hasattr(micro_batch, "to"):
+        try:
+            from verl.utils.device import get_device_id
+            micro_batch = micro_batch.to(get_device_id())
+        except Exception:
+            pass
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     device_name = _read_device_name()
@@ -265,6 +287,13 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     )
     with autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
+        # ##### [PS-diag] dump packed logits（OFF baseline = 完整 packed） #####
+        import os as _os_logits_off
+        if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
+            _logits_off = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
+            dump_logits_verl080(_logits_off)
+        # ##### [PS-diag] dump logits end #####
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
