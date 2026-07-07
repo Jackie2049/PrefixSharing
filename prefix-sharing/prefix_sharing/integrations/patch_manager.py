@@ -28,7 +28,10 @@ class PatchHandle:
         if not self._active:
             return
         for record in reversed(self._records):
-            setattr(record.target, record.attr_name, record.original)
+            if isinstance(record.target, dict):
+                record.target[record.attr_name] = record.original
+            else:
+                setattr(record.target, record.attr_name, record.original)
         self._active = False
 
     def __enter__(self) -> "PatchHandle":
@@ -69,6 +72,31 @@ class PatchManager:
             _PatchRecord(
                 target=target,
                 attr_name=attr_name,
+                original=original,
+                replacement=replacement,
+            )
+        )
+
+    def patch_item(
+        self,
+        target: dict[Any, Any],
+        key: Any,
+        replacement: Any,
+        *,
+        signature_check: Callable[[Any], None] | None = None,
+    ) -> None:
+        if key not in target:
+            raise KeyError(key)
+        original = target[key]
+        if original is replacement:
+            return
+        if signature_check is not None:
+            signature_check(original)
+        target[key] = replacement
+        self._records.append(
+            _PatchRecord(
+                target=target,
+                attr_name=key,
                 original=original,
                 replacement=replacement,
             )

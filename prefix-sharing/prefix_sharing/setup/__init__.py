@@ -42,15 +42,24 @@ def check() -> DetectedVersions:
     return versions
 
 
-def install() -> PatchHandle:
+def install(patch_set_id: str | None = None) -> PatchHandle:
     """一键安装：版本探测 → 矩阵匹配 → 注册 patch → 应用 → 返回 handle。
+
+    Args:
+        patch_set_id: 显式指定 patch set。FSDP 开发线建议使用
+            ``install("verl080_fsdp")``，避免在同时安装 Megatron/MindSpeed 的
+            环境中被兼容矩阵自动选到 Megatron patch set。
 
     Returns: PatchHandle — 可调用 describe() 查看详情、disable() 回滚
     Raises: IncompatibleEnvironment — 版本组合不兼容
     """
-    versions = check()
-    entry = _find_compat_entry(versions)
-    patch_set = _load_patch_set(entry.patch_set_id)
+    if patch_set_id is None:
+        versions = check()
+        entry = _find_compat_entry(versions)
+        patch_set_id = entry.patch_set_id
+    else:
+        print(f"[PS] install() using explicit patch_set={patch_set_id}")
+    patch_set = _load_patch_set(patch_set_id)
 
     for spec in patch_set:
         PatchRegistry.register(spec)
@@ -58,7 +67,7 @@ def install() -> PatchHandle:
     handle = PatchRegistry.install_all()
 
     print(
-        f"[PS] install() complete. {len(patch_set)} patches active. patch_set={entry.patch_set_id}"
+        f"[PS] install() complete. {len(patch_set)} patches active. patch_set={patch_set_id}"
     )
     return handle
 

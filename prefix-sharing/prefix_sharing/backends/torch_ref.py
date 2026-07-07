@@ -349,16 +349,26 @@ def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
-    scale = math.sqrt(q_row.shape[-1])
+    # 用 ``F.scaled_dot_product_attention`` 替代手写 einsum+softmax：
+    # 在 bf16 autocast 下 ``torch.einsum`` 会被降到 bf16（即使输入已 .float()），
+    # 导致 softmax 精度严重劣化，误差在残差流里逐层放大；SDPA 不受 autocast 降精度
+    # 影响（内部 fp32 累加），与 HF attention 数值一致，且更快。Q/K/V 维持原 dtype。
+    import torch.nn.functional as _F
+
+    scale = 1.0 / math.sqrt(q_row.shape[-1])
+
     if q_row.dim() == 2:
-        scores = q_row @ k_row.transpose(-1, -2) / scale
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores, dim=-1)
-        return probs @ v_row
+        q4 = q_row.unsqueeze(0)                     # [1, Lq, D]
+        k4 = k_row.unsqueeze(0)                     # [1, Lk, D]
+        v4 = v_row.unsqueeze(0)
+        m4 = mask.unsqueeze(0)                      # [1, Lq, Lk]
+        out = _F.scaled_dot_product_attention(q4, k4, v4, attn_mask=m4, scale=scale)
+        return out.squeeze(0)
+
     if q_row.dim() != 3:
         raise ValueError("TorchReferenceBackend attention expects packed rows with 2 or 3 dims")
 
-    # 适配GQA
+    # 适配 GQA：把 KV head 复制到与 Q head 数一致（SDPA 旧版本不支持原生 GQA）。
     q_heads = q_row.shape[1]
     kv_heads = k_row.shape[1]
     if q_heads != kv_heads:
@@ -368,11 +378,13 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
         k_row = k_row.repeat_interleave(repeat, dim=1)
         v_row = v_row.repeat_interleave(repeat, dim=1)
 
-    # 注意力计算
-    scores = torch.einsum("qhd,khd->hqk", q_row, k_row) / scale
-    scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
-    probs = torch.softmax(scores, dim=-1)
-    return torch.einsum("hqk,khd->qhd", probs, v_row)
+    # 行内布局 [L, H, D] -> SDPA 期望的 [B=1, H, L, D]
+    q4 = q_row.transpose(0, 1).unsqueeze(0).contiguous()
+    k4 = k_row.transpose(0, 1).unsqueeze(0).contiguous()
+    v4 = v_row.transpose(0, 1).unsqueeze(0).contiguous()
+    m4 = mask.unsqueeze(0).unsqueeze(0)             # [1, 1, Lq, Lk] bool
+    out = _F.scaled_dot_product_attention(q4, k4, v4, attn_mask=m4, scale=scale)
+    return out.squeeze(0).transpose(0, 1)           # 回到 [Lq, H, D]
 
 
 def _pad_like_row(valid_row: Any, packed_row: Any) -> Any:

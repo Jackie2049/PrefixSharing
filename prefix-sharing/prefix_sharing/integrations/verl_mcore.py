@@ -517,6 +517,14 @@ def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
     import torch
 
     rows = [tensor_2d[seq_idx, :original_lengths[seq_idx]] for seq_idx in range(len(original_lengths))]
+    values = torch.cat(rows, dim=0) if rows else tensor_2d.reshape(0, *tensor_2d.shape[2:])
+    offsets = torch.tensor(
+        [0] + [sum(original_lengths[: idx + 1]) for idx in range(len(original_lengths))],
+        dtype=torch.long,
+        device=tensor_2d.device,
+    )
+    if hasattr(torch.nested, "nested_tensor_from_jagged"):
+        return torch.nested.nested_tensor_from_jagged(values, offsets)
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 

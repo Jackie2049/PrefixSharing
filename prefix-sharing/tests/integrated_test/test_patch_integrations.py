@@ -11,6 +11,7 @@ from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreIntegration,
     prefix_sharing_enabled,
 )
+from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
 
 
 class Target:
@@ -43,6 +44,22 @@ def test_patch_manager_context_manager_restores_original():
     with manager.handle():
         assert target.method() == "patched"
     assert target.method() == "original"
+
+
+def test_patch_manager_installs_and_disables_dict_item_patch():
+    registry = {"eager": lambda: "original"}
+    original = registry["eager"]
+    manager = PatchManager()
+
+    def replacement():
+        return "patched"
+
+    manager.patch_item(registry, "eager", replacement)
+    handle = manager.handle()
+    assert registry["eager"]() == "patched"
+
+    handle.disable()
+    assert registry["eager"] is original
 
 
 def test_megatron_integration_reports_missing_dependency_cleanly(monkeypatch):
@@ -79,6 +96,36 @@ def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
     integration = VerlMCoreIntegration(config=config)
     with pytest.raises(IntegrationUnavailable, match="verl"):
         integration.install(model_config={})
+
+
+def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
+    import importlib
+
+    _original_import = importlib.import_module
+
+    def _mock_import(name, package=None):
+        if name == "verl":
+            raise ModuleNotFoundError("No module named 'verl'")
+        return _original_import(name, package=package)
+
+    monkeypatch.setattr(importlib, "import_module", _mock_import)
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    integration = VerlFSDPIntegration(config=config)
+    with pytest.raises(IntegrationUnavailable, match="verl"):
+        integration.install(model_config={})
+
+
+def test_setup_can_load_explicit_verl080_fsdp_patch_set():
+    from prefix_sharing.setup import _load_patch_set
+
+    patch_set = _load_patch_set("verl080_fsdp")
+
+    assert len(patch_set) == 2
+    assert patch_set[0].module_name == "verl.workers.engine.fsdp.transformer_impl"
+    assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
+    assert patch_set[1].module_name == "transformers.modeling_utils"
+    assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():
