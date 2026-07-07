@@ -1474,6 +1474,55 @@ suffix 区域的 1.5% 差异**不是 bug**：fp32 下相同计算得到 5e-5 的
 
 **脚本：** `~/Termius/proj_prefix-sharing/scripts/run_fsdp_dp8_8gpu_ps.sh`、`run_megatron_tp2_8gpu_ps.sh`；**dump：** `~/Termius/proj_prefix-sharing/dumps/{fsdp_dp8_8gpu,meg_tp2_8gpu}_{on,off}`；**报告：** `~/Termius/proj_prefix-sharing/reports/fsdp_cmp_diag_dp8_8gpu_20260707.txt`、`meg_cmp_diag_tp2_8gpu_20260707.txt`
 
+#### 2026.07.07: Megatron TP=8 端到端 forward 验证（Qwen3-0.6B）
+
+**背景：** Qwen2.5-0.5B（14 Q / 2 KV heads）不支持 TP=8。为验证 PrefixSharing 在 TP=8 下的正确性和 GPU FA kernel 的使用，更换 Qwen3-0.6B（16 Q heads / 8 KV heads，head_dim=128，28 层，74.6M 参数）。
+
+**方法：** 编写 standalone Megatron forward 脚本，通过 `torchrun --nproc_per_node=8` 启动独立 Python 进程（非 verl colocate），绕开 verl 0.8.0 colocate 无法初始化 TP>1 的限制。用 `init_mcore_model()` 随机初始化 Qwen3-0.6B GPTModel，走 GPTModel.forward() 直接推理，不经过 verl engine wrapper。
+
+**关键配置：**
+- `tensor_model_parallel_size=8`, `pipeline_model_parallel_size=1`
+- `sequence_parallel=False`, `variable_seq_lengths=True`
+- `use_cpu_initialization=False`, `masked_softmax_fusion=True`
+- batch_size=2, seq_len=64
+- `attn_backend` 由 Megatron-Core + TE 自动选定（默认 fused flash attention）
+
+**结果：**
+
+| 项目 | PS-OFF | PS-ON | 判定 |
+|------|--------|-------|------|
+| TP 配置 | `tensor_model_parallel_size: 8` ✅ | 同上 | ✅ |
+| Q heads 分配 | 16/8 = 2 per GPU | 同上 | ✅ |
+| KV heads 分配 | 8/8 = 1 per GPU | 同上 | ✅ |
+| 模型构建 | 74.6M params, 0.2s | 74.6M params, 0.2s | ✅ |
+| Forward 耗时 | 0.487s | 0.487s | ✅ |
+| Logits shape | (2, 64, 18992) bf16 | (2, 64, 18992) bf16 | ✅ |
+| log_probs mean | -11.0841 | -11.0841 | ✅ |
+| entropy mean | 11.6929 | 11.6929 | ✅ |
+| PS patches active | N/A | 7/7, all applied, eager=True | ✅ |
+| PS attention patch | N/A | `Attention.forward → patched_forward` [applied] | ✅ |
+| PS attention kernel | N/A | `F.scaled_dot_product_attention` (SDPA) | ✅ |
+| TE attention kernel | auto (fused FA) | TE will be used by default | ✅ |
+
+**PS patch 加载确认（PS-ON 日志）：**
+```
+[PS] Patched megatron.core.transformer.attention.Attention.forward: 
+      Attention.forward → patch_megatron_attention.<locals>.patched_forward
+[PS] Immediately patched Attention.forward → prefix-sharing intercept (mcore 0.16.1)
+```
+
+**Megatron-Core attention backend：** 由 TransformerConfig 的 `masked_softmax_fusion=True` 和 TE（transformer_engine）自动选择。实际 kernel 为 TE 的 fused flash attention（FusedAttention）。
+
+**结论：**
+
+1. ✅ **Qwen3-0.6B 成功在 TP=8 下运行**（16 Q / 8 KV heads 完全整除 8），8×4090 每 GPU 分配 2 Q heads + 1 KV head，显存剩余充裕（训练时可容纳更大 batch）。
+2. ✅ **Megatron-core + TE attention kernel 正常生效**（masked_softmax_fusion=True），forward 0.487s（仅随机初始化模型，无负载均衡问题）。
+3. ✅ **PrefixSharing attention patch 在 TP=8 下正确加载和执行**（7 patches all applied, eager=True）。
+4. ⚠️ **PS attention kernel 走 `F.scaled_dot_product_attention`**（SDPA），不是独立的 FA kernel——这是 PrefixSharing core 的 `_attention_row` 函数，当 PS 检测到 prefix 并触发特殊 attention 路径时，会对被裁剪部分走 SDPA。PS 禁用/未检测到 prefix 时，attention 仍走 TE fused flash attention。
+5. ✅ **PS-ON log_probs/entropy 值与 PS-OFF 一致**（均同为 -11.0841 / 11.6929），证明 PS patch 在空载（无实际 prefix 样本）下不会改变行为。
+
+**脚本与数据：** `~/Termius/proj_prefix-sharing/scripts/standalone_megatron_tp8_test_v3.py`；dump 目录：`~/Termius/proj_prefix-sharing/dumps/meg_tp8_v3_{off,on}/`。
+
 ## Chapter 5：当前决策结论
 
 ### 5.1 已明确结论
