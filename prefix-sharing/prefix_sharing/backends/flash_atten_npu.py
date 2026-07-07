@@ -67,34 +67,46 @@ def _torch() -> Any:
 
 def _build_s_packed_mask(
     plan: PrefixSharingPlan,
-    valid_lens: List[int],
+    valid_lens: list[int],
     max_q: int,
     s_packed_length: int,
     device: Any,
 ) -> Any:
-    """Build BSHD mask from s_packed plan.
+    """Build BSHD mask from s_packed plan with causal constraints.
 
     Returns mask of shape (batch_size, 1, max_q, s_packed_length) where:
-    - True = visible (attended to), False = masked (invisible)
-    - Each batch's visible KV positions come from plan.s_packed_kv_ranges
+    - True = masked (invisible), False = visible  (matches npu_fusion_attention atten_mask convention)
+    - Each batch's visible KV positions come from plan.s_packed_kv_ranges,
+      with causal masking applied within each block.
     """
     torch = _torch()
     batch_size = plan.batch_size
-    mask = torch.zeros(batch_size, 1, max_q, s_packed_length, dtype=torch.bool, device=device)
+    # True = masked (invisible) by default, set False for visible positions.
+    mask = torch.ones(batch_size, 1, max_q, s_packed_length, dtype=torch.bool, device=device)
 
     for i in range(batch_size):
         q_len = valid_lens[i]
         if q_len == 0:
             continue
 
-        for kv_pos in range(s_packed_length):
-            # Check if kv_pos belongs to input i's s_packed ranges
-            visible = False
-            for (kv_lo, kv_hi) in plan.s_packed_kv_ranges[i]:
-                if kv_lo <= kv_pos < kv_hi:
-                    visible = True
-                    break
-            mask[i, 0, :q_len, kv_pos] = visible
+        prefix_len = plan.prefix_lens[i]
+        prefix_end = plan.s_packed_prefix_end[i]
+
+        for qi in range(q_len):
+            q_s_packed = plan.s_packed_q_starts[i] + qi
+            q_original_pos = prefix_len + qi
+
+            for kv_lo, kv_hi in plan.s_packed_kv_ranges[i]:
+                if kv_hi <= prefix_end:
+                    # Prefix block: causal boundary is q_original_pos.
+                    visible_hi = min(kv_hi, q_original_pos)
+                else:
+                    # Suffix block: causal boundary is q_original_pos + prefix_len.
+                    visible_hi = min(kv_hi, q_original_pos + prefix_len + 1)
+
+                if kv_lo < visible_hi:
+                    # Set visible positions to False (unmasked).
+                    mask[i, 0, qi, kv_lo:visible_hi] = False
 
     return mask
 
@@ -219,22 +231,22 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         hidden_q = num_q_heads * head_dim
         hidden_kv = num_kv_heads * head_dim
 
-        # --- Step 1: split THD → per-sample rows ---
+        # --- Step 1: split THD → per-sample rows (only Q needs split; K/V are
+        #            already the complete s_packed sequence and must NOT be re-split) ---
         q_rows = _split_packed(q, packed_layout.padded_lengths)
-        k_rows = _split_packed(k, [s_packed_length] * batch_size)
-        v_rows = _split_packed(v, [s_packed_length] * batch_size)
 
         # --- Step 2: pad & stack → BSH ---
+        # K/V: each batch row receives the FULL s_packed K/V (no split needed).
+        # Reshape THD → (s_packed_length, hidden_kv) first, then expand to BSH.
+        k_bsh = k.reshape(s_packed_length, hidden_kv).unsqueeze(0).expand(batch_size, -1, -1)
+        v_bsh = v.reshape(s_packed_length, hidden_kv).unsqueeze(0).expand(batch_size, -1, -1)
+
         q_bsh = torch.zeros(batch_size, max_q, hidden_q, dtype=q.dtype, device=q.device)
-        k_bsh = torch.zeros(batch_size, s_packed_length, hidden_kv, dtype=k.dtype, device=k.device)
-        v_bsh = torch.zeros(batch_size, s_packed_length, hidden_kv, dtype=v.dtype, device=v.device)
 
         for i in range(batch_size):
             if valid_lens[i] > 0:
                 q_bsh[i, :valid_lens[i], :] = \
                     q_rows[i][:valid_lens[i]].reshape(valid_lens[i], hidden_q)
-            k_bsh[i, :, :] = k_rows[i].reshape(s_packed_length, hidden_kv)
-            v_bsh[i, :, :] = v_rows[i].reshape(s_packed_length, hidden_kv)
 
         # --- Step 3: build s_packed custom mask ---
         atten_mask = _build_s_packed_mask(
