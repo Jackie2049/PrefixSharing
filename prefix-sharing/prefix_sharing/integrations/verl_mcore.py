@@ -563,19 +563,58 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
 
 
 def read_ps_config_from_engine_config(engine_config: Any) -> Any | None:
-    """从 verl080 engine_config 读取 prefix_sharing_config。
+    """从 verl080 engine_config 读取 PrefixSharing 配置。
 
-    verl080 engine_config 中 prefix_sharing_config 的位置：
-    1. engine_config.override_transformer_config 是 dict -> 从 dict 中取
-    2. engine_config.override_transformer_config 是对象 -> 从对象属性取
-    3. 回退 -> engine_config.prefix_sharing_config（直接挂在 engine_config 上）
+    优先读取内部实验入口 ``prefix_sharing_config``；若未配置，再读取 verl
+    PrefixGrouper 风格入口 ``use_prefix_grouper + prefix_grouper.mode``。
     """
     override = getattr(engine_config, "override_transformer_config", None)
     if override is not None:
         if isinstance(override, dict):
-            return override.get("prefix_sharing_config")
-        return getattr(override, "prefix_sharing_config", None)
-    return getattr(engine_config, "prefix_sharing_config", None)
+            explicit_config = override.get("prefix_sharing_config")
+        else:
+            explicit_config = getattr(override, "prefix_sharing_config", None)
+        if explicit_config is not None:
+            return explicit_config
+
+    explicit_config = getattr(engine_config, "prefix_sharing_config", None)
+    if explicit_config is not None:
+        return explicit_config
+
+    return _prefix_sharing_config_from_prefix_grouper(engine_config)
+
+
+def _prefix_sharing_config_from_prefix_grouper(engine_config: Any) -> dict[str, Any] | None:
+    use_prefix_grouper = _read_actor_value(engine_config, "use_prefix_grouper", False)
+    if not use_prefix_grouper:
+        return None
+
+    prefix_grouper_config = _read_actor_value(engine_config, "prefix_grouper", None)
+    mode = _read_actor_value(prefix_grouper_config, "mode", "prompt_only")
+    normalized_mode = str(mode or "prompt_only").strip().lower()
+
+    if normalized_mode in {"prompt_only", "prompt-only", "prefix_grouper"}:
+        return {"enable_prefix_sharing": False}
+    if normalized_mode not in {"arbitrary_prefix", "arbitrary-prefix", "prefix_sharing"}:
+        raise ValueError(
+            "prefix_grouper.mode must be one of: prompt_only, arbitrary_prefix"
+        )
+
+    values: dict[str, Any] = {"enable_prefix_sharing": True}
+    for field_name in (
+        "detector",
+        "backend",
+        "min_prefix_len",
+        "min_group_size",
+        "boundary_strategy",
+        "validate_precision",
+        "integrate_mode",
+        "model_type",
+    ):
+        field_value = _read_actor_value(prefix_grouper_config, field_name, None)
+        if field_value is not None:
+            values[field_name] = field_value
+    return values
 
 
 def build_prefix_sharing_micro_batch_verl080(
