@@ -148,6 +148,8 @@ class PrefixSharingPlan:
     s_packed_q_starts: list[int] = field(default_factory=list)
     # 每个输入的 prefix 在 s_packed 中的结束位置（用于区分 prefix/suffix 区间）
     s_packed_prefix_end: list[int] = field(default_factory=list)
+    # 每个输入的 suffix 在 s_packed 中的起始位置（用于 mask 计算）
+    s_packed_suffix_start: list[int] = field(default_factory=list)
 
     # 内部缓存（不在 __post_init__ 验证）
     _global_custom_mask: torch.Tensor | None = field(default=None, repr=False)
@@ -171,6 +173,7 @@ class PrefixSharingPlan:
             ("s_packed_q_lengths", self.s_packed_q_lengths),
             ("s_packed_q_starts", self.s_packed_q_starts),
             ("s_packed_prefix_end", self.s_packed_prefix_end),
+            ("s_packed_suffix_start", self.s_packed_suffix_start),
         )
         for name, value in fields:
             if len(value) != expected:
@@ -259,7 +262,6 @@ class PrefixSharingPlan:
 
         total_q = sum(self.s_packed_q_lengths)
         T = self.s_packed_length
-        # Default invisible (False), matches _causal_q_kv_mask convention
         mask = torch.zeros(total_q, T, dtype=torch.bool, device=device)
 
         for batch_idx in range(self.batch_size):
@@ -267,23 +269,27 @@ class PrefixSharingPlan:
             q_len = self.s_packed_q_lengths[batch_idx]
             prefix_len = self.prefix_lens[batch_idx]
             prefix_end = self.s_packed_prefix_end[batch_idx]
+            suffix_s_start = self.s_packed_suffix_start[batch_idx]
 
             for qi in range(q_len):
-                q_s_packed_pos = q_offset + qi
+                q_pos = q_offset + qi
+                q_original_pos = prefix_len + qi
 
                 for (kv_lo, kv_hi) in self.s_packed_kv_ranges[batch_idx]:
-                    is_prefix_range = kv_hi <= prefix_end
-                    if is_prefix_range:
-                        # Within prefix: causal within prefix, position qi
-                        visible_hi = min(kv_hi, kv_lo + qi + 1)
+                    if kv_hi <= prefix_end:
+                        # Prefix block: contiguous starting at original position 0.
+                        visible_hi = min(kv_hi, q_original_pos)
                         if kv_lo < visible_hi:
-                            mask[q_s_packed_pos, kv_lo:visible_hi] = True
+                            mask[q_pos, kv_lo:visible_hi] = True
                     else:
-                        # Suffix range: causal within suffix
-                        suffix_rel = qi - prefix_len
-                        visible_hi = min(kv_hi, kv_lo + suffix_rel + 1)
+                        # Suffix block: s_packed position kv_lo maps to original position kv_lo - prefix_len
+                        # (suffix in s_packed occupies the same positions as in original space).
+                        # Causal: kv_original_pos <= q_original_pos
+                        # -> kv - prefix_len <= q_original_pos
+                        # -> kv <= q_original_pos + prefix_len
+                        visible_hi = min(kv_hi, q_original_pos + prefix_len + 1)
                         if kv_lo < visible_hi:
-                            mask[q_s_packed_pos, kv_lo:visible_hi] = True
+                            mask[q_pos, kv_lo:visible_hi] = True
 
         object.__setattr__(self, "_global_custom_mask", mask)
         return mask
@@ -413,28 +419,44 @@ class PrefixSharingPlanner:
 
         cu_seqlens_q = _cumsum(kept_lengths_q)
 
-        # --- s_packed 去重构建（sparse_mode=1） ---
-        s_packed_kv_ranges, s_packed_length = PrefixSharingPlan.build_s_packed(
-            input_ids, prefix_lens, original_lengths,
-        )
-        # Q 长度 = suffix_len，Q 位置 = 展平的 suffix 区间
-        s_packed_q_lengths: list[int] = []
-        s_packed_q_starts: list[int] = []
-        s_packed_prefix_ends: list[int] = []
-        q_cumsum = 0
-        for i in range(batch_size):
-            q_len = kept_lengths_q[i]  # = suffix_len
-            s_packed_q_lengths.append(q_len)
-            s_packed_q_starts.append(q_cumsum)
-            q_cumsum += q_len
-            # prefix 在 s_packed 中的结束位置 = 第一段 prefix 区间的 hi
-            prefix_end = 0
-            for (lo, hi) in s_packed_kv_ranges[i]:
-                if hi - lo == prefix_lens[i]:
-                    prefix_end = hi
-                    break
-            s_packed_prefix_ends.append(prefix_end)
-        total_q = q_cumsum
+        # --- s_packed layout: consume fused detector output ---
+        sp = detection.s_packed_result
+        if sp is not None:
+            s_packed_length = sp.s_packed_length
+            s_packed_kv_ranges = sp.s_packed_kv_ranges
+            s_packed_q_lengths = sp.s_packed_q_lengths
+            s_packed_q_starts = sp.s_packed_q_starts
+            s_packed_prefix_ends = sp.s_packed_prefix_ends
+            s_packed_suffix_starts = sp.s_packed_suffix_starts
+            _prebuilt_mask = sp._custom_mask
+        else:
+            # Fallback: run legacy build_s_packed for backward compatibility.
+            s_packed_kv_ranges, s_packed_length = PrefixSharingPlan.build_s_packed(
+                input_ids, prefix_lens, original_lengths,
+            )
+            s_packed_q_lengths = []
+            s_packed_q_starts = []
+            s_packed_prefix_ends = []
+            s_packed_suffix_starts = []
+            q_cumsum = 0
+            for i in range(batch_size):
+                q_len = kept_lengths_q[i]
+                s_packed_q_lengths.append(q_len)
+                s_packed_q_starts.append(q_cumsum)
+                q_cumsum += q_len
+                if s_packed_kv_ranges[i]:
+                    prefix_start = s_packed_kv_ranges[i][0][0]
+                    prefix_end = prefix_start + prefix_lens[i]
+                else:
+                    prefix_start = prefix_end = 0
+                s_packed_prefix_ends.append(prefix_end)
+                # suffix starts at the s_packed position where this sample's suffix was appended.
+                if s_packed_kv_ranges[i]:
+                    suffix_s_start = s_packed_kv_ranges[i][-1][0]
+                else:
+                    suffix_s_start = 0
+                s_packed_suffix_starts.append(suffix_s_start)
+            _prebuilt_mask = None
 
         cu_seqlens_kv = _cumsum(expanded_lengths_kv)
 
@@ -466,4 +488,6 @@ class PrefixSharingPlanner:
             s_packed_q_lengths=s_packed_q_lengths,
             s_packed_q_starts=s_packed_q_starts,
             s_packed_prefix_end=s_packed_prefix_ends,
+            s_packed_suffix_start=s_packed_suffix_starts,
+            _global_custom_mask=_prebuilt_mask,
         )

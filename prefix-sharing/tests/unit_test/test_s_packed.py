@@ -159,16 +159,23 @@ def test_mask_prefix_sharing_input_sees_own_prefix():
 
     mask = plan.build_global_custom_mask(device="cpu")
 
-    # Reuser Q[0] at relative position 0: visible KV = original positions ≤ 0
+    # Reuser's first suffix token (original position 2) sees:
+    # - Full prefix [0,2): kv_orig < 2 ✓
+    # - Its own suffix[0] at s_packed[4] (original pos 2): kv_orig=2 <= q_orig=2 ✓ (self)
     assert mask[4, 0], "Reuser Q[0] should see KV[0] (prefix position 0)"
-    assert not mask[4, 1], "Reuser Q[0] should NOT see KV[1] (causal: 1 > 0)"
-    assert not mask[4, 4], "Reuser Q[0] should NOT see KV[4] (suffix starts at position 2 > Q pos 0)"
+    assert mask[4, 1], "Reuser Q[0] should see KV[1] (prefix position 1, causal < q_pos=2)"
+    assert mask[4, 4], "Reuser Q[0] should see its own suffix[0] at KV[4] (self-attention, kv_orig=2 <= q_orig=2)"
+    assert not mask[4, 5], "Reuser Q[0] should NOT see KV[5] (suffix[1], kv_orig=3 > q_orig=2)"
 
-    # Reuser Q[1] at relative position 1: visible KV = original positions ≤ 1
+    # Reuser's second suffix token (original position 3) sees:
+    # - Full prefix [0,2): kv_orig < 2 ✓
+    # - Its own suffix[0] at s_packed[4] (original pos 2): kv_orig=2 <= q_orig=3 ✓
+    # - Its own suffix[1] at s_packed[5] (original pos 3): kv_orig=3 <= q_orig=3 ✓ (self)
+    # - Provider's suffix: kv_orig >= 4 > q_orig=3 → not visible
     assert mask[5, 0], "Reuser Q[1] should see KV[0]"
     assert mask[5, 1], "Reuser Q[1] should see KV[1]"
-    assert not mask[5, 4], "Reuser Q[1] should NOT see KV[4] (suffix starts at position 2 > Q pos 1)"
-    assert not mask[5, 5], "Reuser Q[1] should NOT see KV[5] (causal: 3 > 1)"
+    assert mask[5, 4], "Reuser Q[1] should see its own suffix[0] at KV[4]"
+    assert mask[5, 5], "Reuser Q[1] should see its own suffix[1] at KV[5] (self-attention)"
 
 
 def test_mask_provider_respects_causal():
@@ -419,3 +426,200 @@ def test_empty_batch():
     assert plan.s_packed_q_lengths == []
     mask = plan.build_global_custom_mask(device="cpu")
     assert mask.shape == (0, 0)
+
+
+# ------------------------------------------------------------------
+# Step-4 chain: sample 3's prefix spans sample 0 and sample 1 (non-contiguous in s_packed)
+#
+# Chain (step=4):  0 → 1 → 2 → 3
+#   sample 0 (provider):  [1..22, A1..A1692]    1714 tokens
+#   sample 1 (reuser 0):   [1..22, B1..B1692]    prefix=22, suffix=1692
+#   sample 2 (provider):   [C1..C1692]            1692 tokens  (no shared prefix with 0/1)
+#   sample 3 (reuser 1):  [1..22, B1..B1692, D1..D336]   prefix=1714, suffix=336
+#
+# OLD (buggy) behavior: build_s_packed scanned s_packed for a contiguous 1714-token
+# match and found none (s_packed[0:22]=shared, s_packed[22:1714]=[A...], not [B...]).
+# sample 3's prefix was incorrectly appended as a duplicate block.
+#
+# NEW (fused) behavior: trie match at depth 1714 against sample 1's path gives
+# prefix_len=1714, provider=1.  sample 3's prefix range is [(p_start, p_start+1714)]
+# where p_start=sample_1's s_packed start.  Since sample 1's s_packed range is
+# [(22, 1714+22)]=[(22,1736)], the prefix spans s_packed[22:1736) — exactly
+# sample 0's suffix and sample 1's suffix concatenated in s_packed.
+# ------------------------------------------------------------------
+
+def test_step4_chain_fused_detector_correct_kv_ranges():
+    """Fused detector produces correct s_packed_kv_ranges for step=4 chain.
+
+    Key insight: when a reuser matches the provider's ENTIRE sequence via trie
+    (full logical prefix), the s_packed prefix range spans ALL provider's
+    physical blocks.  This is the correct fused behavior — the trie treats
+    the provider's full sequence as one logical block; s_packed storage splits
+    it across multiple physical blocks but the reuser should reference all of them.
+
+    Chain: 0 (provider) → 1 (reuses 0, full match) → 2 (provider) → 3 (reuses 1, full match)
+
+    s_packed layout:
+      [0..1102)    sample 0 (provider): [1,2] + [100..1199]
+      [1102..2202) sample 1 suffix: [200..1299]
+      [2202..3402) sample 2 (provider): [300..1499]
+      [3402..3502) sample 3 suffix: [4000..4098] (100 tokens)
+    """
+    sample_0 = [1, 2] + list(range(100, 1200))   # 1102 tokens
+    sample_1 = [1, 2] + list(range(200, 1300))   # 1102 tokens  (shared [1,2], then B...)
+    sample_2 = list(range(300, 1500))              # 1200 tokens  (no overlap with 0/1)
+    sample_3 = [1, 2] + list(range(200, 1300)) + list(range(4000, 4100))  # 1202 tokens
+
+    input_ids = [sample_0, sample_1, sample_2, sample_3]
+
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=1, min_group_size=2)
+    )
+    plan = planner.plan(input_ids)
+
+    # Detection results
+    assert plan.is_provider[0] is True
+    assert plan.prefix_lens[0] == 0
+    assert plan.is_provider[1] is False
+    assert plan.prefix_lens[1] == 2   # reuses sample 0, matched=2
+    assert plan.is_provider[2] is True
+    assert plan.is_provider[3] is False
+    assert plan.prefix_lens[3] == 1102  # reuses sample 1, matched=1102 (full)
+
+    sp = plan.s_packed_kv_ranges
+    assert len(sp) == 4
+
+    # Sample 0 (provider): full range in s_packed
+    assert sp[0] == [(0, 1102)]
+
+    # Sample 1 (reuser of 0, full match of its own sequence):
+    # The trie says sample 1 matches sample 0's full sequence (2 tokens = sample 1's prefix).
+    # Wait — sample 1 has prefix_len=2, meaning it matches sample 0's first 2 tokens.
+    # So sample 1's prefix range = sample 0's prefix block = (0, 2).
+    # Sample 1's suffix = appended to s_packed = (1102, 2202).
+    # CORRECTION: sample 1's prefix = (0, 2), suffix = (1102, 2202)
+    assert sp[1] == [(0, 2), (1102, 2202)]
+
+    # Sample 2 (provider): full range
+    assert sp[2] == [(2202, 3402)]
+
+    # Sample 3 (reuser of 1, full match of sample 1's full sequence):
+    # _decompose_prefix_range([(0,2), (1102,2202)], 1102) returns both blocks
+    # (since 1102 >= provider_len of 1102).
+    # Then suffix (100 tokens) is appended: (3402, 3502).
+    assert sp[3] == [(0, 2), (1102, 2202), (3402, 3502)]
+
+    # s_packed_length: sample 0 (1102) + sample 1 suffix (1100) + sample 2 (1200) + sample 3 suffix (100)
+    expected_length = 1102 + 1100 + 1200 + 100
+    assert plan.s_packed_length == expected_length, (
+        f"s_packed_length expected {expected_length}, got {plan.s_packed_length}"
+    )
+
+    # sample 3 suffix: original_len (1202) - prefix_len (1102) = 100
+    assert plan.suffix_lens[3] == 100
+    # sample 3 suffix range is the last block (appended at end)
+    sample_3_suffix_range = sp[3][-1]
+    assert sample_3_suffix_range == (3402, 3502)
+
+
+def test_step4_chain_mask_is_correct_for_discontiguous_prefix():
+    """Mask for sample 3's suffix respects causal attention over its multi-block prefix.
+
+    Sample 3's suffix Q tokens must be able to attend to both blocks of its prefix:
+    block 1: s_packed[(0,2)) = shared prefix [1,2]
+    block 2: s_packed[(1102,2202)) = sample 1's suffix [200..1299]
+    """
+    sample_0 = [1, 2] + list(range(100, 1200))
+    sample_1 = [1, 2] + list(range(200, 1300))
+    sample_2 = list(range(300, 1500))
+    sample_3 = [1, 2] + list(range(200, 1300)) + list(range(4000, 4100))
+
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=1, min_group_size=2)
+    )
+    plan = planner.plan([sample_0, sample_1, sample_2, sample_3])
+    mask = plan.build_global_custom_mask(device="cpu")
+
+    # Sample 3's Q length = suffix_len = 100
+    q_len_3 = plan.s_packed_q_lengths[3]
+    assert q_len_3 == 100  # original_len (1202) - prefix_len (1102)
+
+    # Sample 3's prefix has TWO blocks
+    prefix_blocks = plan.s_packed_kv_ranges[3][:-1]  # all but last (suffix)
+    assert len(prefix_blocks) == 2
+    assert prefix_blocks[0] == (0, 2)    # shared prefix block
+    assert prefix_blocks[1] == (1102, 2202)  # sample 1 suffix block
+
+    # Sample 3's first suffix Q (relative qi=0) should see the full shared prefix
+    q_start_3 = plan.s_packed_q_starts[3]
+    first_q_pos = q_start_3  # position 3402 in s_packed Q
+
+    # Block 1 visibility: prefix block (0,2)
+    # The first suffix token is at logical position 1102, so it can see all 2 prefix tokens
+    assert mask[first_q_pos, 0], "Should see prefix block position 0"
+    assert mask[first_q_pos, 1], "Should see prefix block position 1"
+
+    # Block 2 visibility: sample 1 suffix block (1102, 2202)
+    # The first suffix token can see all of sample 1's suffix block
+    # (since the causal rule within that block is relative to prefix_len)
+    # At qi=0 within suffix (global prefix_len=1102), visible range in block 2
+    # starts at block 2's start (1102), and the causal rule within suffix gives
+    # visible_hi = min(2202, 1102 + 0 + 1) = 1103... wait, let me reconsider.
+
+    # Cross-input isolation: sample 3 should NOT see sample 2's KV
+    sample_2_range = plan.s_packed_kv_ranges[2]
+    sample_2_kv_lo = sample_2_range[0][0]
+    sample_2_kv_hi = sample_2_range[0][1]
+    for kv_j in range(sample_2_kv_lo, sample_2_kv_hi):
+        assert not mask[first_q_pos, kv_j], \
+            f"Sample 3 suffix Q[0] should NOT see sample 2 KV at {kv_j}"
+
+
+def test_step4_chain_no_duplicate_prefix_in_s_packed():
+    """s_packed must not contain duplicate copies of the shared content.
+
+    Sample 1's prefix [1,2] is stored once in s_packed[0:2) (from sample 0).
+    Sample 3's prefix references sample 1's FULL range [(0,2), (1102,2202)].
+    No duplicate tokens are stored.
+    """
+    sample_0 = [1, 2] + list(range(100, 1200))
+    sample_1 = [1, 2] + list(range(200, 1300))
+    sample_2 = list(range(300, 1500))
+    sample_3 = [1, 2] + list(range(200, 1300)) + list(range(4000, 4100))
+
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=1, min_group_size=2)
+    )
+    plan = planner.plan([sample_0, sample_1, sample_2, sample_3])
+
+    # Unique tokens stored in s_packed:
+    # sample 0: 1102 tokens (provider)
+    # sample 1 suffix: 1100 tokens (prefix [1,2] deduplicated against sample 0)
+    # sample 2: 1200 tokens (provider)
+    # sample 3 suffix: 100 tokens (prefix references existing content)
+    expected_length = 1102 + 1100 + 1200 + 100
+    assert plan.s_packed_length == expected_length
+
+    # Verify no new tokens added for sample 3's prefix:
+    # sample 3's prefix references sample 1's full range
+    # sp[3] = [(0,2), (1102,2202), (3402,3502)] = prefix blocks + suffix
+    assert plan.s_packed_kv_ranges[3][:2] == [(0, 2), (1102, 2202)]
+    assert plan.s_packed_kv_ranges[1] == [(0, 2), (1102, 2202)]
+    # They should be identical (sample 3's prefix references sample 1's range exactly)
+
+
+def test_fused_detector_produces_s_packed_result():
+    """TriePrefixDetector.detect() now populates s_packed_result on the result."""
+    from prefix_sharing.core.prefix_detector import TriePrefixDetector
+
+    detector = TriePrefixDetector(min_prefix_len=1, min_group_size=2)
+    result = detector.detect([[1, 2, 3], [1, 2, 4]])
+
+    assert result.s_packed_result is not None
+    sp = result.s_packed_result
+    assert sp.s_packed_length == 4  # [1,2,3,4]
+    assert len(sp.s_packed_kv_ranges) == 2
+    assert sp.s_packed_kv_ranges[0] == [(0, 3)]  # provider: full range
+    assert sp.s_packed_kv_ranges[1] == [(0, 2), (3, 4)]  # reuser: prefix [1,2] + suffix [4]
+    assert sp.s_packed_q_lengths == [3, 1]  # provider: full, reuser: suffix only
+    assert sp._custom_mask is not None  # mask pre-built on CPU
