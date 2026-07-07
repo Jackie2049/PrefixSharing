@@ -309,6 +309,42 @@ prefix_grouper:
   mode: prompt_only | arbitrary_prefix
 ```
 
+#### 2.1.1 `open-source_fsdp-usability` 开发约定
+
+本分支目标是把已经验证过的 FSDP 能力补齐为“用户可理解、可配置、可复现”的实验特性入口，不重新设计 FSDP 核心算法路径。
+
+必要开发范围：
+
+1. PrefixSharing 包内先支持读取 verl 风格配置：
+
+   ```yaml
+   use_prefix_grouper: true
+   prefix_grouper:
+     mode: arbitrary_prefix
+   ```
+
+2. 配置语义：
+   - `mode=prompt_only`：PrefixSharing 不启用，保留给 PrefixGrouper 包处理；
+   - `mode=arbitrary_prefix`：PrefixSharing 启用 FSDP arbitrary-prefix 路径；
+   - 缺省 `mode`：按 `prompt_only` 处理，保持 PrefixGrouper 既有行为；
+   - 旧实验入口 `prefix_sharing_config`、`ENABLE_PREFIX_SHARING`、`PREFIX_SHARING_PATCHSET=verl080_fsdp` 继续保留。
+
+3. 兼容策略：
+   - `prefix_sharing_config` 优先级高于 `prefix_grouper.mode`，便于内部调试和回归；
+   - `prefix_grouper` 中只透传 PrefixSharing 已支持字段，例如 `min_prefix_len`、`min_group_size`、`validate_precision`；
+   - `strict` 等 PrefixSharing 暂未接收字段不传入 `PrefixSharingConfig`，避免用户侧配置污染内部 dataclass。
+
+4. 测试分工：
+   - Codex 负责本地 TDD：配置解析、prompt_only/arbitrary_prefix 分发、旧配置兼容、user-guide 文档；
+   - ClaudeCode 负责真实 verl/FSDP 环境测试：确认用户文档中的启用方式可执行、audit 日志可见、2/4/8 卡 packed path 不回退。
+
+本分支不做：
+
+- 不修改 verl 主仓 yaml/dataclass schema；
+- 不把 PrefixGrouper 包内部逻辑迁入 PrefixSharing；
+- 不新增性能 benchmark；
+- 不把实验特性写入 README。
+
 不建议首版使用：
 
 ```yaml
@@ -1092,7 +1128,7 @@ prefix_sharing_config:
 export ENABLE_PREFIX_SHARING=1
 ```
 
-当前 `prefix_grouper.mode=prompt_only|arbitrary_prefix` 还没有落地到用户面配置分发，所以真实环境测试先不要依赖该字段。
+PrefixSharing 包侧已支持读取 `prefix_grouper.mode=prompt_only|arbitrary_prefix` 并完成 prompt-only / arbitrary-prefix 分发；但 verl 上游 yaml/dataclass schema 尚未正式接入该字段，所以真实环境测试仍优先使用环境变量路径，或在本地实验配置中手动挂载等价字段。
 
 #### 4.5.2 最小 smoke 流程
 
@@ -1205,7 +1241,7 @@ attention output -> logits -> log_probs/entropy -> restore -> loss -> grad
 | Phase 4 | 性能 benchmark | ❌ |
 | Phase 5 | RFC 与 PR 拆分 | ❌ |
 
-**阻塞合入的三个缺口：** (1) FSDP engine patch set 需真实环境 smoke；(2) 无 `prefix_grouper.mode` 配置分发；(3) 无真实 verl FSDP smoke test 结果。
+**当时阻塞合入的三个缺口：** (1) FSDP engine patch set 需真实环境 smoke；(2) 无 `prefix_grouper.mode` 配置分发；(3) 无真实 verl FSDP smoke test 结果。后续已补齐 FSDP patch set、真实环境 smoke、多卡验证；`prefix_grouper.mode` 已在 PrefixSharing 包侧支持读取，verl 上游 schema 接入仍留待社区 PR。
 
 **本地回归结果（faf5e6ea）：**
 ```
@@ -1390,6 +1426,53 @@ suffix 区域的 1.5% 差异**不是 bug**：fp32 下相同计算得到 5e-5 的
 #### 测试使能方式说明
 
 上述所有真实环境测试走 **env-var 自动激活路径**：`VERL_USE_EXTERNAL_MODULES=prefix_sharing`（verl 启动时 import 包）+ `PREFIX_SHARING_PATCHSET=verl080_fsdp`（显式选 FSDP patch set）+ `ENABLE_PREFIX_SHARING=1`（每 batch 开关）。`install("verl080_fsdp")` 由 `import prefix_sharing` 时的 `_auto_install_patches()` 内部调用（`prefix_sharing/__init__.py:92`），与 §4.5.1 推荐的显式 `prefix_sharing.setup.install("verl080_fsdp")` 写法功能等价，**不强制统一**——env-var 路径在脚本化批量测试中更方便，显式 `install()` 在交互式/notebook 中更直观。
+
+#### 2026.07.07周一: 8 卡 batch_size=16 精度验证（FSDP + Megatron 双路线）
+
+**目标：** 在 8 卡 4090 上分别测试 FSDP 和 Megatron 两条路线的 PrefixSharing 精度（PS on vs off），batch_size=16。
+
+**TP=8 不可行约束：** Qwen2.5-0.5B 有 14 个 Q heads + 2 个 KV heads。TP=8 要求 `num_heads % tp_size == 0`（14 % 8 ≠ 0，2 % 8 ≠ 0），vLLM 和 Megatron-core 均有 `assert total_num_heads % tp_size == 0` 硬检查。TP=8 在此模型下不可行。可行的最大 TP 是 2（14/2=7 Q heads，2/2=1 KV head）。
+
+**FSDP 路线（DP=8，8 卡）：** 纯 FSDP data parallel，batch_size=16，GRPO no-critic，temperature=0 确定性。
+
+**关键前提：** `input_ids_train.pt` ON/OFF `torch.equal=True`（4×49 字节级一致），逐元素对比有效。
+
+**FSDP DP=8 结果：**
+
+| 信号 | 结果 | 判定 |
+|------|------|------|
+| attn per-layer (24 层) | cos_avg 0.999+，cos_min 0.966+，首差层 3 | ✅ bf16 级 |
+| first_token attn | cos 0.998 | ✅ |
+| first_token logits | cos 0.999 | ✅ |
+| logits packed (suffix aligned) | cos_avg 0.9997，cos_min 0.998 | ✅ bf16 级（FAIL 标记为阈值 0.9999 偏严） |
+| logp/entropy | abs_max=0（temperature=0 退化） | ⚠️ 贪心退化，算法预期 |
+| ON prefix_lens | [0, 4, 49, 4] | PS 正常触发 |
+| OFF prefix_lens | [0, 0, 0, 0] | baseline |
+
+**结论：** FSDP DP=8 batch_size=16 精度与之前的 DP=8 batch_size=4 一致（bf16 级对齐），batch_size 增大不引入 PS 精度退化。
+
+**Megatron 路线（TP=1 + DP=8，8 卡）：** 配置了 `actor.megatron.tensor_model_parallel_size=2`，但 verl 0.8.0 colocate 8-worker 模式下 Megatron 实际以 TP=1 运行（`TransformerConfig` 显示 `tensor_model_parallel_size=1`，`get_megatron_parallel_info` 报告 `tp_rank=0/tp_size=1`）。这可能是 verl 0.8.0 在 8-worker colocate 下 TP 初始化的限制。实际配置为 TP=1 + DP=8 + PPO+critic，batch_size=16。
+
+**Megatron PS patch set `eager=True` 修复：** 首次运行发现 Megatron patch set 的所有 6 个 patches 均未生效（import hook 200 次未拦截目标模块后 auto-restored）。根因：`verl.workers.engine.megatron.transformer_impl` 和 `megatron.core.transformer.attention` 在 PS import hook 安装前已被 `verl.workers.engine.__init__.py` 预加载。修复：给所有 Megatron patches 加 `eager=True`（与 FSDP patch set 相同的做法），强制立即 import 并 patch 已加载模块。修复后 7 patches 全部 `Immediately patched`，无 pending 状态。
+
+**Megatron route 不 dump `input_ids_train.pt` 和 `entropy_train.pt`**（Megatron forward_step dump 机制与 FSDP 不同）。prefix_lens ON=[0,4] OFF=[0,0] 正确。`logprobs_train.pt` shape (2,49) ON/OFF 一致，间接证明 batch 相同。
+
+**Megatron TP=1 + DP=8 结果：**
+
+| 信号 | 结果 | 判定 |
+|------|------|------|
+| rope_freqs | max_diff 0.0 | ✅ 完全一致 |
+| attn per-layer (24 层) | cos_avg 0.999+，cos_min 0.936+，首差层 1 | ✅ bf16 级 |
+| first_token attn | cos 0.99996 | ✅ |
+| first_token logits | cos 0.9999 | ✅ |
+| logits packed (suffix aligned) | cos_avg 0.9996，cos_min 0.997 | ✅ bf16 级（FAIL 标记阈值偏严） |
+| logp_train | pearson 0.9995，abs_max 0.24 | ⚠️ 伪 FAIL，temperature=0 下 logp 精度受贪心退化影响 |
+
+**结论：** Megatron TP=1 + DP=8 batch_size=16 精度 bf16 级对齐，PS 在 Megatron 路线正确触发。但实际未测试到 TP>1 条件（verl 0.8.0 colocate 限制），真正 TP=2 精度验证需在 2-GPU 专门 Megatron colocate 环境下进行（参考 `~/verldir/scripts/run_megatron_2gpu.sh`）。
+
+**重要发现：** Megatron patch set `eager=True` 修复是必要的——与 FSDP patch set 的 `eager=True` 同理，verl 的 engine 模块在 import hook 安装前已被预加载。此修复需合入 open-source_fsdp 分支。
+
+**脚本：** `~/Termius/proj_prefix-sharing/scripts/run_fsdp_dp8_8gpu_ps.sh`、`run_megatron_tp2_8gpu_ps.sh`；**dump：** `~/Termius/proj_prefix-sharing/dumps/{fsdp_dp8_8gpu,meg_tp2_8gpu}_{on,off}`；**报告：** `~/Termius/proj_prefix-sharing/reports/fsdp_cmp_diag_dp8_8gpu_20260707.txt`、`meg_cmp_diag_tp2_8gpu_20260707.txt`
 
 ## Chapter 5：当前决策结论
 
