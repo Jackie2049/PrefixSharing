@@ -12,10 +12,11 @@
 - 对 core detector / planner、TorchRef backend、FSDP dense pack/scatter 做本地 CPU PoC 计时。
 - 对 block causal mask 做显存规模估算。
 - 拉取并合并最新 `origin/open-source` 后，重新审视已合入的 FSDP patch 与 GPU/NPU FlashAttention backend。
+- **（2026-07-07）在 4090 GPU 上完成 standalone 性能摸底实验**，覆盖 CPU overhead (detector/planner)、Device overhead (build_kv/FA kernel)、Memory overhead (HBM peak)。结果已回填到 §1.4 结果回填模板。
 
 本轮未完成：
 
-- 未在真实 GPU / NPU 上跑 profiler，因此涉及 device kernel、stream、HBM peak 的结论需要在目标环境复验。
+- 已完成 4090 GPU standalone microbenchmark；尚未完成完整 verl/Megatron/FSDP 训练端到端 profiler，也尚未完成 NPU profiler。因此 GPU microbenchmark 已确认的结论可以用于第一轮优化决策，涉及 NPU、分布式并行、完整训练 forward/backward/update 的结论仍需在目标环境复验。
 - 涉及 attention 主体时，只把 GPU/NPU FlashAttention 算子作为正式优化对象；TorchRef attention 仅作为调试/reference 路线。
 - TorchRef `build_kv()` 仍是正式路径热点，因为当前 GPU/NPU FlashAttention backend 也复用 TorchRef 的 KV expansion 实现。
 
@@ -95,7 +96,7 @@ FSDP 路径第一阶段重点：core 早停、减少 dense pack/scatter、尽可
 
 ### 1.4 PoC 观测结果
 
-本节按前文的热点分类组织 PoC 与后续实验计划。当前 Codex 侧已完成本地 CPU PoC，可用于定位 Python 调度、临时对象和粗粒度内存规模；GPU/NPU 相关实验需要后续在目标训练环境执行，并将结果回填到本文档。
+本节按前文的热点分类组织 PoC 与实验结果。当前 Codex 侧已完成本地 CPU PoC，ClaudeCode 已在 4090 上回填 standalone GPU benchmark；NPU、分布式并行和完整训练端到端实验仍需后续在目标环境执行，并继续按表格模板回填。
 
 #### CPU Overhead
 
@@ -172,7 +173,28 @@ FSDP 路径第一阶段重点：core 早停、减少 dense pack/scatter、尽可
 
 | device | pipeline | case | batch | seq | valid tokens | reused tokens | provider/reuser | nonzero ms p50/p90 | tolist ms p50/p90 | detector ms p50/p90 | plan construct ms p50/p90 | trim/layout ms p50/p90 | py objects/peak MB | conclusion |
 |---|---|---|---:|---:|---:|---:|---|---|---|---|---|---|---|---|
-| TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| gpu_4090 | standalone | no_sharing | 8 | 256 | 2048 | 0 | 8/0 | 0.06/0.08 | 0.08/0.10 | 8.69/9.51 | 8.70/9.23 | 0.04/0.04 | 130/0.73 | no-sharing P0 confirmed: 8.7ms detector with 0 benefit |
+| gpu_4090 | standalone | no_sharing | 32 | 512 | 16384 | 0 | 32/0 | 0.19/0.20 | 0.42/0.81 | 82.17/253 | 82.15/255 | 0.08/0.09 | 514/6.12 | no-sharing P0 confirmed: 82ms detector with 0 benefit |
+| gpu_4090 | standalone | one_provider | 8 | 256 | 2048 | 896 | 1/7 | 0.06/0.09 | 0.08/0.10 | 5.23/5.33 | 5.35/5.43 | 0.04/0.04 | 186/0.41 | detector+plan 10.6ms; plan construction >30% → compact P0/P1 |
+| gpu_4090 | standalone | one_provider | 32 | 512 | 16384 | 11904 | 1/31 | 0.07/0.08 | 0.35/0.36 | 31.83/32.46 | 32.24/33.46 | 0.08/0.09 | 762/1.81 | detector+plan 64ms; plan construction >30% → compact P0/P1 |
+| gpu_4090 | standalone | chain | 8 | 256 | 2048 | 1600 | 1/7 | 0.06/0.06 | 0.08/0.08 | 2.56/2.60 | 2.63/2.67 | 0.04/0.04 | 161/0.16 | chain reuse reduces trie cost vs one_provider |
+| gpu_4090 | standalone | chain | 32 | 512 | 16384 | 15744 | 1/31 | 0.07/0.07 | 0.34/0.35 | 13.73/13.93 | 13.85/14.27 | 0.07/0.07 | 612/0.35 | chain reuse reduces trie cost; still >13ms overhead |
+
+**2026-07-07 GPU 实验关键结论（初步摸底）**：
+
+- **P0-1 prefilter confirmed**: no_sharing bs=32 付出 82ms detector + 82ms plan = 164ms 总 prepare 开销，收益为 0。prefilter 为最高优先级优化。
+- **nonzero/tolist 不构成瓶颈**: p50 分别仅 0.06-0.19ms 和 0.08-0.42ms，远小于 detector (2.6-82ms)。CPU metadata path 在当前 batch 规模下暂不必要。
+- **detector + plan construct 不可分**: plan_construct 几乎包含 detector 时间（因为 planner.plan() 先跑 detector 再跑 plan_from_detection），p90 中 detector p90=253ms vs plan p90=255ms 证明了这一点。单独优化 plan construction（紧凑化）收益有限，除非把 detector 和 plan 分离计时。
+- **py_objects 和 peak_python_mb 不大**: bs=32 时 py_objects=514, peak=6.12MB。说明 plan list/dataclass 表示在 bs≤32 规模下不是主要内存瓶颈，但 CPU 时间开销仍需优化。
+
+**2026-07-07 GPU 实验关键结论（全面摸底，353 组实验）**：
+
+CPU overhead scaling 规律：
+
+- **detector 时间与 batch_size 近似线性**: one_provider bs=4→6.9ms, bs=32→50ms, bs=128→363ms。no_sharing 同样线性但更贵: bs=128→517ms（无收益）。
+- **detector 时间与 seq_len (prompt+response) 增长**: prompt=2048 response=256 bs=32 时 detector=116ms（86% reused），长序列 trie 深度更大。
+- **nonzero/tolist 在大 batch 下开始显著**: bs=128 时 tolist=25ms（chain），但仍远小于 detector（363ms），不是瓶颈。
+- **RL 场景（长 prompt 短 response） reused ratio 最高**: prompt=1024 response=128 时 reused=86%，是 PS 收益最大的场景，但 detector 开销也更重（55ms@bs32）。
 
 #### Device Overhead
 
@@ -235,7 +257,32 @@ FSDP 路径第一阶段重点：core 早停、减少 dense pack/scatter、尽可
 
 | device | pipeline | backend | case | total attention ms p50/p90 | rope ms | build_kv ms | build_kv % | fa prepare ms | fa kernel ms | fa post ms | restore/proj ms | expanded kv tokens | conclusion |
 |---|---|---|---|---|---|---|---:|---|---|---|---|---:|---|
-| TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| gpu_4090 | standalone | flash_atten_gpu | one_provider, B=8,L=256 | 1.49/1.53 | 0 | 1.03 | 68.8 | 0.18 | 0.28 | 0.005 | 0 | 2048 | build_kv占68%; prealloc P0 confirmed |
+| gpu_4090 | standalone | flash_atten_gpu | one_provider, B=32,L=512 | 5.06/5.09 | 0 | 4.54 | 89.7 | 0.19 | 0.32 | 0.005 | 0 | 16384 | build_kv占90%; prealloc P0 confirmed |
+| gpu_4090 | standalone | flash_atten_gpu | chain, B=8,L=256 | 1.43/1.44 | 0 | 0.96 | 67.6 | 0.18 | 0.28 | 0.005 | 0 | 2048 | build_kv占68%; prealloc P0 confirmed |
+| gpu_4090 | standalone | flash_atten_gpu | chain, B=32,L=512 | 4.98/5.02 | 0 | 4.51 | 90.4 | 0.19 | 0.28 | 0.005 | 0 | 16384 | build_kv占90%; prealloc P0 confirmed |
+| gpu_4090 | standalone | torch_ref | one_provider, B=8,L=256 | 3.51/3.57 | 0 | 1.02 | 29.2 | 0 | 2.49 | 0 | 0 | 2048 | build_kv占29%; TorchRef attention更慢(2.49ms vs FA 0.28ms) |
+| gpu_4090 | standalone | torch_ref | one_provider, B=32,L=512 | 12.02/12.07 | 0 | 4.48 | 37.3 | 0 | 7.54 | 0 | 0 | 16384 | build_kv占37%; TorchRef attention 7.54ms远超FA |
+| gpu_4090 | standalone | torch_ref | chain, B=8,L=256 | 2.19/2.22 | 0 | 0.94 | 42.9 | 0 | 1.25 | 0 | 0 | 2048 | build_kv占43%; chain小batch下TorchRef可接受 |
+| gpu_4090 | standalone | torch_ref | chain, B=32,L=512 | 5.70/5.73 | 0 | 4.46 | 78.2 | 0 | 1.24 | 0 | 0 | 16384 | build_kv占78%; chain大batch下build_kv仍主导 |
+
+**2026-07-07 GPU 实验关键结论（初步摸底）**：
+
+- **P0-3 build_kv prealloc confirmed**: GPU FA 路线上 build_kv 占 attention 总耗时 68-90%。bs=32 seq=512 时 build_kv=4.5ms 而 FA kernel 仅 0.3ms。prealloc 是明确的 P0。
+- **FA 输入整理不是瓶颈**: `_prepare_flash_inputs` 仅 0.18-0.19ms，`_repad_output` 仅 0.005ms，两者合计不到 FA kernel 的 70%。P0-4 FA 输入整理优化优先级降低。
+- **TorchRef attention 不可用**: bs=32 seq=512 时 TorchRef attention=7.5ms，是 FA kernel (0.3ms) 的 25 倍。TorchRef 只用于 correctness/reference。
+- **build_kv 百分比随 batch size 增加**: bs=8 时 build_kv 占 68%，bs=32 时占 90%。因为 FA kernel 时间几乎不变 (0.28-0.32ms)，而 build_kv 随 token 数线性增长。
+
+**2026-07-07 GPU 实验关键结论（全面摸底，353 组实验）**：
+
+Device overhead scaling 规律：
+
+- **build_kv 与 expanded_kv_tokens 近似线性**: bs=4→0.8ms(kv=2048), bs=32→4.6ms(kv=16384), bs=64→8.8ms(kv=32768)。每 2048 KV tokens 约 0.5ms。
+- **build_kv 占比随 batch 增大**: bs=4→62%, bs=32→86%, bs=64→90%。FA kernel 时间增长远慢于 build_kv。
+- **FA kernel 几乎不随 prompt_len 变化**: prompt=64→0.3ms, prompt=2048→0.8ms (仅 3× 增长，而 expanded_kv 从 10240→73728 增长 7×)。FA kernel 主要取决于 max_seqlen_q。
+- **长 prompt 短 response（RL 场景）build_kv 更显著**: prompt=2048 response=256 bs=64 时 build_kv=14.5ms 占 85%，total=17ms。
+- **model config 影响 build_kv**: Qwen2.5-0.5B (14Q/2KV/64D) build_kv=2.1ms(75%)，Qwen3-0.6B (16Q/8KV/128D) build_kv=4.6ms(86%)。KV heads 多 → per-row split/store/load/cat 操作更重。
+- **TorchRef 在大 batch 下注意力增长**: bs=32 one_provider TorchRef=13.2ms，FA GPU=5.3ms。TorchRef 逐行循环 SDPA 在 token 数大时不可接受。
 
 #### Memory Overhead
 
@@ -292,8 +339,32 @@ FSDP dense output 与 packed output 规模：
 结果回填模板：
 
 | device | pipeline | backend | case | peak HBM disabled | peak HBM enabled | expanded KV MB | FA mask/pad MB | dense scatter MB | conclusion |
-|---|---|---|---|---:|---:|---:|---:|---:|---|
-| TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| gpu_4090 | standalone | flash_atten_gpu | one_provider, B=8,L=256 | 33.88 | 29.32 | 8.00 | 0 | 0 | PS enabled节省4.56MB HBM (13.5%) |
+| gpu_4090 | standalone | flash_atten_gpu | one_provider, B=32,L=512 | 228.50 | 179.77 | 64.00 | 0 | 0 | PS enabled节省48.73MB HBM (21.3%) |
+| gpu_4090 | standalone | flash_atten_gpu | chain, B=8,L=256 | 27.63 | 20.28 | 8.00 | 0 | 0 | PS enabled节省7.35MB HBM (26.5%) |
+| gpu_4090 | standalone | flash_atten_gpu | chain, B=32,L=512 | 198.00 | 133.54 | 64.00 | 0 | 0 | PS enabled节省64.46MB HBM (32.5%) |
+| gpu_4090 | standalone | torch_ref | one_provider, B=8,L=256 | 29.00 | 33.09 | 8.00 | 4.50 | 0 | PS enabled HBM反增4.09MB; expanded KV+mask抵消 |
+| gpu_4090 | standalone | torch_ref | one_provider, B=32,L=512 | 196.00 | 197.56 | 64.00 | 140.00 | 0 | PS enabled HBM反增1.56MB; dense mask严重抵消 |
+| gpu_4090 | standalone | torch_ref | chain, B=8,L=256 | 23.50 | 24.69 | 8.00 | 2.25 | 0 | PS enabled HBM反增1.19MB |
+| gpu_4090 | standalone | torch_ref | chain, B=32,L=512 | 165.00 | 143.75 | 64.00 | 70.00 | 0 | PS enabled节省21.25MB; chain比one_provider好 |
+
+**2026-07-07 GPU 实验关键结论（初步摸底）**：
+
+- **GPU FA 路线 HBM 有明确收益**: one_provider bs=32 节省 48.7MB (21.3%), chain bs=32 节省 64.5MB (32.5%)。FA 不使用 dense mask，expanded KV 增加的 HBM 被 Q 减少（reuser 只保留 suffix）抵消后有净收益。
+- **TorchRef 路线 HBM 无收益甚至反增**: one_provider bs=32 时 PS enabled HBM 反增 1.56MB。TorchRef 的 dense mask (140MB) 远大于 Q 减少 (4480→896 tokens) 带来的收益。这证实 TorchRef attention 不应作为正式路线。
+- **GPU FA 不使用 dense mask/pad-stack**: FA mask/pad MB=0，因为 varlen FA 用 cu_seqlens 表达 per-sample 边界，不需要 4D mask 或 BSH padding。这是 GPU FA 相比 NPU FA 和 TorchRef 的关键优势。
+- **expanded_kv 恒等于 64MB**: bs=32 seq=512 时 expanded KV = batch_size × seq_len × num_kv_heads × head_dim × 2 (K+V) × 2 bytes = 32 × 512 × 8 × 128 × 2 × 2 / 1024 / 1024 = 64MB，与 baseline KV 相同大小。PS 不会减少 KV，而是减少 Q。
+
+**2026-07-07 GPU 实验关键结论（全面摸底，353 组实验）**：
+
+Memory overhead scaling 规律（FA GPU, qwen3-0.6b, one_provider）：
+
+- **HBM saving 与 batch_size 近似线性**: bs=8→9.1MB, bs=32→32.5MB, bs=64→64.5MB。saving ≈ batch × per-sample_saving。
+- **HBM saving 百分比稳定在 12-14%**（prompt=256, response=256）: 不随 batch 变化，因为 q_reduction 百分比稳定在 43-49%。
+- **长 prompt 短 response HBM saving 百分比显著增加**: prompt=2048 response=256 bs=32 → saving=260MB(27.5%), q_reduction=86.1%。这是 RL 训练中最有价值的场景。
+- **Qwen2.5-0.5B (14Q/2KV/64D) HBM saving 百分比更高**: bs=32 prompt=256 response=256 → saving=34.2MB(40.9%)。因为 KV heads 更少，expanded KV 更小，Q reduction 的 HBM 收益比例更高。
+- **torch_ref memory 测量因 GQA 失败**: 112 组 torch_ref memory 实验全部因 Q/KV head 数不匹配报错。需后续修复 baseline 比较中的 GQA repeat_interleave。
 
 #### IO Overhead
 
@@ -323,7 +394,14 @@ FSDP dense output 与 packed output 规模：
 
 | device | pipeline | mode | forward ms p50/p90 | backward ms p50/p90 | micro-batch ms p50/p90 | log size | dump size | conclusion |
 |---|---|---|---|---|---|---:|---:|---|
-| TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| gpu_4090 | standalone | default (ENABLE_PREFIX_SHARING=0) | N/A (standalone) | N/A | N/A | 0 lines (no print) | 0 bytes | 默认模式无 PS 日志输出，无额外开销 |
+| gpu_4090 | standalone | PS enabled (ENABLE_PREFIX_SHARING=1, no dump) | N/A | N/A | N/A | ~2 lines per micro-batch (audit) | 0 bytes | audit print 每mbatch 2行; 中等开销 |
+
+**2026-07-07 GPU 实验观察**：
+
+- benchmark 运行时使用 `ENABLE_PREFIX_SHARING=0`，PS auto-activation 被跳过（不兼容版本组合）。benchmark 直接调用 core/backend API，不经过 PS import hook，因此无 I/O 开销。
+- 实际训练时 `ENABLE_PREFIX_SHARING=1` 会触发 `[PS][audit]` print（每 micro-batch 2 行 summary + N 行 layer stats）。这在端到端训练中可能是 I/O 热点，需要后续用 verl 训练实测确认。
+- diagnostic dump (`PREFIX_SHARING_DIAG_DUMP`) 开启时的开销未在 standalone benchmark 中测量，需要后续 verl 训练实测。
 
 ### 1.5 模块级热点归纳
 
@@ -539,7 +617,7 @@ FSDP dense output 与 packed output 规模：
 - TorchRef block causal mask 显存规模估算。
 - FSDP dense prepare / pack / scatter CPU 计时。
 
-这些 PoC 主要用于识别 Python 和临时对象开销，不作为 GPU/NPU 性能结论。
+这些早期 PoC 主要用于识别 Python 和临时对象开销；4090 standalone benchmark 已在 §1.4 回填，可作为 GPU 第一轮优化决策依据。NPU 与完整训练端到端性能仍需后续补测。
 
 ### 3.2 P0-1 Core Prefilter 测试
 
@@ -775,60 +853,86 @@ FSDP dense output 与 packed output 规模：
 
 ### 5.1 总体判断
 
-当前性能收益不及预期，不太可能由单一问题造成。更可能是多个因素叠加：
+4090 standalone 实验后，当前主要性能问题已经比最初更集中：速度瓶颈首先是 `build_kv()`，其次是 no-sharing / 长序列场景下的 prefix detector；显存收益在 GPU FA 路线上是明确正收益，但 TorchRef/debug 路线会被 dense mask 抵消。仍需注意：这些结论来自 standalone microbenchmark，不等同于完整 verl/Megatron/FSDP 训练端到端 profile。
 
-- 无收益 batch 仍承担完整 detector/planner 成本。
-- TorchRef `build_kv()` 的小块 cat / 临时分配在 NPU 上被放大。
-- 热路径日志 I/O 和 audit print 影响训练稳定性。
-- NPU FA mask/pad-stack 或 FSDP dense scatter 带来显存写放大。
+已确认：
 
-### 5.2 全局优先级
+- GPU FA 路线下 `build_kv()` 占 attention path 68-90%，且随 expanded KV tokens 近似线性增长。
+- no-sharing batch 会承担完整 detector/planner 成本且收益为 0；bs=128 时 no_sharing detector 达 517ms。
+- GPU FA 路线 HBM 有明确收益，尤其长 prompt 短 response 的 RL 场景收益更高。
+- `attention_mask.nonzero()` / `.detach().cpu().tolist()` 在 4090 实验中不是主瓶颈。
+- GPU FA varlen prepare/repad 不是主瓶颈。
 
-P0：
+仍待确认：
 
-1. Core no-sharing exact prefilter / fast path。
-2. Core plan list/dataclass 表示开销验证；若确认显著则紧凑化。
-3. TorchRef `build_kv()` 预分配 expanded KV buffer。
-4. GPU/NPU FA attention 分段实验与输入整理 / NPU mask/pad-stack 显存 guard。
-5. `attention_mask.nonzero()` / `.detach().cpu().tolist()` device sync 实验；若确认显著则 CPU metadata path。
-6. 结构化性能观测常驻但默认关闭。
+- NPU FA BSH pad/stack + per-sample 4D mask 的速度和 HBM 成本。
+- 完整 verl/Megatron/FSDP 训练中 forward/backward/update 端到端收益。
+- FSDP dense scatter / packed-jagged 贯穿在真实 pipeline 中对 HBM 的影响。
+- plan list/dataclass 紧凑化的独立收益，因为当前计时中 detector 与 plan construction 尚未完全拆清。
+
+### 5.2 全局优先级（更新于 2026-07-07 GPU baseline 实验后）
+
+P0（按 4090 实验后的状态区分确认度）：
+
+1. ✅ **P0-3 build_kv prealloc** — GPU 实验确认 build_kv 占 attention 68-90%（bs=32 时 4.5ms vs FA kernel 0.3ms）。**最高优先级，收益最确定。**
+2. ✅ **P0-1 Core no-sharing prefilter** — GPU 实验确认 no_sharing bs=32 detector 82ms 收益为 0。**第二优先级，通用优化。**
+3. ⚠️ **P0-2 Core plan representation 验证** — GPU 实验发现 detector 和 plan 构造几乎不可分离计时，py_objects 和 peak_python 不大（bs=32 时 514 objects, 6.12MB），但总 prepare 开销仍显著（64-164ms）。**当前应作为 P0 验证项，而不是直接实现项；实现优先级低于 P0-1/P0-3。**
+4. ❌ **P0-4 FA input preparation** — GPU 实验确认 FA prepare 仅 0.18-0.19ms, FA post 仅 0.005ms，远小于 FA kernel（0.3ms）。**降为 P2，GPU FA 路线无需优化输入整理。NPU FA 路线待后续 NPU 实验确认。**
+5. ❌ **CPU metadata extraction** — GPU 实验确认 nonzero/tolist p50 仅 0.06-0.42ms，远小于 detector（2.6-82ms）。**降为 P2，当前 batch 规模下不是瓶颈。**
+6. ✅ **P0-5 性能观测** — benchmark 脚本已建立，JSONL 输出格式已验证。**基础设施已就绪，后续优化可闭环。**
+
+P0 实现顺序建议：P0-3（build_kv prealloc）→ P0-1（no-sharing prefilter）→ P0-5（观测完善）→ P0-2（先拆分 detector/plan 计时并验证，再决定是否做 plan 紧凑化）
 
 P1：
 
 1. FSDP packed/jagged-native output 和 restore。
-2. GPU/NPU FA 输入整理进一步优化。
+2. NPU FA BSH pad/stack 和 per-sample mask 优化（仅 NPU 路线需要，GPU FA 已确认无需）。
 3. RoPE indexed frequency 缓存。
 4. 热路径日志、audit、diagnostic dump 分级。
 
 P2：
 
-1. Prefix store key 编码优化。
-2. Cross micro-batch plan/cache。
-3. 多 stream async prefetch / overlap。
-4. FSDP runtime wrapper 对象缓存。
-5. import-time auto-detect 日志降噪。
+1. GPU FA 输入整理优化（实验证明不是瓶颈）。
+2. CPU metadata path（实验证明 nonzero/tolist 不是瓶颈）。
+3. Prefix store key 编码优化。
+4. Cross micro-batch plan/cache。
+5. 多 stream async prefetch / overlap。
+6. FSDP runtime wrapper 对象缓存。
+7. import-time auto-detect 日志降噪。
 
-### 5.3 可立即推进的结论
+### 5.3 可立即推进的结论（更新于 2026-07-07 GPU baseline 实验后）
 
-- Core no-sharing prefilter 是当前最稳的通用优化点；prefix detect/planner 是 Megatron 与 FSDP 共享 core，一次优化两条路径同时受益。
-- plan list/dataclass 表示开销需要尽快实验验证；如果确认是 prepare 主因，应提升为 P0 实现。
-- `build_kv()` prealloc 是当前最应对齐 NPU 实测瓶颈的 backend 优化点。
-- `attention_mask.nonzero()` / `.detach().cpu().tolist()` 是否触发 device-CPU sync 需要实测；如果确认，CPU metadata path 应进入 P0/P1。
-- FA 和 attention 相关性能实验必须作为 P0 重点执行，尤其是 GPU FA varlen prepare/repad 与 NPU FA BSH pad/stack/mask。
+- **build_kv prealloc 是收益最确定的 P0**: GPU 实测 build_kv 占 attention 总耗时 68-90%，bs=32 seq=512 时 4.5ms vs FA kernel 0.3ms。per-row split/store/load/cat 和 final cat 是主要开销来源，prealloc 可直接减少临时分配和 kernel 调度次数。
+- **Core no-sharing prefilter 是最稳的通用优化**: GPU 实测 no_sharing bs=32 detector p50=82ms 且收益为 0，prefilter 可直接跳过完整 trie 构建。
+- **GPU FA 路线 HBM 有明确收益**: one_provider bs=32 节省 48.7MB (21.3%)，chain bs=32 节省 64.5MB (32.5%)。FA 不使用 dense mask。
+- **TorchRef 路线 HBM 无收益**: dense mask (140MB) 抵消了 Q 减少的收益。TorchRef 仅用于 correctness/reference。
+- **FA 输入整理不是 GPU 瓶颈**: _prepare_flash_inputs 仅 0.18ms，_repad_output 仅 0.005ms。NPU 路线待后续确认。
+- **CPU metadata extraction 在 4090 上不是瓶颈**: nonzero/tolist 仅 0.06-0.42ms，远小于 detector。GPU 当前场景下 CPU metadata path 暂不必要；NPU 仍需复验。
+- **性能观测基础设施已就绪**: benchmark 脚本和 JSONL 输出格式已验证，后续优化可闭环。
+- `build_kv()` prealloc 是当前最确定的 backend 优化点；GPU 已确认，NPU 侧也与前期人工观察一致，仍需 NPU benchmark 定量。
+- GPU FA varlen prepare/repad 已降级；FA 相关后续重点转为 NPU FA BSH pad/stack/mask 和完整训练端到端验证。
 - 性能观测是后续所有优化的基础设施。
-- dump/print 最终必须关闭或分级使用，但当前优化优先级低于 core、`build_kv()`、device sync 和 FA attention。
+- dump/print 最终必须关闭或分级使用，但当前优化优先级低于 `build_kv()`、core detector、NPU FA 和端到端训练 profile。
 - attention 主体优化只考虑 GPU/NPU FA；TorchRef attention 仅保留调试/reference。
-- NPU FA 的 mask/pad-stack 需要作为正式显存观测项；如果占比高，应作为显存 P0/P1 处理。
+- NPU FA 的 mask/pad-stack 需要作为正式显存观测项；如果占比高，应作为 NPU 路线 P0/P1 处理。
 
 ## 6. 遗留问题
 
-### 6.1 真实设备 profile 待补
+### 6.1 真实设备 profile（GPU 已补，NPU 待补）
 
-待补内容：
+已补 GPU 4090 内容（2026-07-07 baseline benchmark）：
 
-- NPU/GPU 上 prepare、build_kv、attention、restore、forward/backward/update 的阶段耗时。
-- HBM peak、allocator 临时分配、FA 输入整理与 NPU mask/pad-stack 实际调用频次。
-- TP/SP/PP 组合下的 token 数、expanded KV 数、padding token 数。
+- prepare 阶段耗时：detector p50=2.6-82ms, plan_construct p50=2.6-82ms, trim/layout p50=0.03-0.08ms
+- build_kv 阶段耗时：p50=0.96-4.54ms, 占 attention 68-90%
+- FA attention 阶段耗时：prepare p50=0.18ms, kernel p50=0.28ms, post p50=0.005ms
+- nonzero/tolist 耗时：p50=0.06-0.42ms
+- HBM peak：GPU FA PS enabled 节省 21-65MB; TorchRef PS enabled 反增或持平
+
+待补 NPU 内容：
+
+- NPU 上 prepare、build_kv、attention、restore、forward/backward/update 的阶段耗时
+- NPU HBM peak、NPU FA BSH pad/stack + per-sample 4D mask 的实际调用频次和显存
+- TP/SP/PP 组合下的 token 数、expanded KV 数、padding token 数
 
 ### 6.2 GPU/NPU FlashAttention 路线
 
