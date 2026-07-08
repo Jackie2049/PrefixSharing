@@ -895,7 +895,13 @@ GPU bf16 correctness (4 组实验, all exact match)：
 
 测试环境：8×RTX 4090 (24GB each)，verl080 conda env，Qwen2.5-0.5B / Qwen3-0.6B
 
-测试矩阵：11 configs × 2 (PS ON/OFF) = 22 training runs，每个 run 1 training step，记录 timing/HBM/throughput/entropy
+测试矩阵：11 configs × 2 (PS ON/OFF) = 22 training runs，每个 run 1 training step，记录 timing/HBM/throughput/entropy。
+
+速度观察口径：
+
+- `gen_s` / rollout 主要属于推理引擎侧，本轮没有改动 vLLM / rollout engine，因此只作为背景记录，不作为 PrefixSharing 速度影响结论。
+- PrefixSharing 可能影响的训练侧环节是 `compute_old_log_prob`、actor/reference logprob forward、`update_actor` forward/backward、restore、prepare/build_kv/FA 等。
+- 第二轮表格中尚未拆出 `compute_old_log_prob` 和 actor forward/backward，因此只能基于 `update_actor_s` 做很粗的训练侧观察；第三轮必须补齐 phase-level profiler。
 
 | # | Engine | GPU | Parallel | Model | BS | Prompt | Response | max_model_len | gpu_mem_util | 数据集 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -930,7 +936,7 @@ GPU bf16 correctness (4 组实验, all exact match)：
   - bs16_p256: actor HBM ↓33.9%, critic HBM ↓34.5%
 - PS=ON actor HBM 恒定 8.99GB（不随 prompt_len/batch_size 变化）——prefix KV reuse 消除按 prompt_len 线性增长的 KV cache 开销
 - critic HBM 恒定 6.99GB（PS=ON），critic 侧同样获得 prefix sharing HBM 收益
-- throughput: PS=OFF 更高（step_time 更短），差距约 9-14%
+- step/throughput 表观上 PS=OFF 更高（差距约 9-14%），但该差异包含 rollout/gen_time，不能直接作为 PrefixSharing 训练侧速度结论；从已记录的 `update_actor_s` 看，部分配置变慢、部分配置持平或变快，需要第三轮拆分 `compute_old_log_prob` 与 actor forward/backward 后再归因
 
 #### Megatron 8GPU TP=2 测试结果
 
@@ -941,7 +947,7 @@ GPU bf16 correctness (4 组实验, all exact match)：
 | bs16_p512_r32 | OFF | 16.46 | 11.42 | 1.01 | 1.73 | 8.60 | 6.86 | 37.9 | 0.952 | 281.2 | 30.7 |
 | bs16_p512_r32 | ON | 18.82 | 13.46 | 1.14 | 1.80 | 8.60 (=) | 6.86 (=) | 33.3 ↓12.1% | 1.055 ↑10.8% | 281.2 | 32.0 |
 
-初步观察（8GPU, TP=2, Megatron）：TP=2 下 actor/critic HBM 在 PS=ON/OFF 下完全相同（8.60/6.86），说明 TP=2 时每个 GPU 只持有一部分 KV shard，prefix sharing 的 HBM 节省被模型权重+optimizer 占比掩盖；throughput 下降约 13%
+初步观察（8GPU, TP=2, Megatron）：TP=2 下 actor/critic HBM 在 PS=ON/OFF 下完全相同（8.60/6.86），说明 TP=2 时每个 GPU 只持有一部分 KV shard，prefix sharing 的 HBM 节省被模型权重+optimizer 占比掩盖；step/throughput 表观下降约 13%，但该指标包含 rollout/gen_time，不作为 PrefixSharing 训练侧速度归因
 
 #### Megatron 8GPU TP=8 测试结果
 
@@ -969,7 +975,7 @@ GPU bf16 correctness (4 组实验, all exact match)：
 - FSDP actor HBM 在 PS=ON 时比 OFF 低：bs16_p256 OFF=3.29GB → ON=3.29GB (=); bs16_p512 OFF=3.81GB → ON=3.29GB ↓13.6%; bs32_p256 OFF=4.52GB → ON=3.29GB ↓27.4%
 - 与 1GPU TP=1 趋势一致：prompt 越长/bs 越大，PS=ON HBM savings 更显著
 - PS=ON actor HBM 恒定 3.29GB（不随 bs/prompt_len 变化），与 1GPU TP=1 actor HBM 恒定 8.99GB 趋势一致
-- throughput 下降约 8-10%，与 Megatron 趋势类似
+- step/throughput 表观下降约 8-10%，与 Megatron 趋势类似；但该指标包含 rollout/gen_time，第二轮只能确认同配置端到端表观变慢，不能确认 PrefixSharing 训练侧变慢
 
 #### 端到端 PS 收益总结
 
@@ -996,9 +1002,10 @@ GPU bf16 correctness (4 组实验, all exact match)：
 3. **多 GPU 分布式场景下 HBM 收益不明显**：TP=2/TP=8 actor/critic HBM 完全不变（8.60/6.86, 10.29/7.80），说明每个 GPU 只持有 TP shard 的 KV cache，prefix sharing savings 被模型权重+optimizer 占比掩盖
 4. **FSDP DP=8 场景下 HBM 收益重现**：bs16_p512 ↓13.6%, bs32_p256 ↓27.4%，与 1GPU 趋势一致
 
-**Latency 收益**：
-- 当前 22 组端到端 run 中 PS=ON 的 step/throughput 普遍更差，但 gen_time 主要属于 rollout/推理引擎侧；由于本轮没有改动推理引擎，不能把 gen_time 变慢直接归因于 PrefixSharing。
-- PrefixSharing 更可能影响 `compute_old_log_prob`、actor/reference logprob forward、backward、`update_actor`、restore 和 integration glue。本轮表格中的 update_actor 差异还不足以完成归因，需要第三轮 phase-level profiler。
+**训练侧速度观察**：
+- 当前 22 组端到端 run 中 PS=ON 的 step/throughput 普遍更差，但这些指标被 `gen_s` / rollout 主导；rollout 属于推理引擎侧，本轮没有改动 vLLM / rollout engine，因此不能把 `gen_s` 差异归因于 PrefixSharing。
+- 第二轮速度结论应聚焦训练侧：`compute_old_log_prob`、actor/reference logprob forward、`update_actor` forward/backward、restore 和 integration glue。本轮只记录了粗粒度 `update_actor_s`，没有拆出 `compute_old_log_prob` 和 actor forward/backward，因此训练侧速度影响仍然未完成归因。
+- 第三轮需要以 phase-level profiler 为准。如果训练侧 phase 基本不变，而 rollout/gen_time 波动导致 step/throughput 下降，则不应将其计入 PrefixSharing overhead。
 - 当前测试多为 bs=8/16/32 + 中短 prompt（158~365 tokens）。如果 HBM 降低能支持更大 batch 或更长 prompt，实际吞吐可能通过容量扩展提升，而不是在同配置 latency 上直接变快。
 
 **结论**：在当前实现和已测配置下，PS 的已确认核心价值是 **HBM 节省 / 容量扩展**，尤其在单卡或纯 DP 场景下效果最显著。多 GPU TP 场景下因每卡 KV shard 占内存比例低，HBM 收益不明显；latency 是否能转正需要在更大 batch、更长 prompt 和 phase-level 归因后再判断。
