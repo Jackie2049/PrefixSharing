@@ -5,7 +5,7 @@ measuring CPU overhead (detector/planner), device overhead (build_kv, FA
 attention), memory overhead (HBM), and I/O overhead.
 
 Results are output as JSONL records, matching the result template format
-from docs/impr-perf.md Section 1.4.
+from docs/developer-docs/impr-perf.md Section 1.4.
 
 Usage:
     python perf_baseline_benchmark.py [--backend torch_ref|flash_atten_gpu] \
