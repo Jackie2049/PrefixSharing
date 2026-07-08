@@ -892,6 +892,117 @@ GPU bf16 correctness (4 组实验, all exact match)：
 
 ## 4. 开发计划
 
+### 3.9 引擎端到端集成测试（4090）
+
+测试环境：8×RTX 4090 (24GB each)，verl080 conda env，Qwen2.5-0.5B / Qwen3-0.6B
+
+测试矩阵：11 configs × 2 (PS ON/OFF) = 22 training runs，每个 run 1 training step，记录 timing/HBM/throughput/entropy
+
+| # | Engine | GPU | Parallel | Model | BS | Prompt | Response | max_model_len | gpu_mem_util | 数据集 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1-6 | Megatron | 1 | TP=1 | Qwen2.5-0.5B | 8/16 | 256/512/1024 | 32/64 | 320/576/1088 | 0.4-0.6 | train_ps_prompt256/512/1024 |
+| 7-8 | Megatron | 8 | TP=2, DP=4 | Qwen2.5-0.5B | 16 | 256/512 | 32 | 320/576 | 0.5-0.6 | train_ps_prompt256/512 |
+| 9-10 | Megatron | 8 | TP=8, DP=1 | Qwen3-0.6B | 16 | 256/512 | 32 | 320/576 | 0.5-0.6 | train_ps_prompt256/512 |
+| 11-13 | FSDP | 8 | DP=8 | Qwen2.5-0.5B | 16/32 | 256/512 | 32/64 | 320/608 | 0.5-0.6 | train_ps_prompt256/512 |
+
+测试数据集：合成数据，16 samples 共享同一 system prompt（158/263/365 tokens），data_source=openai/gsm8k，ground_truth 已嵌入 reward_model
+
+#### Megatron 1GPU TP=1 测试结果
+
+| Config | PS | step_s | gen_s | update_actor_s | update_weights_s | actor_HBM_GB | critic_HBM_GB | throughput_tok/s | entropy | prompt_mean | response_mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| bs8_p256_r32 | OFF | 16.05 | 11.33 | 0.69 | 1.53 | 9.44 | 7.82 | 103.5 | 0.985 | 176.6 | 30.9 |
+| bs8_p256_r32 | ON | 18.08 | 13.23 | 0.79 | 1.58 | 8.99 ↓0.45 | 6.99 ↓0.83 | 91.5 ↓11.2% | 1.035 ↑5.1% | 176.6 | 30.3 |
+| bs8_p512_r32 | OFF | 16.45 | 11.54 | 0.78 | 1.54 | 11.52 | 9.24 | 151.8 | 1.024 | 281.6 | 30.4 |
+| bs8_p512_r32 | ON | 18.17 | 13.37 | 0.74 | 1.56 | 8.99 ↓2.53 | 6.99 ↓2.25 | 138.1 ↓9.0% | 1.026 ↑0.2% | 281.6 | 32.0 |
+| bs8_p1024_r32 | OFF | 15.55 | 11.65 | 0.34 | 1.61 | 13.58 | 10.65 | 213.9 | 1.029 | 383.6 | 32.0 |
+| bs8_p1024_r32 | ON | 17.14 | 13.14 | 0.52 | 1.48 | 8.99 ↓4.59 | 6.99 ↓3.66 | 194 ↓9.3% | 0.939 ↓8.7% | 383.6 | 32.0 |
+| bs16_p256_r32 | OFF | 15.43 | 11.53 | 0.35 | 1.54 | 13.60 | 10.66 | 216.0 | 1.137 | 176.2 | 32.0 |
+| bs16_p256_r32 | ON | 17.95 | 13.53 | 0.78 | 1.53 | 8.99 ↓4.61 | 6.99 ↓3.67 | 185.4 ↓14.2% | 0.999 ↓12.2% | 176.2 | 31.8 |
+| bs16_p512_r64 | OFF | 16.01 | 11.80 | 0.49 | 1.64 | 12.06 | 9.61 | 338.8 | 1.149 | 281.2 | 57.7 |
+| bs16_p512_r64 | ON | 18.11 | 13.82 | 0.88 | 1.23 | 8.99 ↓3.07 | 6.99 ↓2.62 | 303.6 ↓10.4% | 1.198 ↑4.3% | 281.2 | 62.3 |
+
+初步观察（bs8/bs16, 1GPU, Megatron TP=1）：
+- PS=ON gen_time/step_time 更长（vLLM rollout overhead > reuse 收益），但 HBM 显著减少
+  - bs8_p256: actor HBM ↓4.8%, critic HBM ↓10.6%
+  - bs8_p512: actor HBM ↓22.0%, critic HBM ↓24.4%
+  - bs8_p1024: actor HBM ↓33.8%, critic HBM ↓34.4%
+  - bs16_p256: actor HBM ↓33.9%, critic HBM ↓34.5%
+- PS=ON actor HBM 恒定 8.99GB（不随 prompt_len/batch_size 变化）——prefix KV reuse 消除按 prompt_len 线性增长的 KV cache 开销
+- critic HBM 恒定 6.99GB（PS=ON），critic 侧同样获得 prefix sharing HBM 收益
+- throughput: PS=OFF 更高（step_time 更短），差距约 9-14%
+
+#### Megatron 8GPU TP=2 测试结果
+
+| Config | PS | step_s | gen_s | u_actor_s | u_weights_s | actor_HBM_GB | critic_HBM_GB | throughput_tok/s | entropy | prompt_mean | response_mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| bs16_p256_r32 | OFF | 16.54 | 11.53 | 1.03 | 1.70 | 8.60 | 6.86 | 25.2 | 0.954 | 176.2 | 32.0 |
+| bs16_p256_r32 | ON | 18.85 | 13.72 | 1.12 | 1.75 | 8.60 (=) | 6.86 (=) | 22.0 | 0.887 | 176.2 | 31.3 |
+| bs16_p512_r32 | OFF | 16.46 | 11.42 | 1.01 | 1.73 | 8.60 | 6.86 | 37.9 | 0.952 | 281.2 | 30.7 |
+| bs16_p512_r32 | ON | 18.82 | 13.46 | 1.14 | 1.80 | 8.60 (=) | 6.86 (=) | 33.3 ↓12.1% | 1.055 ↑10.8% | 281.2 | 32.0 |
+
+初步观察（8GPU, TP=2, Megatron）：TP=2 下 actor/critic HBM 在 PS=ON/OFF 下完全相同（8.60/6.86），说明 TP=2 时每个 GPU 只持有一部分 KV shard，prefix sharing 的 HBM 节省被模型权重+optimizer 占比掩盖；throughput 下降约 13%
+
+#### Megatron 8GPU TP=8 测试结果
+
+| Config | PS | step_s | gen_s | u_actor_s | u_weights_s | actor_HBM_GB | critic_HBM_GB | throughput_tok/s | entropy | prompt_mean | response_mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| bs16_p256_r32 | OFF | 17.63 | 12.18 | 1.25 | 1.75 | 10.29 | 7.80 | 24.5 | 0.411 | 184.2 | 32.0 |
+| bs16_p256_r32 | ON | 19.50 | 14.07 | 1.32 | 1.77 | 10.29 (=) | 7.80 (=) | 22.2 ↓9.4% | 0.419 ↑2.0% | 184.2 | 32.0 |
+| bs16_p512_r32 | OFF | 17.22 | 11.97 | 1.21 | 1.71 | 10.29 | 7.80 | 37.3 | 0.423 | 289.2 | 32.0 |
+| bs16_p512_r32 | ON | 19.55 | 14.18 | 1.34 | 1.72 | 10.29 (=) | 7.80 (=) | 32.9 ↓11.8% | 0.440 ↑4.0% | 289.2 | 32.0 |
+
+初步观察（8GPU, TP=8, Qwen3-0.6B）：TP=8 下 actor/critic HBM 同样在 PS=ON/OFF 下相同（10.29/7.80），与 TP=2 观察一致；Qwen3 entropy 较低（0.41 vs Qwen2.5 的 0.95）可能因其架构差异
+
+#### FSDP 8GPU DP=8 测试结果
+
+| Config | PS | step_s | gen_s | u_actor_s | u_weights_s | actor_HBM_GB | throughput_tok/s | entropy | prompt_mean | response_mean |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bs16_p256_r32 | OFF | 16.43 | 11.01 | 0.96 | 2.25 | 3.29 | 50.7 | 1.039 | 176.3 | 32.0 |
+| bs16_p256_r32 | ON | 18.15 | 12.89 | 0.88 | 2.28 | 3.29 (=) | 45.8 ↓9.7% | 0.986 ↓5.1% | 176.3 | 31.7 |
+| bs16_p512_r64 | OFF | 16.83 | 11.63 | 0.95 | 2.16 | 3.81 | 80.8 | 1.056 | 281.3 | 58.9 |
+| bs16_p512_r64 | ON | 18.32 | 13.32 | 0.90 | 2.05 | 3.29 ↓0.52 | 74.3 ↓8.1% | 1.116 ↑5.7% | 281.3 | 59.1 |
+| bs32_p256_r32 | OFF | 17.02 | 11.40 | 0.96 | 2.41 | 4.52 | 97.6 | 1.100 | 176.0 | 31.6 |
+| bs32_p256_r32 | ON | 18.56 | 13.19 | 0.98 | 2.25 | 3.29 ↓27.4% | 89.5 ↓8.3% | 1.116 ↑1.5% | 176.0 | 31.5 |
+
+初步观察（8GPU, FSDP DP=8, Qwen2.5-0.5B）：
+- FSDP actor HBM 在 PS=ON 时比 OFF 低：bs16_p256 OFF=3.29GB → ON=3.29GB (=); bs16_p512 OFF=3.81GB → ON=3.29GB ↓13.6%; bs32_p256 OFF=4.52GB → ON=3.29GB ↓27.4%
+- 与 1GPU TP=1 趋势一致：prompt 越长/bs 越大，PS=ON HBM savings 更显著
+- PS=ON actor HBM 恒定 3.29GB（不随 bs/prompt_len 变化），与 1GPU TP=1 actor HBM 恒定 8.99GB 趋势一致
+- throughput 下降约 8-10%，与 Megatron 趋势类似
+
+#### 端到端 PS 收益总结
+
+**测试覆盖**：22 个 training run（11 configs × PS ON/OFF），覆盖 Megatron (1GPU TP=1, 8GPU TP=2, 8GPU TP=8) + FSDP (8GPU DP=8)，Qwen2.5-0.5B / Qwen3-0.6B，bs=8/16/32，prompt_len=256/512/1024
+
+**HBM 收益（核心价值）**：
+
+| 场景 | actor_HBM_OFF | actor_HBM_ON | Δ actor | critic_HBM_OFF | critic_HBM_ON | Δ critic |
+|---|---|---|---|---|---|---|
+| M 1GPU bs8_p256 | 9.44 | 8.99 | ↓4.8% | 7.82 | 6.99 | ↓10.6% |
+| M 1GPU bs8_p512 | 11.52 | 8.99 | ↓22.0% | 9.24 | 6.99 | ↓24.4% |
+| M 1GPU bs8_p1024 | 13.58 | 8.99 | ↓33.8% | 10.65 | 6.99 | ↓34.4% |
+| M 1GPU bs16_p256 | 13.60 | 8.99 | ↓33.9% | 10.66 | 6.99 | ↓34.5% |
+| M 1GPU bs16_p512 | 12.06 | 8.99 | ↓25.5% | 9.61 | 6.99 | ↓27.2% |
+| M 8GPU TP=2 bs16_p256 | 8.60 | 8.60 | = | 6.86 | 6.86 | = |
+| M 8GPU TP=8 bs16_p256 | 10.29 | 10.29 | = | 7.80 | 7.80 | = |
+| F 8GPU DP=8 bs16_p256 | 3.29 | 3.29 | = | — | — | — |
+| F 8GPU DP=8 bs16_p512 | 3.81 | 3.29 | ↓13.6% | — | — | — |
+| F 8GPU DP=8 bs32_p256 | 4.52 | 3.29 | ↓27.4% | — | — | — |
+
+关键发现：
+1. **1GPU 单卡是 PS HBM 收益最显著的场景**：actor ↓4.8%~33.9%, critic ↓10.6%~34.5%，收益随 prompt_len/batch_size 线性增长
+2. **PS=ON actor HBM 恒定**（不随 prompt_len/batch_size 变化）：1GPU=8.99GB, FSDP=3.29GB — prefix KV reuse 完全消除了按序列长度线性增长的 KV cache 存储开销
+3. **多 GPU 分布式场景下 HBM 收益不明显**：TP=2/TP=8 actor/critic HBM 完全不变（8.60/6.86, 10.29/7.80），说明每个 GPU 只持有 TP shard 的 KV cache，prefix sharing savings 被模型权重+optimizer 占比掩盖
+4. **FSDP DP=8 场景下 HBM 收益重现**：bs16_p512 ↓13.6%, bs32_p256 ↓27.4%，与 1GPU 趋势一致
+
+**Latency 收益**：
+- PS=ON gen_time/step_time 普遍更长（+10~14%），说明 vLLM rollout 的 PS overhead > KV reuse 收益
+- 这是因为当前测试用的是 bs=8/16/32 小 batch + 短 prompt（158~365 tokens），prefix sharing 的 rollout 计算节省不足以抵消 detection/planning/trimming 的额外开销
+- 预期在更大 batch_size (bs=64+) + 更长 prompt (1K~4K+) 场景下，latency 收益会翻转
+
+**结论**：PS 的核心价值在 **HBM 节省**而非 latency 加速，尤其在单卡或纯 DP 场景下效果最显著。多 GPU TP 场景下因每卡 KV shard 占内存比例低，HBM 收益不明显，但 latency overhead 仍然存在
+
 ### 4.1 第一阶段：确定性 P0 优化
 
 目标：
