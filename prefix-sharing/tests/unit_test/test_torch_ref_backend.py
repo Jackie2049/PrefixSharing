@@ -21,6 +21,8 @@ from prefix_sharing.backends.torch_ref import (
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.core.prefix_store import (
+    PREFIX_STATE_TYPE_ATTENTION_KV,
+    PrefixActivationSlotId,
     PrefixAttentionStore,
     PrefixDeltanetStore,
 )
@@ -52,6 +54,72 @@ def _make_plan(batch_sizes, prefix_lens):
             next_token += size - p
             sequences.append(provider_seq[:p] + suffix)
     return planner.plan(sequences)
+
+
+def _reference_build_kv(key, value, plan, layout, *, layer_id=0, tp_rank=0):
+    """Old per-row cat implementation kept as a correctness oracle for tests."""
+    key_rows = _split_packed(key, layout.padded_lengths)
+    value_rows = _split_packed(value, layout.padded_lengths)
+    store = PrefixAttentionStore()
+    expanded_keys = []
+    expanded_values = []
+
+    for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
+        valid_length = layout.valid_lengths[batch_index]
+        valid_key_row = key_row[:valid_length]
+        valid_value_row = value_row[:valid_length]
+        if not plan.is_reuser(batch_index):
+            slot_id = PrefixActivationSlotId(
+                plan.forward_id,
+                plan.micro_batch_id,
+                layer_id,
+                batch_index,
+                PREFIX_STATE_TYPE_ATTENTION_KV,
+                tp_rank,
+            )
+            store.store(
+                slot_id,
+                key_tensor=valid_key_row,
+                value_tensor=valid_value_row,
+                prefix_len=valid_key_row.shape[0],
+                overwrite=True,
+            )
+            expanded_keys.append(valid_key_row)
+            expanded_values.append(valid_value_row)
+            continue
+
+        provider = plan.provider_index[batch_index]
+        provider_slot_id = PrefixActivationSlotId(
+            plan.forward_id,
+            plan.micro_batch_id,
+            layer_id,
+            provider,
+            PREFIX_STATE_TYPE_ATTENTION_KV,
+            tp_rank,
+        )
+        entry = store.load(provider_slot_id)
+        prefix_len = plan.prefix_lens[batch_index]
+        expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
+        expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
+        own_slot_id = PrefixActivationSlotId(
+            plan.forward_id,
+            plan.micro_batch_id,
+            layer_id,
+            batch_index,
+            PREFIX_STATE_TYPE_ATTENTION_KV,
+            tp_rank,
+        )
+        store.store(
+            own_slot_id,
+            key_tensor=expanded_key,
+            value_tensor=expanded_value,
+            prefix_len=expanded_key.shape[0],
+            overwrite=True,
+        )
+        expanded_keys.append(expanded_key)
+        expanded_values.append(expanded_value)
+
+    return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
 
 # ------------------------------------------------------------------
@@ -180,6 +248,79 @@ def test_build_kv_transitive_reuse():
     assert expanded_k.shape[0] == sum(plan.expanded_lengths_kv)
     # Row 2 (reuser with prefix=5): expanded_len = prefix + kept_suffix
     assert plan.expanded_lengths_kv[2] == 6  # prefix=5 + suffix=1
+
+
+def test_build_kv_matches_reference_for_chained_reuse_with_padding_and_gradients():
+    """Optimized build_kv must preserve old concat semantics and autograd paths."""
+    plan = _make_plan([8, 7, 6, 4], [0, 3, 5, 0])
+    rows = [torch.zeros(length, dtype=torch.long) for length in plan.kept_lengths_q]
+    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=4)
+    backend = TorchReferenceBackend()
+
+    num_heads, head_dim = 2, 4
+    total = layout.total_padded_length
+    key = torch.randn(total, num_heads, head_dim, requires_grad=True)
+    value = torch.randn(total, num_heads, head_dim, requires_grad=True)
+    key_ref = key.detach().clone().requires_grad_(True)
+    value_ref = value.detach().clone().requires_grad_(True)
+
+    expected_k, expected_v = _reference_build_kv(key_ref, value_ref, plan, layout)
+    actual_k, actual_v = backend.build_kv(
+        key,
+        value,
+        PrefixAttentionStore(),
+        plan,
+        packed_batch_layout=layout,
+        layer_id=0,
+        tp_rank=0,
+    )
+
+    assert torch.equal(actual_k, expected_k)
+    assert torch.equal(actual_v, expected_v)
+
+    actual_loss = (actual_k.square().sum() + actual_v.square().sum())
+    expected_loss = (expected_k.square().sum() + expected_v.square().sum())
+    actual_loss.backward()
+    expected_loss.backward()
+
+    assert torch.equal(key.grad, key_ref.grad)
+    assert torch.equal(value.grad, value_ref.grad)
+
+
+def test_build_kv_store_holds_expanded_reuser_rows_for_chain_reuse():
+    plan = _make_plan([8, 7, 6], [0, 3, 5])
+    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    backend = TorchReferenceBackend()
+    store = PrefixAttentionStore()
+
+    key = torch.randn(layout.total_padded_length, 2, 4, requires_grad=True)
+    value = torch.randn(layout.total_padded_length, 2, 4, requires_grad=True)
+    expanded_k, expanded_v = backend.build_kv(
+        key,
+        value,
+        store,
+        plan,
+        packed_batch_layout=layout,
+        layer_id=2,
+        tp_rank=1,
+    )
+
+    row1_start = plan.cu_seqlens_kv[1]
+    row1_end = plan.cu_seqlens_kv[2]
+    slot_id = PrefixActivationSlotId(
+        plan.forward_id,
+        plan.micro_batch_id,
+        2,
+        1,
+        PREFIX_STATE_TYPE_ATTENTION_KV,
+        1,
+    )
+    entry = store.load(slot_id)
+
+    assert torch.equal(entry.key_tensor, expanded_k[row1_start:row1_end])
+    assert torch.equal(entry.value_tensor, expanded_v[row1_start:row1_end])
+    assert entry.key_tensor.requires_grad
+    assert entry.value_tensor.requires_grad
 
 
 # ------------------------------------------------------------------

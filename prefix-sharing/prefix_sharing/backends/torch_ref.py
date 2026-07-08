@@ -66,8 +66,10 @@ class TorchReferenceBackend:
         # valid tokens may enter the store or expanded KV.
         key_rows = _split_packed(key, layout.padded_lengths)
         value_rows = _split_packed(value, layout.padded_lengths)
-        expanded_keys = []
-        expanded_values = []
+        expanded_offsets = _cumsum(prefix_sharing_plan.expanded_lengths_kv)
+        expanded_total = expanded_offsets[-1]
+        expanded_key = key.new_empty((expanded_total, *key.shape[1:]))
+        expanded_value = value.new_empty((expanded_total, *value.shape[1:]))
         store_count = 0
         reuse_count = 0
         reuse_hit_count = 0
@@ -84,7 +86,13 @@ class TorchReferenceBackend:
             valid_length = layout.valid_lengths[batch_index]
             valid_key_row = key_row[:valid_length]
             valid_value_row = value_row[:valid_length]
+            expanded_start = expanded_offsets[batch_index]
+            expanded_end = expanded_offsets[batch_index + 1]
+            expanded_key_row = expanded_key[expanded_start:expanded_end]
+            expanded_value_row = expanded_value[expanded_start:expanded_end]
             if not prefix_sharing_plan.is_reuser(batch_index):
+                expanded_key_row.copy_(valid_key_row)
+                expanded_value_row.copy_(valid_value_row)
                 slot_id = PrefixActivationSlotId(
                     prefix_sharing_plan.forward_id,
                     prefix_sharing_plan.micro_batch_id,
@@ -96,15 +104,13 @@ class TorchReferenceBackend:
                 # Publish this row's KV so later reusers in this micro-batch can load it.
                 store.store(
                     slot_id,
-                    key_tensor=valid_key_row,
-                    value_tensor=valid_value_row,
-                    prefix_len=valid_key_row.shape[0],
+                    key_tensor=expanded_key_row,
+                    value_tensor=expanded_value_row,
+                    prefix_len=expanded_key_row.shape[0],
                     overwrite=True,
                 )
                 store_count += 1
-                stored_tokens += int(valid_key_row.shape[0])
-                expanded_keys.append(valid_key_row)
-                expanded_values.append(valid_value_row)
+                stored_tokens += int(expanded_key_row.shape[0])
             else:
                 provider = prefix_sharing_plan.provider_index[batch_index]
                 provider_slot_id = PrefixActivationSlotId(
@@ -130,7 +136,7 @@ class TorchReferenceBackend:
                             reuse_miss_count=reuse_miss_count,
                             stored_tokens=stored_tokens,
                             reused_prefix_tokens=reused_prefix_tokens,
-                            expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                            expanded_kv_tokens=expanded_total,
                             valid_q_tokens=layout.total_valid_length,
                             padded_q_tokens=layout.total_padded_length,
                         )
@@ -138,8 +144,10 @@ class TorchReferenceBackend:
                 reuse_hit_count += 1
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
                 reused_prefix_tokens += int(prefix_len)
-                expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
-                expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
+                expanded_key_row[:prefix_len].copy_(entry.key_tensor[:prefix_len])
+                expanded_key_row[prefix_len:].copy_(valid_key_row)
+                expanded_value_row[:prefix_len].copy_(entry.value_tensor[:prefix_len])
+                expanded_value_row[prefix_len:].copy_(valid_value_row)
                 own_slot_id = PrefixActivationSlotId(
                     prefix_sharing_plan.forward_id,
                     prefix_sharing_plan.micro_batch_id,
@@ -151,15 +159,13 @@ class TorchReferenceBackend:
                 # Publish the expanded reuser KV because a later row may reuse this longer prefix.
                 store.store(
                     own_slot_id,
-                    key_tensor=expanded_key,
-                    value_tensor=expanded_value,
-                    prefix_len=expanded_key.shape[0],
+                    key_tensor=expanded_key_row,
+                    value_tensor=expanded_value_row,
+                    prefix_len=expanded_key_row.shape[0],
                     overwrite=True,
                 )
                 store_count += 1
-                stored_tokens += int(expanded_key.shape[0])
-                expanded_keys.append(expanded_key)
-                expanded_values.append(expanded_value)
+                stored_tokens += int(expanded_key_row.shape[0])
         if stats is not None:
             stats.record_attention_kv_build(
                 layer_id=layer_id,
@@ -169,11 +175,11 @@ class TorchReferenceBackend:
                 reuse_miss_count=reuse_miss_count,
                 stored_tokens=stored_tokens,
                 reused_prefix_tokens=reused_prefix_tokens,
-                expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                expanded_kv_tokens=expanded_total,
                 valid_q_tokens=layout.total_valid_length,
                 padded_q_tokens=layout.total_padded_length,
             )
-        return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
+        return expanded_key, expanded_value
 
     def attention(
         self,
@@ -340,6 +346,15 @@ def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
     if sum(lengths) != tensor.shape[0]:
         raise ValueError("packed tensor first dimension does not match lengths")
     return list(torch.split(tensor, lengths, dim=0))
+
+
+def _cumsum(lengths: list[int]) -> list[int]:
+    offsets = [0]
+    total = 0
+    for length in lengths:
+        total += int(length)
+        offsets.append(total)
+    return offsets
 
 
 def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any:
