@@ -1,5 +1,21 @@
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.core.prefix_detector import PrefixDetector, TriePrefixDetector
+
+
+class _FailingDetector(PrefixDetector):
+    def detect(self, input_ids):
+        raise AssertionError("detector should have been skipped")
+
+
+class _RecordingDetector(PrefixDetector):
+    def __init__(self):
+        self.calls = 0
+        self._delegate = TriePrefixDetector(min_prefix_len=2, min_group_size=2)
+
+    def detect(self, input_ids):
+        self.calls += 1
+        return self._delegate.detect(input_ids)
 
 
 def test_planner_builds_phase_one_prefix_sharing_plan_and_restore_specs():
@@ -67,6 +83,76 @@ def test_planner_no_shared_prefix_keeps_original_shapes():
     assert prefix_sharing_plan.input_keep_ranges == [(0, 2), (0, 2), (0, 2)]
     assert prefix_sharing_plan.reuse_specs == []
     assert prefix_sharing_plan.prefix_last_restore == []
+
+
+def test_planner_no_sharing_prefilter_skips_detector_when_signatures_are_unique():
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3),
+        detector=_FailingDetector(),
+    )
+
+    prefix_sharing_plan = planner.plan(
+        [
+            [1, 2, 3, 10],
+            [1, 2, 4, 20],
+            [1, 3, 3, 30],
+            [9, 9],
+        ],
+        forward_id=11,
+        micro_batch_id=7,
+    )
+
+    assert not prefix_sharing_plan.has_sharing
+    assert prefix_sharing_plan.forward_id == 11
+    assert prefix_sharing_plan.micro_batch_id == 7
+    assert prefix_sharing_plan.provider_index == [0, 1, 2, 3]
+    assert prefix_sharing_plan.prefix_lens == [0, 0, 0, 0]
+    assert prefix_sharing_plan.kept_lengths_q == [4, 4, 4, 2]
+    assert prefix_sharing_plan.expanded_lengths_kv == [4, 4, 4, 2]
+    assert prefix_sharing_plan.input_keep_ranges == [(0, 4), (0, 4), (0, 4), (0, 2)]
+
+
+def test_planner_no_sharing_prefilter_respects_min_group_size():
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=3),
+        detector=_FailingDetector(),
+    )
+
+    prefix_sharing_plan = planner.plan(
+        [
+            [1, 2, 10],
+            [1, 2, 20],
+            [3, 4, 30],
+        ],
+        forward_id=12,
+        micro_batch_id=8,
+    )
+
+    assert not prefix_sharing_plan.has_sharing
+    assert prefix_sharing_plan.provider_index == [0, 1, 2]
+    assert prefix_sharing_plan.prefix_lens == [0, 0, 0]
+
+
+def test_planner_prefilter_does_not_skip_when_signature_can_share():
+    detector = _RecordingDetector()
+    planner = PrefixSharingPlanner(
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2),
+        detector=detector,
+    )
+
+    prefix_sharing_plan = planner.plan(
+        [
+            [1, 2, 3, 10],
+            [1, 2, 4, 20],
+            [9, 9, 9],
+        ],
+        forward_id=13,
+        micro_batch_id=9,
+    )
+
+    assert detector.calls == 1
+    assert prefix_sharing_plan.has_sharing
+    assert prefix_sharing_plan.provider_index == [0, 0, 2]
 
 
 def test_planner_emits_only_prefix_last_not_interior():
