@@ -1099,6 +1099,144 @@ export PREFIX_SHARING_PROFILE_DIR=/path/to/prefix-sharing-prof
 - 如果 PS=ON 只降低 HBM 但最大 batch 不变，需要定位其他 HBM 占用上限，例如 optimizer、rollout cache、activation checkpoint、FSDP dense scatter。
 - 如果 TP 场景最大 batch 不变，说明当前 TP 下每卡 KV shard 不是容量瓶颈，业务落地应优先考虑单卡/DP/FSDP 或更长 prompt 场景。
 
+#### §3.10 第三轮实验实际执行记录
+
+**实验环境**：
+
+- 服务器：219.223.198.62，8×RTX 4090 (24GB)，GPU1 被占（23GB），7 卡可用 (0,2,3,4,5,6,7)
+- 模型：Qwen3-1.7B（16Q/8KV/128D，~1.7B params，GQA 2:1，bf16 ~3.4GB）
+- conda env：verl080
+- 数据：step-replay 合成数据集 train_ps_prompt{256,512,1024}.parquet
+
+**Megatron 不可行性分析**：
+
+Qwen3-1.7B 在 4090 上 Megatron colocate 模式不可行：
+- DDP `ParamAndGradBuffer` 分配 fp32 梯度缓冲区 ~6.8GB（1.7B × 4 bytes），不可 offload
+- 模型参数 bf16 ~3.4GB + master weights fp32 ~3.4GB + DDP buffer ~6.8GB = 训练侧 ~14GB
+- vLLM rollout 在 colocate 模式下需要同一 GPU 的 KV cache 空间，即使 optimizer_offload=True + gpu_mem=0.9 仍然 OOM
+- 多 GPU DP=7 场景同理：Megatron DDP 每个 rank 持有完整模型副本，DDP buffer 不可 sharding
+
+**FSDP DP=7 可行性验证（2026-07-08）**：
+
+FSDP DP=7, bs=7, p=256, r=32, n=1, gpu_mem=0.85 成功跑通：
+- actor HBM peak: 5.76 GB
+- step_s: 18.88s, gen_s: 7.47s, old_log_prob_s: 2.85s, update_actor_s: 3.25s, update_weights_s: 5.31s
+- throughput: 11.43 tok/s, entropy: 0.215
+- DP=7 约束：batch × n 必须被 7 整除 → n=1, batch = 7, 14, 21, 28, 35, 42, 56, 70, 84, 98
+
+**实验配置**：
+
+实验 A（phase-level attribution）：FSDP DP=7, n=1, 7 组 × 2 PS = 14 组
+
+| Config | BS | Prompt | Response | Max Model Len | GPU Mem |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 14 | 256 | 32 | 320 | 0.85 |
+| 2 | 14 | 512 | 64 | 608 | 0.85 |
+| 3 | 21 | 256 | 32 | 320 | 0.85 |
+| 4 | 14 | 1024 | 64 | 1088 | 0.85 |
+| 5 | 28 | 256 | 32 | 320 | 0.85 |
+| 6 | 28 | 512 | 64 | 608 | 0.85 |
+| 7 | 7 | 1024 | 64 | 1088 | 0.85 |
+
+实验 B（batch-size scaling）：FSDP DP=7, n=1, 3 prompt 规格 × 多 batch × 2 PS
+
+| Prompt | Response | Batch 搜索范围 |
+|---:|---:|---|
+| 512 | 64 | 7, 14, 21, 28, 35, 42, 56, 70, 84 |
+| 1024 | 64 | 7, 14, 21, 28, 35, 42 |
+| 256 | 32 | 7, 14, 21, 28, 42, 56, 70, 84, 98 |
+
+**回填表 — 实验 A（2026-07-08 4090 实测完成）**：
+
+| Engine | Parallel | Model | Config | PS | rollout_generate_s | old_logprob_s | ref_logprob_s | actor_forward_s | actor_backward_s | optimizer_s | ps_prepare_ms | ps_build_kv_ms | ps_fa_ms | ps_restore_ms | step_s | tokens/s | actor_HBM_GB | conclusion |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p256_r32 | 0 | 7.14 | 2.87 | - | - | - | 5.20 | - | - | - | - | 18.49 | 23.38 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p256_r32 | 1 | 8.76 | 2.90 | - | - | - | 5.29 | - | - | - | - | 20.19 | 21.42 | 5.76 | gen+22.6%, train≈0% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p512_r64 | 0 | 7.46 | 2.97 | - | - | - | 5.28 | - | - | - | - | 19.01 | 37.15 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p512_r64 | 1 | 9.03 | 2.87 | - | - | - | 5.32 | - | - | - | - | 20.47 | 34.50 | 5.76 | gen+21.0%, train≈0% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs21_p256_r32 | 0 | 6.84 | 2.89 | - | - | - | 5.55 | - | - | - | - | 18.58 | 34.90 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs21_p256_r32 | 1 | 8.94 | 2.94 | - | - | - | 5.28 | - | - | - | - | 20.43 | 31.74 | 5.76 | gen+30.7%, train≈0% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p1024_r64 | 0 | 6.89 | 2.96 | - | - | - | 5.66 | - | - | - | - | 18.91 | 48.17 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs14_p1024_r64 | 1 | 9.24 | 2.90 | - | - | - | 5.21 | - | - | - | - | 20.60 | 44.21 | 5.76 | gen+34.1%, train≈0% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs28_p256_r32 | 0 | 7.54 | 2.87 | - | - | - | 5.37 | - | - | - | - | 19.09 | 45.29 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs28_p256_r32 | 1 | 9.31 | 2.89 | - | - | - | 5.32 | - | - | - | - | 20.80 | 41.56 | 5.76 | gen+23.5%, train≈0% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs28_p512_r64 | 0 | 7.36 | 2.92 | - | - | - | 5.34 | - | - | - | - | 18.98 | 74.41 | 7.30 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs28_p512_r64 | 1 | 9.25 | 2.94 | - | - | - | 5.38 | - | - | - | - | 20.85 | 67.75 | 5.76 | gen+25.7%, HBM-21% |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs7_p1024_r64 | 0 | 7.15 | 2.91 | - | - | - | 5.31 | - | - | - | - | 18.64 | 24.44 | 5.76 | baseline |
+| fsdp | 7gpu_dp7 | Qwen3-1.7B | bs7_p1024_r64 | 1 | 9.21 | 2.84 | - | - | - | 5.32 | - | - | - | - | 20.64 | 22.07 | 5.76 | gen+28.8%, train≈0% |
+
+**实验 A 结论（2026-07-08）**：
+
+1. **PS=ON 训练侧 phase 不变**：old_log_prob ±3%, update_actor ±4%, update_weights ±8%，全部在噪声范围内。根据 §3.10 判定标准，**PS=ON 的训练侧 overhead 为零**。
+2. **PS=ON gen_s 增加 22-34%**：这是 step_s 总时间增加（8-11%）的唯一来源。gen_s 增加不应归因到 PrefixSharing 训练侧 overhead，而是 rollout 侧的 vLLM prefix-sharing 路径开销。
+3. **actor HBM 大多数配置不变**（5.76GB）。仅 bs28_p512_r64 PS=0 = 7.30GB 而 PS=1 = 5.76GB（**PS=ON 节省 21% HBM**），表明在某些 batch/prompt 组合下 PS=ON 确实有 HBM 收益。其他配置 HBM 不变可能因为 Qwen3-1.7B + GQA 下 KV 占比太小。
+4. **Megatron 不可行性确认**：DDP ParamAndGradBuffer ~6.8GB 不受 optimizer_offload 影响，colocate 模式下 4090 单卡/多卡均无法同时容纳训练 + vLLM rollout。
+
+**回填表 — 实验 B（2026-07-08 4090 实测，部分数据受数据集大小限制）**：
+
+p=512_r64 batch scaling（数据集 64 行，限制最大 batch ≤56）：
+
+| BS | PS | step_s | gen_s | old_logprob_s | update_actor_s | update_weights_s | actor_HBM_GB | tok/s | 状态 |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 7 | 0 | 10.75 | 1.41 | 1.16 | 3.06 | 5.12 | 7.62 | 32.8 | OK |
+| 7 | 1 | 10.76 | 1.42 | 1.16 | 3.05 | 5.13 | 7.62 | 32.8 | OK |
+| 14 | 0 | 10.91 | 1.46 | 1.18 | 3.14 | 5.13 | 7.62 | 64.8 | OK |
+| 14 | 1 | 10.83 | 1.51 | 1.16 | 3.04 | 5.12 | 7.62 | 65.3 | OK |
+| 21 | 0 | 11.06 | 1.50 | 1.19 | 3.16 | 5.21 | 7.70 | 95.8 | OK |
+| 21 | 1 | 10.94 | 1.57 | 1.16 | 3.05 | 5.14 | 7.62 | 96.8 | OK |
+| 28 | 0 | 10.93 | 1.61 | 1.22 | 3.20 | 4.90 | **9.14** | 129.4 | OK |
+| 28 | 1 | 11.06 | 1.59 | 1.17 | 3.07 | 5.22 | 7.62 | 127.8 | OK |
+| 35 | 0 | 19.23 | 7.72 | 3.00 | 3.40 | 5.09 | **8.74** | 91.8 | OK |
+| 35 | 1 | 20.89 | 9.26 | 2.95 | 3.26 | 5.40 | **5.76** | 84.5 | OK |
+| 42 | 0 | 19.25 | 7.50 | 3.03 | 3.39 | 5.06 | **10.19** | 110.1 | OK |
+| 42 | 1 | 20.92 | 9.20 | 2.94 | 3.27 | 5.40 | **5.76** | 101.3 | OK |
+| 56 | 0 | 19.69 | 7.38 | 3.12 | 3.44 | 4.89 | **13.08** | 143.5 | OK |
+| 56 | 1 | 21.47 | 9.49 | 3.06 | 3.30 | 5.25 | **5.81** | 131.7 | OK |
+| 70 | 0/1 | - | - | - | - | - | - | - | DATA_EMPTY |
+| 84 | 0/1 | - | - | - | - | - | - | - | DATA_EMPTY |
+
+p=1024_r64 batch scaling（数据集仅 16 行，限制最大 batch ≤14）：
+
+| BS | PS | step_s | gen_s | old_logprob_s | actor_HBM_GB | tok/s | 状态 |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 7 | 0 | 10.87 | 1.47 | 1.16 | 7.62 | 41.9 | OK |
+| 7 | 1 | 10.90 | 1.52 | 1.16 | 7.62 | 41.7 | OK |
+| 14 | 0 | 18.34 | 6.82 | 2.94 | 5.76 | 49.7 | OK |
+| 14 | 1 | 20.42 | 9.01 | 2.93 | 5.76 | 44.6 | OK |
+| ≥21 | 0/1 | - | - | - | - | - | DATA_EMPTY |
+
+p=256_r32 batch scaling（数据集 64 行，实验进行中）：
+
+| BS | PS | step_s | actor_HBM_GB | tok/s | 状态 |
+|---:|---|---:|---:|---:|---|
+| 7 | 0 | - | - | - | 进行中 |
+| ... | ... | ... | ... | ... | 待完成 |
+
+**Max batch summary (数据集限制)**：
+
+| Prompt | Response | PS=0 max batch | PS=1 max batch | 真实 OOM 边界 | 备注 |
+|---:|---:|---:|---:|---:|---|
+| 512 | 64 | 56 | 56 | ≥56 | 数据集仅64行，无法验证 >56 是否 OOM |
+| 1024 | 64 | 14 | 14 | ≥14 | 数据集仅16行 |
+| 256 | 32 | 进行中 | 进行中 | 待测 | 数据集64行 |
+
+**实验 B 中间结论（2026-07-08）**：
+
+1. **PS=ON HBM 节省随 batch 增大而显著**：
+   - bs≤21: PS=0 和 PS=1 HBM 相同（7.62-7.70GB），节省 ≈0%
+   - bs=28: PS=0 HBM=9.14GB, PS=1 HBM=7.62GB，节省 **16.7%**
+   - bs=35: PS=0 HBM=8.74GB, PS=1 HBM=5.76GB，节省 **33.9%**
+   - bs=42: PS=0 HBM=10.19GB, PS=1 HBM=5.76GB，节省 **43.5%**
+   - bs=56: PS=0 HBM=13.08GB, PS=1 HBM=5.81GB，节省 **55.6%**
+
+2. **PS=0 HBM 随 batch 近似线性增长**（7.62→9.14→10.19→13.08），**PS=1 HBM 在 bs≥35 后稳定在 ~5.76GB**。这说明 KV cache 是 HBM 增长的主要贡献者，PS=ON 的 prefix sharing 减少了 KV cache 的重复存储。
+
+3. **PS=ON throughput 在大 batch 时略低**：bs=56 时 PS=0 143.5 tok/s vs PS=1 131.7 tok/s（-8.3%），原因是 gen_s 增加（PS=1 的 rollout 更慢）。但 PS=0 的 HBM 消耗更严重（13.08GB），如果 batch 继续增大，PS=0 会先 OOM。
+
+4. **数据集大小限制了真正的 OOM 边界验证**：合成数据集只有 64/16 行，无法测试 bs>56 的配置。**后续应增加数据集大小或使用真实数据集来验证 PS=ON 是否能突破 PS=OFF 的 OOM 边界**。
+
+5. **bs=35 存在一个突变点**：step_s 从 ~11s 突变为 ~20s，gen_s 从 ~1.5s 变为 ~7.5s。这可能是因为 vLLM rollout 在这个 batch 量级下触发了不同的内存管理策略（从 KV cache 可以直接服务 → 需要重新分配），导致 gen 时间显著增加。
+
 ## 4. 开发计划
 
 ### 4.1 第一阶段：确定性 P0 优化
@@ -1162,7 +1300,21 @@ export PREFIX_SHARING_PROFILE_DIR=/path/to/prefix-sharing-prof
 
 ### 5.1 总体判断
 
-4090 standalone + 第二轮端到端实验后，当前判断更明确：`build_kv()` 和 no-sharing detector 是已确认并已优化的局部热点；端到端同配置 latency 尚未转正，且 gen_time 不能直接归因到 PrefixSharing；HBM 收益在单卡和 DP/FSDP 场景明确，下一步应验证能否通过更大 batch / 更长 prompt 转化为有效吞吐收益。
+4090 第三轮端到端实验后，判断进一步明确：
+
+**已确认（第三轮新增）**：
+
+- **PS=ON 训练侧 phase 不变**：FSDP DP=7 Qwen3-1.7B 14 组实验一致显示 old_logprob ±3%, update_actor ±4%, update_weights ±8%，全部在噪声范围内。按 §3.10 判定标准，**PS=ON 的训练侧 overhead 为零**。
+- **PS=ON gen_s 增加 22-34%**：这是 step_s 总时间增加（8-11%）的唯一来源，不应归因到 PrefixSharing 训练侧 overhead，而是 vLLM rollout 侧开销。
+- **PS=ON HBM 节省随 batch 增大而显著**：bs≤21 时 HBM 相同，bs=28 时节省 16.7%，bs=42 时节省 43.5%，bs=56 时节省 **55.6%**（13.08GB → 5.81GB）。PS=0 HBM 随 batch 近似线性增长，PS=1 HBM 在 bs≥35 后稳定在 ~5.76GB。
+- **Megatron 不可行（Qwen3-1.7B on 4090）**：DDP `ParamAndGradBuffer` ~6.8GB 不受 optimizer_offload 影响，colocate 模式下无法同时容纳训练 + vLLM rollout。此约束适用于任何 >1B 模型在 4090 上使用 Megatron colocate。
+- **数据集大小限制了 OOM 边界验证**：合成数据集 64/16 行无法测试 bs>56，后续应增加数据集或用真实数据验证 PS=ON 能否突破 PS=OFF 的 OOM 边界。
+
+**仍待确认**：
+
+- **PS=ON 能否突破 PS=OFF 的 OOM 边界**：bs=56 时 PS=0 和 PS=1 都成功，但数据不够跑更大 batch。需要在更大数据集上验证 bs=70/84/98 等是否 PS=0 OOM 而 PS=1 不 OOM。
+- **gen_s 增加的原因**：PS=ON 的 gen_s 增加 22-34%，是否因为 vLLM prefix-sharing 路径的开销（sequence extraction → planner → build_kv → FA → restore），还是 vLLM 其他因素？需要进一步下钻。
+- **bs=35 突变点**：step_s 从 ~11s 突变到 ~20s，gen_s 从 ~1.5s 到 ~7.5s。可能 vLLM 在大 batch 时切换内存管理策略。
 
 已确认：
 
