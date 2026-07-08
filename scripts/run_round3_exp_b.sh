@@ -1,9 +1,9 @@
 #!/bin/bash
 # PrefixSharing Round 3 - Experiment B: Batch-size scaling / HBM capacity
 # Purpose: Verify PS=ON reduced HBM enables larger batch, improving effective throughput
-# Model: Qwen3-8B (32Q/4KV/128D, ~8.19B params)
+# Model: Qwen3-8B (32Q/8KV/128D, ~8.19B params, GQA 4:1)
 # Runs 3 training steps per config, discard 1st warmup
-# Note: TP=8 excluded (4KV heads not divisible by 8)
+# Note: TP=8 feasible (8KV divisible by 8)
 
 set -uo pipefail
 
@@ -20,7 +20,7 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 export TOKENIZERS_PARALLELISM=false
 
 # Model paths - update QWEN3_8B path after download completes
-MODEL_QWEN3_8B="${MODEL_QWEN3_8B:-/home/zxw/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/PLACEHOLDER}"
+MODEL_QWEN3_8B="/home/zxw/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 DATA_DIR="/home/zxw/Termius/proj_prefix-sharing/data"
 VERL_DIR="/home/zxw/verldir"
 
@@ -42,13 +42,13 @@ echo "Using model: $MODEL_QWEN3_8B"
 # Format: engine|parallel|prompt|response|max_model_len|gpu_mem|optim_offload|distributed_optim|batch_list
 # We sweep batch sizes to find max without OOM for both PS=ON and PS=OFF
 SCALING_TESTS=(
-  # Megatron 1GPU TP=1 - optimizer_offload mandatory, small batches only
-  "megatron|1gpu_tp1|256|32|320|0.85|True|False|2,4,8,12,16"
-  # Megatron 8GPU TP=2 - distributed optimizer, moderate batches
-  "megatron|8gpu_tp2|512|64|608|0.5|False|True|8,16,24,32"
-  # Megatron 8GPU TP=4 - optimizer_offload for safety, larger batches possible
-  "megatron|8gpu_tp4|512|64|608|0.5|True|False|16,32,48,64"
-  # FSDP 8GPU DP=8 - rollout constrained (full model on each GPU for inference)
+  # Megatron 1GPU TP=1: IMPOSSIBLE (DDP grad buffer > 24GB)
+  # Megatron 8GPU TP=2: IMPOSSIBLE (DDP grad buffer + model = 24GB, no headroom)
+  # Megatron 8GPU TP=4 - optimizer_offload mandatory, moderate batches
+  "megatron|8gpu_tp4|512|64|608|0.5|True|False|8,16,24,32,48"
+  # Megatron 8GPU TP=8 - optimizer_offload mandatory (DP=1), larger batches possible
+  "megatron|8gpu_tp8|256|32|320|0.5|True|False|16,32,48,64,96"
+  # FSDP 8GPU DP=8 - handles sharding, rollout needs full model per GPU
   "fsdp|8gpu_dp8|512|64|608|0.85|False|False|4,8,16,24,32"
 )
 
@@ -111,18 +111,15 @@ for spec in "${SCALING_TESTS[@]}"; do
       fi
 
       # Determine GPU allocation and TP size
-      if [ "$parallel" = "1gpu_tp1" ]; then
-        export CUDA_VISIBLE_DEVICES=0
-        NGPU=1
-        TP_SIZE=1
-      elif [ "$parallel" = "8gpu_tp2" ]; then
-        export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-        NGPU=8
-        TP_SIZE=2
-      elif [ "$parallel" = "8gpu_tp4" ]; then
+      # Note: 1gpu_tp1 and 8gpu_tp2 removed - DDP gradient buffer exceeds 4090 24GB
+      if [ "$parallel" = "8gpu_tp4" ]; then
         export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
         NGPU=8
         TP_SIZE=4
+      elif [ "$parallel" = "8gpu_tp8" ]; then
+        export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+        NGPU=8
+        TP_SIZE=8
       elif [ "$parallel" = "8gpu_dp8" ]; then
         export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
         NGPU=8

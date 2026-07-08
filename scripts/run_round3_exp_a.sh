@@ -2,9 +2,9 @@
 # PrefixSharing Round 3 - Experiment A: Phase-level attribution
 # Purpose: Determine if PS=ON slows training-side phases, and where
 # Uses existing verl marked_timer: gen, old_log_prob, RefPolicy, update_actor, update_weights
-# Model: Qwen3-8B (32Q/4KV/128D, ~8.19B params)
-# Engine: Megatron (TP=1/2/4) + FSDP (DP=8)
-# Note: TP=8 excluded (4KV heads not divisible by 8)
+# Model: Qwen3-8B (32Q/8KV/128D, ~8.19B params, GQA 4:1)
+# Engine: Megatron (TP=1/2/4/8) + FSDP (DP=8)
+# Note: TP=8 feasible (8KV divisible by 8)
 
 set -uo pipefail
 
@@ -21,7 +21,7 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 export TOKENIZERS_PARALLELISM=false
 
 # Model paths - update QWEN3_8B path after download completes
-MODEL_QWEN3_8B="${MODEL_QWEN3_8B:-/home/zxw/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/PLACEHOLDER}"
+MODEL_QWEN3_8B="/home/zxw/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 DATA_DIR="/home/zxw/Termius/proj_prefix-sharing/data"
 VERL_DIR="/home/zxw/verldir"
 
@@ -45,20 +45,21 @@ echo "Using model: $MODEL_QWEN3_8B"
 # Format: engine|parallel|batch|prompt|response|max_model_len|gpu_mem|optim_offload|distributed_optim
 # Key: optimizer_offload needed for TP=1/4 (Adam states 32GB > GPU 24GB)
 TESTS=(
-  # Megatron 1-GPU TP=1 - must offload optimizer
-  "megatron|1gpu_tp1|4|256|32|320|0.85|True|False"
-  "megatron|1gpu_tp1|4|512|64|608|0.85|True|False"
-  "megatron|1gpu_tp1|8|256|32|320|0.85|True|False"
-  # Megatron 8-GPU TP=2 - distributed optimizer across DP=4
-  "megatron|8gpu_tp2|8|256|32|320|0.6|False|True"
-  "megatron|8gpu_tp2|16|512|64|608|0.5|False|True"
-  # Megatron 8-GPU TP=4 - optimizer_offload safer than distributed_optim (DP=2 only)
+  # Megatron 1-GPU TP=1: IMPOSSIBLE (DDP grad buffer 32GB > 24GB GPU)
+  # Megatron 8-GPU TP=2: IMPOSSIBLE (DDP grad buffer 16GB + model 8GB = 24GB, no headroom)
+  # Megatron 8-GPU TP=4 - optimizer_offload mandatory (DP=2 not enough for distributed_optimizer)
   "megatron|8gpu_tp4|16|256|32|320|0.5|True|False"
   "megatron|8gpu_tp4|16|512|64|608|0.5|True|False"
+  "megatron|8gpu_tp4|32|256|32|320|0.5|True|False"
   "megatron|8gpu_tp4|16|1024|64|1088|0.5|True|False"
-  # FSDP 8-GPU DP=8
+  # Megatron 8-GPU TP=8 - optimizer_offload mandatory (DP=1, no sharding possible)
+  "megatron|8gpu_tp8|16|256|32|320|0.5|True|False"
+  "megatron|8gpu_tp8|16|512|64|608|0.5|True|False"
+  "megatron|8gpu_tp8|32|256|32|320|0.5|True|False"
+  # FSDP 8-GPU DP=8 - handles sharding internally, rollout uses full model per GPU
   "fsdp|8gpu_dp8|8|256|32|320|0.85|False|False"
   "fsdp|8gpu_dp8|16|512|64|608|0.85|False|False"
+  "fsdp|8gpu_dp8|32|256|32|320|0.85|False|False"
   "fsdp|8gpu_dp8|8|1024|64|1088|0.85|False|False"
 )
 
@@ -107,18 +108,15 @@ for test_spec in "${TESTS[@]}"; do
     fi
 
     # Determine GPU allocation and TP size
-    if [ "$parallel" = "1gpu_tp1" ]; then
-      export CUDA_VISIBLE_DEVICES=0
-      NGPU=1
-      TP_SIZE=1
-    elif [ "$parallel" = "8gpu_tp2" ]; then
-      export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-      NGPU=8
-      TP_SIZE=2
-    elif [ "$parallel" = "8gpu_tp4" ]; then
+    # Note: 1gpu_tp1 and 8gpu_tp2 removed - DDP gradient buffer exceeds 4090 24GB
+    if [ "$parallel" = "8gpu_tp4" ]; then
       export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
       NGPU=8
       TP_SIZE=4
+    elif [ "$parallel" = "8gpu_tp8" ]; then
+      export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+      NGPU=8
+      TP_SIZE=8
     elif [ "$parallel" = "8gpu_dp8" ]; then
       export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
       NGPU=8
