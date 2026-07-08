@@ -13,10 +13,11 @@
 - 对 block causal mask 做显存规模估算。
 - 拉取并合并最新 `origin/open-source` 后，重新审视已合入的 FSDP patch 与 GPU/NPU FlashAttention backend。
 - **（2026-07-07）在 4090 GPU 上完成 standalone 性能摸底实验**，覆盖 CPU overhead (detector/planner)、Device overhead (build_kv/FA kernel)、Memory overhead (HBM peak)。结果已回填到 §1.4 结果回填模板。
+- **（2026-07-08）在 4090 GPU 上完成第二轮 P0 验证与引擎端到端摸底**，覆盖 P0-1 no-sharing prefilter、P0-3 build_kv prealloc，以及 Megatron/FSDP 的 22 组端到端训练 run。
 
 本轮未完成：
 
-- 已完成 4090 GPU standalone microbenchmark；尚未完成完整 verl/Megatron/FSDP 训练端到端 profiler，也尚未完成 NPU profiler。因此 GPU microbenchmark 已确认的结论可以用于第一轮优化决策，涉及 NPU、分布式并行、完整训练 forward/backward/update 的结论仍需在目标环境复验。
+- 已完成 4090 GPU standalone microbenchmark 与部分 verl/Megatron/FSDP 端到端训练摸底；尚未完成 NPU profiler，也尚未完成更大 batch / 更长 prompt 下的容量收益验证。因此 GPU 已确认的结论可以用于当前优化决策，涉及 NPU、超长 prompt、大 batch、完整 phase-level 归因的结论仍需在目标环境复验。
 - 涉及 attention 主体时，只把 GPU/NPU FlashAttention 算子作为正式优化对象；TorchRef attention 仅作为调试/reference 路线。
 - TorchRef `build_kv()` 仍是正式路径热点，因为当前 GPU/NPU FlashAttention backend 也复用 TorchRef 的 KV expansion 实现。
 
@@ -96,7 +97,7 @@ FSDP 路径第一阶段重点：core 早停、减少 dense pack/scatter、尽可
 
 ### 1.4 PoC 观测结果
 
-本节按前文的热点分类组织 PoC 与实验结果。当前 Codex 侧已完成本地 CPU PoC，ClaudeCode 已在 4090 上回填 standalone GPU benchmark；NPU、分布式并行和完整训练端到端实验仍需后续在目标环境执行，并继续按表格模板回填。
+本节按前文的热点分类组织 PoC 与实验结果。当前 Codex 侧已完成本地 CPU PoC，ClaudeCode 已在 4090 上回填 standalone GPU benchmark、P0 验证实验和部分引擎端到端训练结果；NPU、超长 prompt、大 batch 容量收益、phase-level 归因仍需后续在目标环境执行，并继续按表格模板回填。
 
 #### CPU Overhead
 
@@ -890,8 +891,6 @@ GPU bf16 correctness (4 组实验, all exact match)：
 
 - 端到端 forward latency 稳定下降，且不引入精度或梯度风险。
 
-## 4. 开发计划
-
 ### 3.9 引擎端到端集成测试（4090）
 
 测试环境：8×RTX 4090 (24GB each)，verl080 conda env，Qwen2.5-0.5B / Qwen3-0.6B
@@ -923,7 +922,8 @@ GPU bf16 correctness (4 组实验, all exact match)：
 | bs16_p512_r64 | ON | 18.11 | 13.82 | 0.88 | 1.23 | 8.99 ↓3.07 | 6.99 ↓2.62 | 303.6 ↓10.4% | 1.198 ↑4.3% | 281.2 | 62.3 |
 
 初步观察（bs8/bs16, 1GPU, Megatron TP=1）：
-- PS=ON gen_time/step_time 更长（vLLM rollout overhead > reuse 收益），但 HBM 显著减少
+- PS=ON gen_time/step_time 更长，但当前 prefix-sharing 没有改动 vLLM 推理引擎，不能直接将 gen_time 差异归因于 PrefixSharing；后续应重点拆分 `compute_old_log_prob` / actor forward-backward / update_actor 等训练侧 phase
+- HBM 显著减少：
   - bs8_p256: actor HBM ↓4.8%, critic HBM ↓10.6%
   - bs8_p512: actor HBM ↓22.0%, critic HBM ↓24.4%
   - bs8_p1024: actor HBM ↓33.8%, critic HBM ↓34.4%
@@ -997,11 +997,102 @@ GPU bf16 correctness (4 组实验, all exact match)：
 4. **FSDP DP=8 场景下 HBM 收益重现**：bs16_p512 ↓13.6%, bs32_p256 ↓27.4%，与 1GPU 趋势一致
 
 **Latency 收益**：
-- PS=ON gen_time/step_time 普遍更长（+10~14%），说明 vLLM rollout 的 PS overhead > KV reuse 收益
-- 这是因为当前测试用的是 bs=8/16/32 小 batch + 短 prompt（158~365 tokens），prefix sharing 的 rollout 计算节省不足以抵消 detection/planning/trimming 的额外开销
-- 预期在更大 batch_size (bs=64+) + 更长 prompt (1K~4K+) 场景下，latency 收益会翻转
+- 当前 22 组端到端 run 中 PS=ON 的 step/throughput 普遍更差，但 gen_time 主要属于 rollout/推理引擎侧；由于本轮没有改动推理引擎，不能把 gen_time 变慢直接归因于 PrefixSharing。
+- PrefixSharing 更可能影响 `compute_old_log_prob`、actor/reference logprob forward、backward、`update_actor`、restore 和 integration glue。本轮表格中的 update_actor 差异还不足以完成归因，需要第三轮 phase-level profiler。
+- 当前测试多为 bs=8/16/32 + 中短 prompt（158~365 tokens）。如果 HBM 降低能支持更大 batch 或更长 prompt，实际吞吐可能通过容量扩展提升，而不是在同配置 latency 上直接变快。
 
-**结论**：PS 的核心价值在 **HBM 节省**而非 latency 加速，尤其在单卡或纯 DP 场景下效果最显著。多 GPU TP 场景下因每卡 KV shard 占内存比例低，HBM 收益不明显，但 latency overhead 仍然存在
+**结论**：在当前实现和已测配置下，PS 的已确认核心价值是 **HBM 节省 / 容量扩展**，尤其在单卡或纯 DP 场景下效果最显著。多 GPU TP 场景下因每卡 KV shard 占内存比例低，HBM 收益不明显；latency 是否能转正需要在更大 batch、更长 prompt 和 phase-level 归因后再判断。
+
+### 3.10 第三轮性能摸底实验指导
+
+第三轮目标不是重复验证 gen_time，而是回答两个问题：
+
+1. PrefixSharing 是否让训练侧 phase 变慢，具体慢在哪里。
+2. HBM 节省能否换来更大的 batch size / prompt length，并最终提升有效吞吐。
+
+#### 实验 A：phase-level 训练侧归因
+
+必须拆分记录以下 phase，禁止只记录 step/gen 总时间：
+
+- `rollout_generate`：只作为背景值记录，不作为 PrefixSharing 归因依据。
+- `compute_old_log_prob` / actor logprob forward。
+- reference logprob forward（如果当前 pipeline 单独计算）。
+- `update_actor_forward`。
+- `update_actor_backward`。
+- `optimizer_step` / `update_weights`。
+- prefix-sharing prepare：sequence extraction、planner、trim/layout。
+- prefix-sharing attention：rope、build_kv、FA prepare、FA kernel、FA post、restore。
+- micro-batch end-to-end、mini-batch end-to-end。
+
+建议环境变量：
+
+```bash
+export ENABLE_PREFIX_SHARING=0|1
+export PREFIX_SHARING_PROFILE=1
+export PREFIX_SHARING_PROFILE_SYNC=1
+export PREFIX_SHARING_PROFILE_DIR=/path/to/prefix-sharing-prof
+```
+
+推荐测试矩阵：
+
+| Engine | Parallel | Model | Batch | Prompt | Response | 目的 |
+|---|---|---|---:|---:|---:|---|
+| Megatron | 1GPU TP=1 | Qwen2.5-0.5B | 8/16/32 | 256/512/1024 | 32/64 | 对齐第二轮，补 phase 归因 |
+| Megatron | 8GPU TP=2 | Qwen2.5-0.5B | 16/32 | 512/1024 | 32/64 | 验证 TP 下训练侧 overhead |
+| Megatron | 8GPU TP=8 | Qwen3-0.6B | 16/32 | 512/1024 | 32/64 | 验证 Qwen3 + TP shard 下 overhead |
+| FSDP | 8GPU DP=8 | Qwen2.5-0.5B | 16/32/64 | 512/1024 | 32/64 | 验证 DP/FSDP 容量收益 |
+
+回填表：
+
+| Engine | Parallel | Model | Config | PS | rollout_generate_s | old_logprob_s | ref_logprob_s | actor_forward_s | actor_backward_s | optimizer_s | ps_prepare_ms | ps_build_kv_ms | ps_fa_ms | ps_restore_ms | step_s | tokens/s | actor_HBM_GB | conclusion |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+
+判定标准：
+
+- 如果 PS=ON 的 `rollout_generate_s` 变慢但训练侧 phase 不变，不能归因到 PrefixSharing。
+- 如果 `old_logprob_s` / `actor_forward_s` / `actor_backward_s` 明显变慢，继续下钻 prefix-sharing prepare/build_kv/FA/restore。
+- 如果同配置 latency 变慢但 HBM 明显下降，进入实验 B 验证容量扩展后的有效吞吐。
+
+#### 实验 B：HBM 容量收益与 batch-size scaling
+
+目的：验证 PS=ON 降低 HBM 后，能否跑更大的 batch / prompt，并提升有效吞吐。
+
+已测 HBM 收益基线：
+
+- Megatron 1GPU TP=1, bs8_p1024_r32：actor HBM 13.58GB → 8.99GB，下降 **33.8%**；critic HBM 10.65GB → 6.99GB，下降 **34.4%**。
+- Megatron 1GPU TP=1, bs16_p256_r32：actor HBM 13.60GB → 8.99GB，下降 **33.9%**；critic HBM 10.66GB → 6.99GB，下降 **34.5%**。
+- FSDP DP=8, bs32_p256_r32：actor HBM 4.52GB → 3.29GB，下降 **27.4%**。
+- Standalone GPU FA, chain B=32 L=512：peak HBM 198.00MB → 133.54MB，下降 **32.5%**。
+
+容量实验方法：
+
+1. 对每个 engine 固定 prompt/response，分别寻找 PS=OFF 与 PS=ON 的最大可运行 batch size。
+2. 每个可运行配置至少跑 3 个 step，丢弃第 1 个 warmup step。
+3. 记录是否 OOM、peak HBM、tokens/s、samples/s、step_s、old_logprob_s、update_actor_s。
+4. 以“最大可运行 batch 下的 tokens/s / samples/s”判断容量收益，而不是只比较同 batch latency。
+
+推荐矩阵：
+
+| Engine | Parallel | Model | Prompt | Response | Batch 搜索范围 |
+|---|---|---|---:|---:|---|
+| Megatron | 1GPU TP=1 | Qwen2.5-0.5B | 1024 | 32/64 | 8, 16, 24, 32, 48, 64 |
+| Megatron | 1GPU TP=1 | Qwen2.5-0.5B | 2048 | 32/64 | 4, 8, 16, 24, 32 |
+| FSDP | 8GPU DP=8 | Qwen2.5-0.5B | 512 | 64 | 16, 32, 48, 64, 96 |
+| FSDP | 8GPU DP=8 | Qwen2.5-0.5B | 1024 | 64 | 8, 16, 32, 48, 64 |
+| Megatron | 8GPU TP=2/8 | Qwen2.5/Qwen3 | 1024 | 32/64 | 16, 32, 48, 64 |
+
+回填表：
+
+| Engine | Parallel | Model | Prompt | Response | PS | Max batch without OOM | Peak actor HBM | Peak critic HBM | step_s p50 | old_logprob_s p50 | update_actor_s p50 | tokens/s | samples/s | conclusion |
+|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+
+判定标准：
+
+- 如果 PS=ON 最大 batch 明显大于 PS=OFF，且最大 batch 下 tokens/s 或 samples/s 更高，则确认“HBM 换吞吐”成立。
+- 如果 PS=ON 只降低 HBM 但最大 batch 不变，需要定位其他 HBM 占用上限，例如 optimizer、rollout cache、activation checkpoint、FSDP dense scatter。
+- 如果 TP 场景最大 batch 不变，说明当前 TP 下每卡 KV shard 不是容量瓶颈，业务落地应优先考虑单卡/DP/FSDP 或更长 prompt 场景。
+
+## 4. 开发计划
 
 ### 4.1 第一阶段：确定性 P0 优化
 
@@ -1064,7 +1155,7 @@ GPU bf16 correctness (4 组实验, all exact match)：
 
 ### 5.1 总体判断
 
-4090 standalone 实验后，当前主要性能问题已经比最初更集中：速度瓶颈首先是 `build_kv()`，其次是 no-sharing / 长序列场景下的 prefix detector；显存收益在 GPU FA 路线上是明确正收益，但 TorchRef/debug 路线会被 dense mask 抵消。仍需注意：这些结论来自 standalone microbenchmark，不等同于完整 verl/Megatron/FSDP 训练端到端 profile。
+4090 standalone + 第二轮端到端实验后，当前判断更明确：`build_kv()` 和 no-sharing detector 是已确认并已优化的局部热点；端到端同配置 latency 尚未转正，且 gen_time 不能直接归因到 PrefixSharing；HBM 收益在单卡和 DP/FSDP 场景明确，下一步应验证能否通过更大 batch / 更长 prompt 转化为有效吞吐收益。
 
 已确认：
 
@@ -1077,7 +1168,8 @@ GPU bf16 correctness (4 组实验, all exact match)：
 仍待确认：
 
 - NPU FA BSH pad/stack + per-sample 4D mask 的速度和 HBM 成本。
-- 完整 verl/Megatron/FSDP 训练中 forward/backward/update 端到端收益。
+- 完整 verl/Megatron/FSDP 训练中 `compute_old_log_prob` / actor forward-backward / update_actor 的 phase-level 归因。
+- HBM 节省是否能提升最大可运行 batch size，并带来 tokens/s 或 samples/s 的端到端收益。
 - FSDP dense scatter / packed-jagged 贯穿在真实 pipeline 中对 HBM 的影响。
 - plan list/dataclass 紧凑化的独立收益，因为当前计时中 detector 与 plan construction 尚未完全拆清。
 
