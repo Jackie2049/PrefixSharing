@@ -10,9 +10,9 @@ state by composite keys.
 
 Core Responsibilities:
     1. **Isolate prefix activations by scope**: index entries with ``forward_id``,
-       ``micro_batch_id``, ``layer_id``, ``sample_idx_in_batch``, and
-       ``tp_rank`` so micro-batches, layers, and tensor-parallel ranks do not
-       collide.
+       ``micro_batch_id``, ``layer_id``, ``sample_idx_in_batch``, ``tp_rank``,
+       and ``cp_rank`` so micro-batches, layers, tensor-parallel ranks, and
+       context-parallel ranks do not collide.
     2. **Preserve typed mixer history**: store attention KV and Gated DeltaNet
        state as different entry types while sharing lifecycle and isolation
        mechanics.
@@ -66,6 +66,7 @@ class PrefixActivationSlotId:
     sample_idx_in_batch: int
     prefix_state_type: str
     tp_rank: int = 0
+    cp_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class StoredAttentionKV:
     key_tensor: Any
     value_tensor: Any
     prefix_len: int
+    position_ids: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,7 @@ class PrefixAttentionStore(PrefixActivationStore):
         key_tensor: Any,
         value_tensor: Any,
         prefix_len: int,
+        position_ids: Any | None = None,
         overwrite: bool = False,
     ) -> None:
         if slot_id.prefix_state_type != PREFIX_STATE_TYPE_ATTENTION_KV:
@@ -161,7 +164,12 @@ class PrefixAttentionStore(PrefixActivationStore):
             raise ValueError("prefix_len must be >= 0")
         self.store_entry(
             slot_id,
-            entry=StoredAttentionKV(key_tensor=key_tensor, value_tensor=value_tensor, prefix_len=prefix_len),
+            entry=StoredAttentionKV(
+                key_tensor=key_tensor,
+                value_tensor=value_tensor,
+                prefix_len=prefix_len,
+                position_ids=position_ids,
+            ),
             overwrite=overwrite,
         )
 

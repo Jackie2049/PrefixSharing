@@ -31,6 +31,17 @@ class PackedPrefixLastRestoreIndex:
     """Actual token ID used as label (needed when label isn't in trimmed packed region)."""
 
 
+@dataclass
+class PrefixLastLogitsSaveIndex:
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
+    provider_global_1d_pos: int
+    provider_local_1d_pos: int | None
+    owner_cp_rank: int
+    target_2d_pos: int
+    label_value: int
+
+
 @dataclass(init=False)
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
@@ -40,6 +51,7 @@ class PrefixSharingRuntimeContext:
     attention_backend: Any | None = None
     kept_position_ids: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
+    prefix_last_logits_save_indices: list[PrefixLastLogitsSaveIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
     """Saved provider packed logits for prefix-last logprob recompute in 2D space.
 
@@ -63,6 +75,11 @@ class PrefixSharingRuntimeContext:
         self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
             runtime_state.prefix_sharing_plan,
             runtime_state.packed_batch_layout,
+        )
+        self.prefix_last_logits_save_indices = _build_prefix_last_logits_save_indices(
+            self.prefix_last_restore_indices,
+            runtime_state.packed_batch_layout,
+            self.parallel_info.cp_rank,
         )
         # Provider packed logits saved for prefix-last logprob recompute in 2D
         # space.  Populated lazily by the verl vocab-logprobs patch for each
@@ -120,6 +137,100 @@ def _build_prefix_last_restore_indices(
             )
         )
     return indices
+
+
+def _build_prefix_last_logits_save_indices(
+    restore_indices: list[PackedPrefixLastRestoreIndex],
+    packed_batch_layout: PackedBatchLayout,
+    cp_rank: int,
+) -> list[PrefixLastLogitsSaveIndex]:
+    cp_view = packed_batch_layout.context_parallel
+    save_indices: list[PrefixLastLogitsSaveIndex] = []
+    for index in restore_indices:
+        local_pos = index.provider_1d_pos
+        owner_cp_rank = int(cp_rank)
+        if cp_view is not None:
+            local_pos = cp_view.global_to_local(index.provider_1d_pos)
+            owner_cp_rank = _owner_cp_rank_for_global_index(
+                packed_batch_layout,
+                index.provider_1d_pos,
+            )
+        save_indices.append(
+            PrefixLastLogitsSaveIndex(
+                reuse_idx_in_batch=index.reuse_idx_in_batch,
+                provider_idx_in_batch=index.provider_idx_in_batch,
+                provider_global_1d_pos=index.provider_1d_pos,
+                provider_local_1d_pos=local_pos,
+                owner_cp_rank=owner_cp_rank,
+                target_2d_pos=index.target_2d_pos,
+                label_value=index.label_value,
+            )
+        )
+    return save_indices
+
+
+def _owner_cp_rank_for_global_index(
+    packed_batch_layout: PackedBatchLayout,
+    global_index: int,
+) -> int:
+    cp_view = packed_batch_layout.context_parallel
+    if cp_view is None:
+        return 0
+    row = _row_for_global_index(packed_batch_layout, global_index)
+    row_start = packed_batch_layout.row_start(row)
+    offset = int(global_index) - row_start
+    padded_length = packed_batch_layout.padded_lengths[row]
+    chunk_len = padded_length // cp_view.cp_size
+    half = chunk_len // 2
+    if offset < padded_length // 2:
+        return offset // half
+    return (padded_length - 1 - offset) // half
+
+
+def _row_for_global_index(packed_batch_layout: PackedBatchLayout, global_index: int) -> int:
+    for row in range(packed_batch_layout.batch_size):
+        if packed_batch_layout.cu_seqlens[row] <= global_index < packed_batch_layout.cu_seqlens[row + 1]:
+            return row
+    raise IndexError("global_index is outside packed layout")
+
+
+def gather_prefix_last_logits_across_context_parallel(ctx: Any, logits_2d: Any) -> None:
+    parallel_info = getattr(ctx, "parallel_info", None)
+    cp_size = int(getattr(parallel_info, "cp_size", 1))
+    if cp_size <= 1:
+        return
+
+    import torch
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "[vocab_logprobs] CP prefix-last restore requires torch.distributed "
+            "to gather owner-rank logits across the context-parallel group."
+        )
+    try:
+        from megatron.core import parallel_state
+
+        cp_group = parallel_state.get_context_parallel_group()
+    except Exception as exc:
+        raise RuntimeError(
+            "[vocab_logprobs] failed to read Megatron context-parallel group "
+            "for prefix-last logits gather"
+        ) from exc
+
+    try:
+        from torch.distributed.nn.functional import all_gather as autograd_all_gather
+    except Exception as exc:
+        raise RuntimeError(
+            "[vocab_logprobs] torch.distributed.nn.functional.all_gather is required "
+            "to preserve autograd for CP prefix-last logits gather"
+        ) from exc
+
+    zero_logits = logits_2d.new_zeros((1, logits_2d.shape[-1]))
+    for index in ctx.prefix_last_logits_save_indices:
+        key = (index.reuse_idx_in_batch, index.target_2d_pos)
+        local_logits = ctx.prefix_last_logits_saved.get(key, zero_logits)
+        gathered = autograd_all_gather(local_logits, group=cp_group)
+        ctx.prefix_last_logits_saved[key] = gathered[index.owner_cp_rank]
 
 
 @contextmanager

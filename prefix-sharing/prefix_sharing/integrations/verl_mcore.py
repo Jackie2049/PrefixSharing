@@ -641,7 +641,16 @@ def build_prefix_sharing_micro_batch_verl080(
 
     # ── 阶段 1: 配置校验 ──
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
-    ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
+    ps_config.validate_for_engine(
+        use_remove_padding=use_remove_padding,
+        context_parallel_size=int(getattr(engine_self.engine_config, "context_parallel_size", 1)),
+        context_parallel_algo=getattr(
+            getattr(engine_self.engine_config, "override_transformer_config", None),
+            "context_parallel_algo",
+            getattr(engine_self.engine_config, "context_parallel_algo", None),
+        ),
+        dynamic_context_parallel=bool(getattr(engine_self.engine_config, "dynamic_context_parallel", False)),
+    )
 
     # ── 阶段 2: 拒绝不支持的特性 ──
     try:
@@ -712,6 +721,8 @@ def build_prefix_sharing_micro_batch_verl080(
     packed_layout = PackedBatchLayout.from_kept_position_rows(
         kept_position_rows,
         align_size=int(align_size),
+        cp_rank=int(parallel_info.cp_rank),
+        cp_size=int(parallel_info.cp_size),
     )
 
     # ── 阶段 7: 构建 state ──

@@ -42,15 +42,38 @@ def prefix_attention(
 
     # 确保 QKV 符合 THD packing格式
     packed_batch_layout = prefix_sharing_context.packed_batch_layout
-    ensure_global_packed_token_lengths(
-        {
+    cp_view = packed_batch_layout.context_parallel
+    if cp_view is None:
+        ensure_global_packed_token_lengths(
+            {
+                "query_length": query.shape[0],
+                "key_length": key.shape[0],
+                "value_length": value.shape[0],
+            },
+            total_padded_length=packed_batch_layout.total_padded_length,
+            context="attention hook",
+        )
+        rope_position_ids = packed_batch_layout.packed_position_ids
+        expected_token_length = packed_batch_layout.total_padded_length
+    else:
+        expected_token_length = cp_view.local_total_padded_length
+        actual_lengths = {
             "query_length": query.shape[0],
             "key_length": key.shape[0],
             "value_length": value.shape[0],
-        },
-        total_padded_length=packed_batch_layout.total_padded_length,
-        context="attention hook",
-    )
+        }
+        mismatched = {
+            name: value for name, value in actual_lengths.items()
+            if int(value) != int(expected_token_length)
+        }
+        if mismatched:
+            raise RuntimeError(
+                "[prefix-sharing] CP attention hook requires CP-local THD token length. "
+                f"expected_local_total_padded_length={expected_token_length}, "
+                f"actual={actual_lengths}, cp_rank={cp_view.cp_rank}, cp_size={cp_view.cp_size}. "
+                "This path does not support SP/CP-local variants with different hook tensor layout."
+            )
+        rope_position_ids = cp_view.local_position_ids
 
     # QK位置编码
     #   mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
@@ -68,7 +91,7 @@ def prefix_attention(
         key,
         q_pos_emb,
         k_pos_emb,
-        packed_batch_layout.packed_position_ids,
+        rope_position_ids,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         mscale=mscale,
@@ -83,7 +106,8 @@ def prefix_attention(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
         f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"enter prefix-sharing path: query_token_length={query.shape[0]} "
-        f"total_padded_length={packed_batch_layout.total_padded_length} query_shape={tuple(query.shape)}, "
+        f"total_padded_length={packed_batch_layout.total_padded_length} expected_token_length={expected_token_length} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} query_shape={tuple(query.shape)}, "
         f"key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, valid_lengths={packed_batch_layout.valid_lengths}, "
         f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}"
     )
@@ -98,6 +122,7 @@ def prefix_attention(
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
+        cp_rank=parallel_info.cp_rank,
         stats=prefix_sharing_context.stats,
     )
     print(

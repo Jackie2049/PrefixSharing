@@ -1,7 +1,15 @@
+import pytest
+
+torch = pytest.importorskip("torch")
+
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
+from prefix_sharing.integrations.context import (
+    current_prefix_sharing_context,
+    gather_prefix_last_logits_across_context_parallel,
+    prefix_sharing_runtime_context,
+)
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
 
@@ -68,6 +76,116 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
         assert len(ctx.prefix_last_restore_indices) == 1
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2  # prefix-last, direct provider seq0 offset 2
         assert ctx.stats.kept_padded_tokens == 8
+
+
+def test_prefix_sharing_runtime_context_builds_cp_local_logits_save_indices():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    prefix_sharing_plan = planner.plan(
+        [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+        forward_id=10,
+        micro_batch_id=20,
+    )
+    layout = PackedBatchLayout.from_kept_position_rows(
+        [torch.arange(5), torch.arange(3, 5)],
+        align_size=8,
+        cp_rank=1,
+        cp_size=2,
+    )
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=prefix_sharing_plan,
+        attention_backend=None,
+        packed_batch_layout=layout,
+        parallel_info=MegatronParallelInfo(cp_rank=1, cp_size=2),
+    )
+
+    with prefix_sharing_runtime_context(runtime_state) as ctx:
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        assert len(ctx.prefix_last_logits_save_indices) == 1
+        save_index = ctx.prefix_last_logits_save_indices[0]
+        assert save_index.provider_global_1d_pos == 2
+        assert save_index.provider_local_1d_pos == 0
+        assert save_index.owner_cp_rank == 1
+        assert save_index.target_2d_pos == 2
+
+
+def test_prefix_sharing_runtime_context_skips_non_owner_cp_local_logits_save_index():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    prefix_sharing_plan = planner.plan(
+        [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+        forward_id=10,
+        micro_batch_id=20,
+    )
+    layout = PackedBatchLayout.from_kept_position_rows(
+        [torch.arange(5), torch.arange(3, 5)],
+        align_size=8,
+        cp_rank=0,
+        cp_size=2,
+    )
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=prefix_sharing_plan,
+        attention_backend=None,
+        packed_batch_layout=layout,
+        parallel_info=MegatronParallelInfo(cp_rank=0, cp_size=2),
+    )
+
+    with prefix_sharing_runtime_context(runtime_state) as ctx:
+        save_index = ctx.prefix_last_logits_save_indices[0]
+        assert save_index.provider_global_1d_pos == 2
+        assert save_index.provider_local_1d_pos is None
+        assert save_index.owner_cp_rank == 1
+
+
+def test_gather_prefix_last_logits_across_context_parallel_fills_non_owner_rank(monkeypatch):
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    prefix_sharing_plan = planner.plan(
+        [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+        forward_id=10,
+        micro_batch_id=20,
+    )
+    layout = PackedBatchLayout.from_kept_position_rows(
+        [torch.arange(5), torch.arange(3, 5)],
+        align_size=8,
+        cp_rank=0,
+        cp_size=2,
+    )
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=prefix_sharing_plan,
+        attention_backend=None,
+        packed_batch_layout=layout,
+        parallel_info=MegatronParallelInfo(cp_rank=0, cp_size=2),
+    )
+    owner_logits = torch.randn(1, 7, requires_grad=True)
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    import sys
+    from types import ModuleType
+
+    parallel_state = ModuleType("megatron.core.parallel_state")
+    parallel_state.get_context_parallel_group = lambda: object()
+    core = ModuleType("megatron.core")
+    core.parallel_state = parallel_state
+    megatron = ModuleType("megatron")
+    megatron.core = core
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
+
+    def fake_all_gather(local_logits, group=None):
+        return (local_logits, owner_logits)
+
+    monkeypatch.setattr("torch.distributed.nn.functional.all_gather", fake_all_gather)
+
+    with prefix_sharing_runtime_context(runtime_state) as ctx:
+        save_index = ctx.prefix_last_logits_save_indices[0]
+        key = (save_index.reuse_idx_in_batch, save_index.target_2d_pos)
+        assert key not in ctx.prefix_last_logits_saved
+
+        gather_prefix_last_logits_across_context_parallel(ctx, torch.zeros(1, 7))
+
+        assert ctx.prefix_last_logits_saved[key] is owner_logits
 
 
 def test_chain_reuse_prefix_last_resolves_to_direct_provider():

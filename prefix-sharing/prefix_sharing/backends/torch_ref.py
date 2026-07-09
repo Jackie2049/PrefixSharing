@@ -59,9 +59,22 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        cp_rank: int = 0,
         stats: PrefixSharingStats | None = None,
     ) -> tuple[Any, Any]:
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        if layout.context_parallel is not None:
+            return self._build_kv_context_parallel(
+                key,
+                value,
+                store,
+                prefix_sharing_plan,
+                packed_batch_layout=layout,
+                layer_id=layer_id,
+                tp_rank=tp_rank,
+                cp_rank=cp_rank,
+                stats=stats,
+            )
         # Input K/V still follow the framework's padded packed layout; only
         # valid tokens may enter the store or expanded KV.
         key_rows = _split_packed(key, layout.padded_lengths)
@@ -100,6 +113,7 @@ class TorchReferenceBackend:
                     batch_index,
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
+                    cp_rank,
                 )
                 # Publish this row's KV so later reusers in this micro-batch can load it.
                 store.store(
@@ -120,6 +134,7 @@ class TorchReferenceBackend:
                     provider,
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
+                    cp_rank,
                 )
                 # Load the already-published provider KV before building this reuser's expanded KV.
                 reuse_count += 1
@@ -155,6 +170,7 @@ class TorchReferenceBackend:
                     batch_index,
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
+                    cp_rank,
                 )
                 # Publish the expanded reuser KV because a later row may reuse this longer prefix.
                 store.store(
@@ -181,6 +197,133 @@ class TorchReferenceBackend:
             )
         return expanded_key, expanded_value
 
+    def _build_kv_context_parallel(
+        self,
+        key: Any,
+        value: Any,
+        store: PrefixAttentionStore,
+        prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any,
+        layer_id: int,
+        tp_rank: int = 0,
+        cp_rank: int = 0,
+        stats: PrefixSharingStats | None = None,
+    ) -> tuple[Any, Any]:
+        layout = packed_batch_layout
+        cp_view = layout.context_parallel
+        if cp_view is None:
+            raise ValueError("context parallel view is required")
+        key_rows = _split_packed(key, cp_view.local_padded_lengths)
+        value_rows = _split_packed(value, cp_view.local_padded_lengths)
+        local_position_rows, local_valid_mask_rows = _local_position_and_mask_rows(layout)
+        expanded_position_rows = _cp_local_expanded_position_rows(prefix_sharing_plan, layout)
+        expanded_lengths = [int(row.shape[0]) for row in expanded_position_rows]
+        expanded_offsets = _cumsum(expanded_lengths)
+        expanded_total = expanded_offsets[-1]
+        expanded_key = key.new_empty((expanded_total, *key.shape[1:]))
+        expanded_value = value.new_empty((expanded_total, *value.shape[1:]))
+        store_count = 0
+        reuse_count = 0
+        reuse_hit_count = 0
+        reuse_miss_count = 0
+        stored_tokens = 0
+        reused_prefix_tokens = 0
+        for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
+            valid_mask = local_valid_mask_rows[batch_index]
+            valid_key_row = key_row[valid_mask]
+            valid_value_row = value_row[valid_mask]
+            valid_positions = local_position_rows[batch_index][valid_mask]
+            expanded_start = expanded_offsets[batch_index]
+            expanded_end = expanded_offsets[batch_index + 1]
+            expanded_key_row = expanded_key[expanded_start:expanded_end]
+            expanded_value_row = expanded_value[expanded_start:expanded_end]
+            if not prefix_sharing_plan.is_reuser(batch_index):
+                expanded_key_row.copy_(valid_key_row)
+                expanded_value_row.copy_(valid_value_row)
+                slot_id = PrefixActivationSlotId(
+                    prefix_sharing_plan.forward_id,
+                    prefix_sharing_plan.micro_batch_id,
+                    layer_id,
+                    batch_index,
+                    PREFIX_STATE_TYPE_ATTENTION_KV,
+                    tp_rank,
+                    cp_rank,
+                )
+                store.store(
+                    slot_id,
+                    key_tensor=expanded_key_row,
+                    value_tensor=expanded_value_row,
+                    prefix_len=expanded_key_row.shape[0],
+                    position_ids=valid_positions,
+                    overwrite=True,
+                )
+                store_count += 1
+                stored_tokens += int(expanded_key_row.shape[0])
+                continue
+
+            provider = prefix_sharing_plan.provider_index[batch_index]
+            provider_slot_id = PrefixActivationSlotId(
+                prefix_sharing_plan.forward_id,
+                prefix_sharing_plan.micro_batch_id,
+                layer_id,
+                provider,
+                PREFIX_STATE_TYPE_ATTENTION_KV,
+                tp_rank,
+                cp_rank,
+            )
+            reuse_count += 1
+            try:
+                entry = store.load(provider_slot_id)
+            except KeyError:
+                reuse_miss_count += 1
+                raise
+            reuse_hit_count += 1
+            prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+            provider_positions = entry.position_ids
+            if provider_positions is None:
+                raise ValueError("CP-local attention KV entry requires position_ids")
+            provider_prefix_mask = provider_positions < prefix_len
+            provider_prefix_key = entry.key_tensor[provider_prefix_mask]
+            provider_prefix_value = entry.value_tensor[provider_prefix_mask]
+            reused_prefix_tokens += int(provider_prefix_key.shape[0])
+            expanded_key_row.copy_(torch.cat([provider_prefix_key, valid_key_row], dim=0))
+            expanded_value_row.copy_(torch.cat([provider_prefix_value, valid_value_row], dim=0))
+            own_positions = torch.cat([provider_positions[provider_prefix_mask], valid_positions], dim=0)
+            own_slot_id = PrefixActivationSlotId(
+                prefix_sharing_plan.forward_id,
+                prefix_sharing_plan.micro_batch_id,
+                layer_id,
+                batch_index,
+                PREFIX_STATE_TYPE_ATTENTION_KV,
+                tp_rank,
+                cp_rank,
+            )
+            store.store(
+                own_slot_id,
+                key_tensor=expanded_key_row,
+                value_tensor=expanded_value_row,
+                prefix_len=expanded_key_row.shape[0],
+                position_ids=own_positions,
+                overwrite=True,
+            )
+            store_count += 1
+            stored_tokens += int(expanded_key_row.shape[0])
+        if stats is not None:
+            stats.record_attention_kv_build(
+                layer_id=layer_id,
+                store_count=store_count,
+                reuse_count=reuse_count,
+                reuse_hit_count=reuse_hit_count,
+                reuse_miss_count=reuse_miss_count,
+                stored_tokens=stored_tokens,
+                reused_prefix_tokens=reused_prefix_tokens,
+                expanded_kv_tokens=expanded_total,
+                valid_q_tokens=int(sum(mask.sum().item() for mask in local_valid_mask_rows)),
+                padded_q_tokens=cp_view.local_total_padded_length,
+            )
+        return expanded_key, expanded_value
+
     def attention(
         self,
         query: Any,
@@ -192,6 +335,8 @@ class TorchReferenceBackend:
         **_: Any,
     ) -> Any:
         batch_layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        if batch_layout.context_parallel is not None:
+            return _attention_context_parallel(query, key, value, prefix_sharing_plan, batch_layout)
         
         # QKV从batch拆分到单条序列，便于精度问题定位
         query_rows = _split_packed(query, batch_layout.padded_lengths)
@@ -262,6 +407,7 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        cp_rank: int = 0,
     ) -> Any:
         """Build prefix-expanded Qwen3.5 GatedDeltaNet recurrent trajectories.
 
@@ -286,6 +432,7 @@ class TorchReferenceBackend:
                     batch_index,
                     PREFIX_STATE_TYPE_DELTANET_STATE,
                     tp_rank,
+                    cp_rank,
                 )
                 # Publish provider state so later reusers can start from the
                 # exact prefix boundary instead of recomputing the prefix.
@@ -306,6 +453,7 @@ class TorchReferenceBackend:
                 provider,
                 PREFIX_STATE_TYPE_DELTANET_STATE,
                 tp_rank,
+                cp_rank,
             )
             # The provider trajectory is indexed at prefix_len - 1 to obtain the
             # reusable state after the shared prefix has been consumed.
@@ -328,6 +476,7 @@ class TorchReferenceBackend:
                 batch_index,
                 PREFIX_STATE_TYPE_DELTANET_STATE,
                 tp_rank,
+                cp_rank,
             )
             # Publish the expanded reuser trajectory for transitive reuse by a later row.
             store.store(
@@ -348,6 +497,74 @@ def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
     return list(torch.split(tensor, lengths, dim=0))
 
 
+def _local_position_and_mask_rows(layout: Any) -> tuple[list[Any], list[Any]]:
+    cp_view = layout.context_parallel
+    if cp_view is None:
+        raise ValueError("context parallel view is required")
+    position_rows = _split_packed(cp_view.local_position_ids, cp_view.local_padded_lengths)
+    mask_rows = _split_packed(cp_view.local_valid_token_mask, cp_view.local_padded_lengths)
+    return position_rows, mask_rows
+
+
+def _cp_local_expanded_position_rows(prefix_sharing_plan: PrefixSharingPlan, layout: Any) -> list[Any]:
+    local_position_rows, local_valid_mask_rows = _local_position_and_mask_rows(layout)
+    expanded_positions: list[Any] = []
+    for batch_index, position_row in enumerate(local_position_rows):
+        valid_positions = position_row[local_valid_mask_rows[batch_index]]
+        if not prefix_sharing_plan.is_reuser(batch_index):
+            expanded_positions.append(valid_positions)
+            continue
+        provider = prefix_sharing_plan.provider_index[batch_index]
+        prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+        provider_positions = expanded_positions[provider]
+        expanded_positions.append(
+            torch.cat([provider_positions[provider_positions < prefix_len], valid_positions], dim=0)
+        )
+    return expanded_positions
+
+
+def _attention_context_parallel(
+    query: Any,
+    key: Any,
+    value: Any,
+    prefix_sharing_plan: PrefixSharingPlan,
+    batch_layout: Any,
+) -> Any:
+    cp_view = batch_layout.context_parallel
+    if cp_view is None:
+        raise ValueError("context parallel view is required")
+    query_rows = _split_packed(query, cp_view.local_padded_lengths)
+    local_position_rows, local_valid_mask_rows = _local_position_and_mask_rows(batch_layout)
+    expanded_position_rows = _cp_local_expanded_position_rows(prefix_sharing_plan, batch_layout)
+    expanded_lengths = [int(row.shape[0]) for row in expanded_position_rows]
+    key_rows = _split_packed(key, expanded_lengths)
+    value_rows = _split_packed(value, expanded_lengths)
+
+    outputs = []
+    for q_row, q_positions, q_valid_mask, k_row, v_row, kv_positions in zip(
+        query_rows,
+        local_position_rows,
+        local_valid_mask_rows,
+        key_rows,
+        value_rows,
+        expanded_position_rows,
+    ):
+        q_valid = q_row[q_valid_mask]
+        q_valid_positions = q_positions[q_valid_mask]
+        if q_valid.shape[0] == 0:
+            outputs.append(torch.zeros_like(q_row))
+            continue
+        mask = _position_causal_mask(q_valid_positions, kv_positions)
+        valid_output = _attention_row(q_valid, k_row, v_row, mask)
+        if q_valid.shape[0] == q_row.shape[0]:
+            outputs.append(valid_output)
+            continue
+        padded_output = torch.zeros_like(q_row)
+        padded_output[q_valid_mask] = valid_output
+        outputs.append(padded_output)
+    return torch.cat(outputs, dim=0)
+
+
 def _cumsum(lengths: list[int]) -> list[int]:
     offsets = [0]
     total = 0
@@ -361,6 +578,10 @@ def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any
     q_positions = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
     kv_positions = torch.arange(0, kv_len, device=device).unsqueeze(0)
     return kv_positions <= q_positions
+
+
+def _position_causal_mask(q_positions: Any, kv_positions: Any) -> Any:
+    return kv_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:

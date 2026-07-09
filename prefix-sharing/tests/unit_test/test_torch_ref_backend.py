@@ -221,6 +221,87 @@ def test_build_kv_with_padding_strips_to_valid():
     assert expanded_k.shape[0] == expected_total
 
 
+def test_context_parallel_build_kv_uses_local_valid_tokens_and_cp_rank_isolation():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    plan = planner.plan(
+        [[0, 1, 2, 3, 4], [0, 1, 2, 9, 10]],
+        forward_id=10,
+        micro_batch_id=20,
+    )
+    layout = PackedBatchLayout.from_kept_position_rows(
+        [torch.arange(5), torch.tensor([3, 4])],
+        align_size=8,
+        cp_rank=0,
+        cp_size=2,
+    )
+    backend = TorchReferenceBackend()
+    store = PrefixAttentionStore()
+    key = torch.arange(layout.context_parallel.local_total_padded_length, dtype=torch.float32).view(-1, 1, 1)
+    value = key + 100
+
+    expanded_key, expanded_value = backend.build_kv(
+        key,
+        value,
+        store,
+        plan,
+        packed_batch_layout=layout,
+        layer_id=0,
+        tp_rank=0,
+        cp_rank=0,
+    )
+
+    # rank0 owns provider positions [0, 1] and reuser suffix positions [3, 4].
+    assert expanded_key.flatten().tolist() == [0.0, 1.0, 0.0, 1.0, 4.0, 5.0]
+    assert expanded_value.flatten().tolist() == [100.0, 101.0, 100.0, 101.0, 104.0, 105.0]
+    cp1_slot = PrefixActivationSlotId(
+        plan.forward_id,
+        plan.micro_batch_id,
+        0,
+        0,
+        PREFIX_STATE_TYPE_ATTENTION_KV,
+        tp_rank=0,
+        cp_rank=1,
+    )
+    assert not store.contains(cp1_slot)
+
+
+def test_context_parallel_attention_preserves_local_padded_query_shape():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    plan = planner.plan([[0, 1, 2, 3, 4], [0, 1, 2, 9, 10]])
+    layout = PackedBatchLayout.from_kept_position_rows(
+        [torch.arange(5), torch.tensor([3, 4])],
+        align_size=8,
+        cp_rank=0,
+        cp_size=2,
+    )
+    backend = TorchReferenceBackend()
+    store = PrefixAttentionStore()
+    total_local = layout.context_parallel.local_total_padded_length
+    query = torch.randn(total_local, 1, 4)
+    key = torch.randn(total_local, 1, 4)
+    value = torch.randn(total_local, 1, 4)
+    expanded_key, expanded_value = backend.build_kv(
+        key,
+        value,
+        store,
+        plan,
+        packed_batch_layout=layout,
+        layer_id=0,
+        tp_rank=0,
+        cp_rank=0,
+    )
+
+    output = backend.attention(
+        query,
+        expanded_key,
+        expanded_value,
+        plan,
+        packed_batch_layout=layout,
+    )
+
+    assert output.shape == query.shape
+
+
 def test_build_kv_transitive_reuse():
     """Reuser row 2 reuses from row 1 which reused from row 0 (transitive chain)."""
     # Use a valid transitive reuse: row0=provider, row1=reuse(prefix=3), row2=reuse(prefix=5)

@@ -68,7 +68,8 @@ class PrefixSharingConfig:
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
 
-    supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
+    supported_cp_size: int = 1  # Kept for CP=1 backward compatibility; CP>1 is gated by context_parallel_algo.
+    supported_context_parallel_algo: str = "kvallgather_cp_algo"
     supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
     supported_fused_qkv_rope: bool = False  # Fused QKV+RoPE kernel support (False = must disable)
 
@@ -177,6 +178,16 @@ class PrefixSharingConfig:
             "context_parallel_size",
             self.supported_cp_size,
         )
+        override_transformer_config = _read_config_value(model_config, "override_transformer_config", None)
+        context_parallel_algo = _read_config_value(model_config, "context_parallel_algo", None)
+        if context_parallel_algo is None:
+            context_parallel_algo = _read_config_value(
+                override_transformer_config,
+                "context_parallel_algo",
+                None,
+            )
+        dynamic_context_parallel = _read_config_value(model_config, "dynamic_context_parallel", False)
+        use_remove_padding = _read_config_value(model_config, "use_remove_padding", True)
         rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
         fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
 
@@ -198,12 +209,28 @@ class PrefixSharingConfig:
                 "当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
                 "请关闭 virtual PP 或禁用 prefix sharing。"
             )
-        if cp_size != self.supported_cp_size:
+        cp_size_int = int(cp_size)
+        if cp_size_int < 1:
             raise PrefixSharingConfigError(
-                f"[Config Error] context_parallel_size={cp_size} 不支持当前阶段。"
-                f"Phase 1 仅支持 context_parallel_size=1 (无上下文并行)，"
-                f"请修改配置将 CP 大小设为 1，或禁用 prefix sharing。"
+                f"[Config Error] context_parallel_size={cp_size} 不合法。"
+                "context_parallel_size 必须 >= 1。"
             )
+        if dynamic_context_parallel:
+            raise PrefixSharingConfigError(
+                "[Config Error] dynamic_context_parallel=True 不支持当前阶段。"
+                "当前 CP 首版只支持静态 context parallel。"
+            )
+        if cp_size_int > 1:
+            if context_parallel_algo != self.supported_context_parallel_algo:
+                raise PrefixSharingConfigError(
+                    f"[Config Error] context_parallel_algo={context_parallel_algo!r} 不支持当前阶段。"
+                    f"CP 首版仅支持 context_parallel_algo='{self.supported_context_parallel_algo}'。"
+                )
+            if not use_remove_padding:
+                raise PrefixSharingConfigError(
+                    "[Config Error] CP 首版仅支持 THD / use_remove_padding=True。"
+                    "BSHD CP 尚未支持。"
+                )
         if not self.supported_rope_fusion and rope_fusion:
             raise PrefixSharingConfigError(
                 "[Config Error] apply_rope_fusion=True 不支持当前阶段。"
@@ -221,6 +248,10 @@ class PrefixSharingConfig:
         self,
         use_remove_padding: bool = True,
         integrate_mode: str = "verl_megatron_actor",
+        *,
+        context_parallel_size: int = 1,
+        context_parallel_algo: str | None = None,
+        dynamic_context_parallel: bool = False,
     ) -> None:
         """Validate phase-1 constraints for verl engine 架构（verl 0.8.0+）。
 
@@ -247,6 +278,23 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_prefix_len must be >= 1")
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
+
+        cp_size_int = int(context_parallel_size)
+        if cp_size_int < 1:
+            raise PrefixSharingConfigError(
+                f"[Config Error] context_parallel_size={context_parallel_size} 不合法。"
+                "context_parallel_size 必须 >= 1。"
+            )
+        if dynamic_context_parallel:
+            raise PrefixSharingConfigError(
+                "[Config Error] dynamic_context_parallel=True 不支持当前阶段。"
+                "当前 CP 首版只支持静态 context parallel。"
+            )
+        if cp_size_int > 1 and context_parallel_algo != self.supported_context_parallel_algo:
+            raise PrefixSharingConfigError(
+                f"[Config Error] context_parallel_algo={context_parallel_algo!r} 不支持当前阶段。"
+                f"CP 首版仅支持 context_parallel_algo='{self.supported_context_parallel_algo}'。"
+            )
 
         # THD packed layout 需要 use_remove_padding
         if not use_remove_padding:

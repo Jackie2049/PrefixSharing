@@ -76,3 +76,22 @@ def test_prefix_activation_store_base_rejects_duplicate_entries():
     assert store.load_entry(slot_id) is entry
     with pytest.raises(KeyError):
         store.store_entry(slot_id, entry=object())
+
+
+def test_prefix_activation_slot_id_isolates_context_parallel_rank():
+    store = PrefixAttentionStore()
+    cp0_slot = PrefixActivationSlotId(
+        1, 2, 3, 4, PREFIX_STATE_TYPE_ATTENTION_KV, tp_rank=0, cp_rank=0,
+    )
+    cp1_slot = PrefixActivationSlotId(
+        1, 2, 3, 4, PREFIX_STATE_TYPE_ATTENTION_KV, tp_rank=0, cp_rank=1,
+    )
+    key_tensor = torch.randn(2, 1, 4, requires_grad=True)
+    value_tensor = torch.randn(2, 1, 4, requires_grad=True)
+
+    store.store(cp0_slot, key_tensor=key_tensor, value_tensor=value_tensor, prefix_len=2)
+
+    assert store.contains(cp0_slot)
+    assert not store.contains(cp1_slot)
+    with pytest.raises(KeyError):
+        store.load(cp1_slot)

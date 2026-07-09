@@ -9,8 +9,10 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context, 
 from prefix_sharing.integrations.megatron_runtime import prefix_attention
 from prefix_sharing.integrations.verl_mcore import (
     build_prefix_sharing_micro_batch_verl070,
+    build_prefix_sharing_micro_batch_verl080,
     restore_reuser_prefix_columns_2d,
 )
+from prefix_sharing.core.config import PrefixSharingConfig
 
 
 def _install_megatron_parallel_state(
@@ -339,6 +341,50 @@ def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physi
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         # 1 prefix-last index (interior bulk-sliced, not indexed)
         assert len(ctx.prefix_last_restore_indices) == 1
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_build_prefix_sharing_micro_batch_verl080_builds_context_parallel_layout(
+    monkeypatch,
+    cp_size,
+):
+    _install_megatron_parallel_state(monkeypatch, tp_size=1, cp_size=cp_size, cp_rank=cp_size - 1)
+    engine_self = SimpleNamespace(
+        engine_config=SimpleNamespace(
+            use_remove_padding=True,
+            context_parallel_size=cp_size,
+            dynamic_context_parallel=False,
+            override_transformer_config=SimpleNamespace(
+                context_parallel_algo="kvallgather_cp_algo",
+            ),
+        )
+    )
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+    }
+    ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
+
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl080(
+        engine_self,
+        batch,
+        ps_config,
+    )
+
+    layout = prefix_sharing_runtime_state.packed_batch_layout
+    assert layout.context_parallel is not None
+    align_size = 2 * cp_size
+    assert layout.padded_lengths == [
+        5 + (align_size - 5 % align_size) % align_size,
+        2 + (align_size - 2 % align_size) % align_size,
+    ]
+    assert layout.context_parallel.cp_rank == cp_size - 1
+    assert layout.context_parallel.cp_size == cp_size
+    assert layout.context_parallel.local_total_padded_length == layout.total_padded_length // cp_size
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert len(ctx.prefix_last_logits_save_indices) == 1
 
 
 def test_attention_hook_rejects_sp_local_shard_token_length():

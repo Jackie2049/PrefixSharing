@@ -44,7 +44,7 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         # 调用后 logits 已变成 exp(L-max) 废值。若在 original_fn 之后 clone，存的是废值，
         # restore 侧重算 logp(exp(L-max), label) ≠ logp(L, label)，logp 会完全错。
         # 必须在 original_fn 之前 clone 原始 logits（dump 同理）。
-        if ctx is not None and ctx.prefix_last_restore_indices:
+        if ctx is not None and ctx.prefix_last_logits_save_indices:
             # logits 形态可能是 [N, V//tp] 或 [N, 1, V//tp]，统一 view 成 2D。
             # N = 裁剪后 packed 1D 总长度（provider 行完整含 prefix-last token）。
             logits_2d = logits.view(-1, logits.size(-1))
@@ -59,28 +59,32 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                     f"has_padding={_layout.has_padding}",
                     flush=True,
                 )
-                for _idx in ctx.prefix_last_restore_indices:
+                for _idx in ctx.prefix_last_logits_save_indices:
                     print(
                         f"[PS-diag][packed-align] reuser={_idx.reuse_idx_in_batch} "
                         f"provider={_idx.provider_idx_in_batch} "
-                        f"provider_1d_pos={_idx.provider_1d_pos} "
+                        f"provider_global_1d_pos={_idx.provider_global_1d_pos} "
+                        f"provider_local_1d_pos={_idx.provider_local_1d_pos} "
+                        f"owner_cp_rank={_idx.owner_cp_rank} "
                         f"target_2d_pos={_idx.target_2d_pos}",
                         flush=True,
                     )
             # ##### [PS-diag] 验证 packed 坐标对齐 end #####
 
-            for index in ctx.prefix_last_restore_indices:
+            for index in ctx.prefix_last_logits_save_indices:
                 # 每条对应一个 reuser 的 prefix-last，逐条保存其 provider 的 vocab 维 logits。
-                pos = index.provider_1d_pos
+                pos = index.provider_local_1d_pos
                 key = (index.reuse_idx_in_batch, index.target_2d_pos)
+                if pos is None:
+                    # CP>1: this rank does not own the provider prefix-last
+                    # token.  A later CP gather step will make the owner rank's
+                    # saved logits visible to every rank before restore.
+                    continue
                 if pos < 0:
-                    # 不应发生：prefix-last 必落在直接 provider 的 packed 区段内
-                    # （见 _build_prefix_last_restore_indices 文档）。raise 暴露，避免
-                    # 下游 restore 静默 KeyError。
                     raise RuntimeError(
                         f"[vocab_logprobs] prefix-last spec got provider_1d_pos<0; "
-                        f"key={key} provider_1d_pos={pos}. "
-                        f"prefix-last 应在直接 provider 的 packed 区段内。"
+                        f"key={key} provider_local_1d_pos={pos}. "
+                        f"prefix-last local index must be non-negative."
                     )
                 # clone 保留 autograd 图（restore 重算 logp 要走反向传播，禁止 detach）。
                 saved = logits_2d[pos:pos + 1, :].clone()  # [1, V//tp]
@@ -94,8 +98,13 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                 # 的 saved_key = (reuser_row, valid_col) 对齐。
                 ctx.prefix_last_logits_saved[key] = saved
 
+            from prefix_sharing.integrations.context import (
+                gather_prefix_last_logits_across_context_parallel,
+            )
+
+            gather_prefix_last_logits_across_context_parallel(ctx, logits_2d)
+
         # 调原始函数（此后 logits 被 in-place 改成 exp(L-max)，但 dump/save 已完成）
         log_probs = original_fn(logits, labels)
         return log_probs
-
     return patched_fn
