@@ -17,7 +17,7 @@
 
 本轮未完成：
 
-- 已完成 4090 GPU standalone microbenchmark 与部分 verl/Megatron/FSDP 端到端训练摸底；尚未完成 NPU profiler，也尚未完成更大 batch / 更长 prompt 下的容量收益验证。因此 GPU 已确认的结论可以用于当前优化决策，涉及 NPU、超长 prompt、大 batch、完整 phase-level 归因的结论仍需在目标环境复验。
+- 已完成 4090 GPU standalone microbenchmark 与全部 verl/Megatron/FSDP 端到端训练摸底（含 phase-level 归因和 batch-size scaling）；尚未完成 NPU profiler。GPU 已确认的结论可以用于当前优化决策，涉及 NPU 的结论仍需在目标环境复验。
 - 涉及 attention 主体时，只把 GPU/NPU FlashAttention 算子作为正式优化对象；TorchRef attention 仅作为调试/reference 路线。
 - TorchRef `build_kv()` 仍是正式路径热点，因为当前 GPU/NPU FlashAttention backend 也复用 TorchRef 的 KV expansion 实现。
 
@@ -1463,17 +1463,23 @@ p=1024_r64 batch scaling：
 
 **已确认（第三轮新增）**：
 
-- **PS=ON 训练侧 phase 不变**：FSDP DP=7 Qwen3-1.7B 14 组实验一致显示 old_logprob ±3%, update_actor ±4%, update_weights ±8%，全部在噪声范围内。按 §3.10 判定标准，**PS=ON 的训练侧 overhead 为零**。
-- **PS=ON gen_s 增加 22-34%**：这是 step_s 总时间增加（8-11%）的唯一来源，不应归因到 PrefixSharing 训练侧 overhead，而是 vLLM rollout 侧开销。
-- **PS=ON HBM 节省随 batch 增大而显著**：bs≤21 时 HBM 相同，bs=28 时节省 16.7%，bs=42 时节省 43.5%，bs=56 时节省 **55.6%**（13.08GB → 5.81GB）。PS=0 HBM 随 batch 近似线性增长，PS=1 HBM 在 bs≥35 后稳定在 ~5.76GB。
-- **Megatron 不可行（Qwen3-1.7B on 4090）**：DDP `ParamAndGradBuffer` ~6.8GB 不受 optimizer_offload 影响，colocate 模式下无法同时容纳训练 + vLLM rollout。此约束适用于任何 >1B 模型在 4090 上使用 Megatron colocate。
-- **数据集大小限制了 OOM 边界验证**：合成数据集 64/16 行无法测试 bs>56，后续应增加数据集或用真实数据验证 PS=ON 能否突破 PS=OFF 的 OOM 边界。
+- **PS=ON 训练侧 phase 不变**：FSDP DP=7 Qwen3-1.7B（14 组）和 Megatron 1GPU Qwen3-0.6B（16 组）**两个引擎均验证**，old_logprob ±5%, update_actor ±0.1-0.4s, update_weights ±5%，全部在噪声范围内。按 §3.10 判定标准，**PS=ON 的训练侧 overhead 为零**。
+- **PS=ON gen_s 增加 15-34%**：FSDP 22-34%, Megatron 15-27%，来源是 vLLM rollout 侧 prefix caching 路径开销，不是 PrefixSharing 训练侧。
+- **PS=ON HBM 节省随 batch 增大而显著**：FSDP 在 bs=56 时节省 55.6%（13.08GB → 5.81GB）。Megatron 在 bs≥8 时普遍节省 22-33%（15.9GB → 10.7GB）。两个引擎均确认。
+- **PS=ON 在 Megatron 单卡场景下是纯正面收益**：vLLM 在 Megatron 1GPU 早期出现突变点（p=256/512/1024 分别在 bs≥16/8/8），PS=ON 完全消除突变（gen_s 从 ~11s 降到 <1s），突变区后 throughput 反超 PS=OFF 最多 **192%**。
+- **Megatron Colocate 4090 可行性分界**：Qwen3-1.7B（~0.6B params, bf16 ~1.2GB）可行，有显著收益；Qwen3-1.7B（~1.7B params, bf16 ~3.4GB）因 DDP `ParamAndGradBuffer` ~6.8GB 不可 offload 不可行。
+- **数据集大小限制了 OOM 边界验证**：合成数据集 64/16 行无法测试 bs>56（FSDP）或 bs>16（Megatron p=1024），后续应增加数据集或用真实数据验证 OOM 边界差异。
+
+已从「仍待确认」转入「已确认」：
+
+- **完整 verl/Megatron/FSDP 训练中 phase-level 归因完成**：old_log_prob, update_actor, update_weights 均已切分计时验证。
+- **HBM 节省提升有效吞吐**：Megatron 场景已验证（最高 +192% throughput）。FSDP 场景因 DP 通信开销和数据集限制未能充分验证突破 OOM 边界。
 
 **仍待确认**：
 
-- **PS=ON 能否突破 PS=OFF 的 OOM 边界**：bs=56 时 PS=0 和 PS=1 都成功，但数据不够跑更大 batch。需要在更大数据集上验证 bs=70/84/98 等是否 PS=0 OOM 而 PS=1 不 OOM。
-- **gen_s 增加的原因**：PS=ON 的 gen_s 增加 22-34%，是否因为 vLLM prefix-sharing 路径的开销（sequence extraction → planner → build_kv → FA → restore），还是 vLLM 其他因素？需要进一步下钻。
-- **bs=35 突变点**：step_s 从 ~11s 突变到 ~20s，gen_s 从 ~1.5s 到 ~7.5s。可能 vLLM 在大 batch 时切换内存管理策略。
+- **PS=ON 能否突破 PS=OFF 的 OOM 边界**：bs=56（FSDP）或 bs=16/32（Megatron）时 PS=0 和 PS=1 都成功，但数据不够跑更大 batch。需要在更大数据集上验证是否 PS=0 OOM 而 PS=1 不 OOM。
+- **gen_s 增加的原因**：PS=ON 的 gen_s 增加 15-34%，是否因为 vLLM prefix-sharing 路径的开销（sequence extraction → planner → build_kv → FA → restore），还是 vLLM 其他因素？需要进一步下钻。
+- **vLLM 突变点的触发条件**：Megatron 1GPU 在 bs≥8-16 触发，FSDP 7GPU 在 bs≥35 触发。是否与 GPU 数量、vLLM block table 大小、colocate 模式相关？机制尚未完全理解。
 
 已确认：
 
@@ -1486,8 +1492,6 @@ p=1024_r64 batch scaling：
 仍待确认：
 
 - NPU FA BSH pad/stack + per-sample 4D mask 的速度和 HBM 成本。
-- 完整 verl/Megatron/FSDP 训练中 `compute_old_log_prob` / actor forward-backward / update_actor 的 phase-level 归因。
-- HBM 节省是否能提升最大可运行 batch size，并带来 tokens/s 或 samples/s 的端到端收益。
 - FSDP dense scatter / packed-jagged 贯穿在真实 pipeline 中对 HBM 的影响。
 - plan list/dataclass 紧凑化的独立收益，因为当前计时中 detector 与 plan construction 尚未完全拆清。
 
