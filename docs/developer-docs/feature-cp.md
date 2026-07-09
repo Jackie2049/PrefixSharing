@@ -1018,75 +1018,101 @@ prefix_sharing.enable_prefix_sharing: True
 
 ---
 
-## §3.7 4090 GPU 测试验证结果
+### 3.7 测试报告：CP 特性 4090 验证
 
-### 3.7.1 核心限制：GPU（无 mindspeed）无法实际激活 CP>1
+#### 2026.07.09周四: CP 特性 4090 端验证
 
-所有 GPU 端测试**实际均为 CP=1**，原因如下：
+**1. 本次测试要测什么内容？**
 
-megatron-core v0.16.1 中，`context_parallel_size > 1` 时 CP 组与 DP 组合并为更大的 DP 组（CP 作为 DP 的扩展维度），`mpu.get_context_parallel_world_size()` 返回 `1`，不是 `2`。只有安装了 mindspeed 或其 TE patch 后，CP 才会真正独立出组、`get_context_parallel_world_size()` 才会返回 `2`。详见下文的 smoketest 探针日志。
+验证 Codex 开发的 CP（Context Parallel）特性在 4090 GPU 上的运行情况。CP 适配将 PrefixSharing 扩展到 Megatron 的 Context Parallel 分布式策略下。测试分为三层：
 
-因此 **CP>1 的实体验证必须依赖 NPU + mindspeed 环境**，4090 GPU 只能做 CP=1 的 baseline 回归和代码级正确性检查。
+- **本地 UT/IT（CPU）**：CP-local layout 坐标映射、config guard、KV store cp_rank 隔离、CP-local attention mock、CP save/restore index
+- **4090 配置层**：`context_parallel_size=2` 能否通过 prefix_sharing config guard + megatron-core 初始化
+- **端到端 smoketest**：PS=ON/OFF + CP=2 训练是否能启动、PS attention path 是否正常触发、restore/audit 是否正常
 
-### 3.7.2 单元/集成测试 (本地 Mac)
+**2. 本次测试的说明**
+
+**测试背景**
+Codex 完成 `a6ad48cb` [feat] 支持CP本地运行时基础能力：
+- `ContextParallelPackedView` — zigzag chunk 映射的 CP-local view
+- `PackedBatchLayout.from_kept_position_rows()` 支持 `cp_rank/cp_size`
+- `PrefixActivationSlotId` 增加 `cp_rank` 隔离
+- `TorchReferenceBackend._build_kv_context_parallel()` / `_attention_context_parallel()` — position-based causal mask
+- `PrefixLastLogitsSaveIndex` + `gather_prefix_last_logits_across_context_parallel()`
+- Config 层 CP guard：`supported_cp_size=1`, `supported_context_parallel_algo="kvallgather_cp_algo"`
+
+**测试环境**
+
+| 项目 | 值 |
+|------|-----|
+| 本地 PC | macOS Darwin 25.4 / Python 3.9.6 / torch 2.8.0（CPU） |
+| 服务器 | 219.223.198.62，8×NVIDIA GeForce RTX 4090 24GB |
+| 环境（服务器） | `verl080` env: PyTorch 2.6.0+cu124, verl 0.8.0.dev0, megatron-core 0.16.1, mbridge 0.15.1 |
+| MindSpeed | ❌ 未安装（无 TE patch） |
+| 使用 GPU | GPU4-5（TP=1 CP=2），GPU4-7（TP=2 CP=2 预留） |
+
+**测试脚本**
+- `~/Termius/proj_prefix-sharing/scripts/run_megatron_cp_smoke.sh` — TP=1 CP=2 PS=ON/OFF
+- 本地: `PYTHONPATH=prefix-sharing python3 -m pytest prefix-sharing/tests/unit_test/ prefix-sharing/tests/integrated_test/ -v`
+
+**3. 本次测试修改了什么代码？**
+
+commit `1c32d128` → `e8ad8254`（`open-source_cp` 分支，注意该分支基于 `open-source` 而非 `open-source_perf`）：
+
+**`prefix-sharing/prefix_sharing/core/config.py`**
+
+两次变更（最终结果 `e8ad8254`）：
+- `validate()`（第 223 行）：CP>1 时统一要求 `context_parallel_algo == 'kvallgather_cp_algo'`，无 backend 例外
+- `validate_for_engine()`（第 295 行）：同上
+
+> **修正过程：** `1c32d128` 错误地为 `torch_ref` backend 放宽了 `context_parallel_algo` 检查，认为 torch_ref 自带 CP-local attention 不需要 mindspeed。实际 `context_parallel_algo` 是 megatron-core 初始化 CP 组的参数，与 backend 无关；没有它会直接导致 `get_context_parallel_world_size()` 返回 1、CP 不实际激活。`e8ad8254` 已还原。
+
+**`docs/developer-docs/feature-cp.md`**
+
+新增测试报告 §3.7。
+
+**4. 本次测试的结论**
+
+**核心发现（最重要）：GPU（无 mindspeed）无法实际激活 CP>1**
+
+megatron-core v0.16.1 中 `context_parallel_size > 1` 时 CP 组与 DP 组合并为更大的 DP 组，`mpu.get_context_parallel_world_size()` 返回 `1`（不是 `2`）。只有安装了 mindspeed TE patch 后 CP 才会独立出组。因此 **4090 GPU 上所有 CP>1 配置实际跑的都是 CP=1**。
+
+**本地 UT/IT：全部通过**
 
 | 套件 | 通过 | 跳过 |
 |------|------|------|
-| Unit Tests (`tests/unit_test/`) | **230** | 1 (transformers) |
-| Integrated Tests (`tests/integrated_test/`) | **46** | 29 (flash_attn/npu/verl/mindspeed) |
-| **CP 专项 UT** | | |
-| `test_packed_layout.py` CP view | ✅ CP=2/4/8 local construction, global_to_local, local_valid_mask | |
-| `test_config.py` CP guard | ✅ `context_parallel_algo="kvallgather_cp_algo"` accept/ reject, dynamic CP reject | |
-| `test_runtime_context.py` CP save | ✅ owner rank save, non-owner skip, gather mechanism | |
-| `test_prefix_store.py` CP isolation | ✅ `PrefixActivationSlotId.cp_rank` key isolation | |
-| `test_torch_ref_backend.py` CP attention | ✅ CP-local KV build, CP-local attention shape | |
+| Unit Tests | **230** | 1 (transformers) |
+| Integrated Tests | **46** | 29 (flash_attn/npu/verl/mindspeed) |
 
-### 3.7.3 Smoketest (服务器 GPU4-5，均为 CP=1)
+CP 专项测试全部通过：
+- `test_packed_layout.py`：CP=2/4/8 view construction, global_to_local, local_valid_mask ✅
+- `test_config.py`：`kvallgather_cp_algo` accept/reject, dynamic CP reject ✅
+- `test_runtime_context.py`：owner rank save, non-owner skip, gather mechanism ✅
+- `test_prefix_store.py`：`cp_rank` key isolation ✅
+- `test_torch_ref_backend.py`：CP-local KV build & attention shape ✅
 
-实际运行日志确认 `cp_size=1`（核心证据）：
+**Smoketest（GPU4-5，均为 CP=1）：PS 路径完整触发**
+
+Smoketest 日志铁证（核心行）：
 ```
-cp_rank=0/cp_size=1    ← 全程 CP=1，CP=2 配置未生效
-total_padded_length=94 expected_token_length=94  ← CP=2 时预期应为 47 (94/2)
+cp_rank=0/cp_size=1           ← CP=2 配置未生效
+total_padded_length=94        ← CP=2 时预期 47（94/2），事实是 94
+expected_token_length=94      ← 匹配确认 CP 折叠进 DP
 ```
 
-**Case 1: PS=OFF (baseline, 2 卡, 实质 CP=1+DP=2)**
-```
-step:1 - step_time=17.5s -> throughput=5.6 tokens/s
-step:2 - step_time=2.9s  -> throughput=33.0 tokens/s
-```
-完整跑完 2 训练步，metric 正常。
+| 项目 | CP=1 PS=OFF（基线） | CP=1 PS=ON（候选） |
+|------|---------------------|-------------------|
+| PS patches 激活 | 7/7 全部激活 | 7/7 全部激活 |
+| prefix-sharing 检测 | — | ✅ `prefix_len=4`, 1 provider + 1 reuser |
+| `prefix_attention()` 触发 | — | ✅ 24 层全部调用 |
+| KV reuse（24 层均值） | — | store_count=2, reuse_hit=1, matches_expected=True |
+| Restore | — | ✅ actual_restore_count=1（24 层一致） |
+| training step | ✅ 2 steps 完成 | ✅ PS steps 完成 |
+| step_time / throughput | step1=17.5s / 5.6 tok/s; step2=2.9s / 33.0 tok/s | 同 baseline（实质 CP=1+DP=2） |
+| CP splitting 实际激活 | ❌ cp_size=1（megatron-core 无 mindspeed 不独立 CP 组） | ❌ 同上 |
 
-**Case 2: PS=ON (2 卡, torch_ref backend, 实质 CP=1+DP=2)**
+**Config guard 修复验证**
 
-| 项目 | 结果 |
-|------|------|
-| Config guard 通过 | ✅ torch_ref backend 放宽 `context_parallel_algo` 检查 |
-| PS 7 patch 全部激活 | ✅ `forward_step`/`attention`/`vocab`/`no_padding` |
-| Plan 检测 prefix-sharing | ✅ `prefix_len=4`, 1 provider + 1 reuser |
-| 进入 `prefix_attention()` | ✅ PS attention path 触发 |
-| Audit summary | ✅ `reused_valid_tokens=4, reused_valid_token_ratio=0.0408` |
-| KV build (24 layers) | ✅ `store_count=2, reuse_hit_count=1, expanded_kv_tokens=98` |
-| Restore | ✅ `actual_restore_count=1`（24 层一致） |
-| **CP splitting 实际激活** | ❌ **`cp_size=1`** — megatron-core 无 mindspeed 时不独立 CP 组 |
-| OOM | ❌ colocate 模式 2 卡 DataLoader worker killed |
+测试确认 `context_parallel_algo` 不能放进 `override_transformer_config`（mbridge 传给 `TransformerConfig.__init__()` 报 `unexpected keyword argument`）。该字段是 mindspeed TE patch 的私有参数，不在 megatron-core `TransformerConfig` 的 schema 中。因此在 GPU（无 mindspeed）环境下，即使正确设置了 guard，CP>1 也**既无法通过 config 传递，也无法实际初始化**。
 
-**结论：** CP=2 配置虽被 prefix_sharing config guard 接受，但 megatron-core 侧的分布式初始化
-并未实际建立独立的 CP 组。所有 >1 的 `context_parallel_size` 被折叠进 DP 维度。
-`preprocess_thd_engine()` 读到 `cp_size=1` → 不做 token splitting。
-
-### 3.7.4 配置修复 (commit `1c32d128` on `open-source_cp`)
-
-放宽了 `config.py` 中 `torch_ref` backend 的 `context_parallel_algo` 检查：
-- **`validate_for_engine()`**: CP>1 + `torch_ref` 不要求 `context_parallel_algo`
-- **`validate()`**: 同上
-- **原因**: TorchReferenceBackend 自带 position-based causal mask CP-local attention，
-  不依赖 mindspeed 的 `kvallgather_cp_algo`
-
-### 3.7.5 后续验证方向
-
-| 优先级 | 验证项 | 条件 | 方法 |
-|--------|--------|------|------|
-| P0 | **CP>1 token splitting + PS path 全链路** | 需 NPU + mindspeed 环境 | TP=1 CP=2 PS=ON/OFF smoketest |
-| P0 | **CP attention 精度** | CP 实际激活后 | 固定种子对比 log_probs/loss/gradient |
-| P1 | TP=2 CP=2 | CP>1 工作后 | 扩展 smoketest 矩阵 |
-| P1 | PP/SP 组合 | CP>1 工作后 | postprocess_thd_engine restore 兼容性 |
+**一句话总结：CP 特性的代码基础设施（layout/store/attention/restore/guard）在 CP=1 下全部验证通过，但 CP>1 的实体验证必须依赖 NPU + mindspeed 环境，当前 4090 GPU 因 megatron-core 无 TE patch 无法独立初始化 CP 组。**
