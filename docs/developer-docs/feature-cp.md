@@ -1020,20 +1020,13 @@ prefix_sharing.enable_prefix_sharing: True
 
 ## §3.7 4090 GPU 测试验证结果
 
-### 3.7.1 环境确认 (2026-07-09)
+### 3.7.1 核心限制：GPU（无 mindspeed）无法实际激活 CP>1
 
-| 项目 | 值 |
-|------|-----|
-| GPU | 8×4090 24GB |
-| verl | 0.8.0.dev0 |
-| megatron-core | 0.16.1 |
-| mbridge | 0.15.1 |
-| mindspeed | ❌ 未安装 |
-| PyTorch | 2.6.0+cu124 |
+所有 GPU 端测试**实际均为 CP=1**，原因如下：
 
-**关键发现：megatron-core v0.16.1 无 mindspeed 时 CP 组被折叠进 DP 组。**
+megatron-core v0.16.1 中，`context_parallel_size > 1` 时 CP 组与 DP 组合并为更大的 DP 组（CP 作为 DP 的扩展维度），`mpu.get_context_parallel_world_size()` 返回 `1`，不是 `2`。只有安装了 mindspeed 或其 TE patch 后，CP 才会真正独立出组、`get_context_parallel_world_size()` 才会返回 `2`。详见下文的 smoketest 探针日志。
 
-`context_parallel_size=2` 配置通过后，`mpu.get_context_parallel_world_size()` 返回 `1`（而非 `2`），因为 megatron-core v0.16.1 将 CP 组视为 DP 的扩展维度。纯 GPU（无 mindspeed NPU TE）环境中，CP token splitting 依赖 mindspeed 的 TE patch 做 `context_parallel_algo="kvallgather_cp_algo"` 的 hook。
+因此 **CP>1 的实体验证必须依赖 NPU + mindspeed 环境**，4090 GPU 只能做 CP=1 的 baseline 回归和代码级正确性检查。
 
 ### 3.7.2 单元/集成测试 (本地 Mac)
 
@@ -1048,48 +1041,52 @@ prefix_sharing.enable_prefix_sharing: True
 | `test_prefix_store.py` CP isolation | ✅ `PrefixActivationSlotId.cp_rank` key isolation | |
 | `test_torch_ref_backend.py` CP attention | ✅ CP-local KV build, CP-local attention shape | |
 
-### 3.7.3 Smoketest 结果 (服务器 GPU4-5)
+### 3.7.3 Smoketest (服务器 GPU4-5，均为 CP=1)
 
-**Case 1: PS=OFF CP=1 (baseline, 2 卡)**
+实际运行日志确认 `cp_size=1`（核心证据）：
+```
+cp_rank=0/cp_size=1    ← 全程 CP=1，CP=2 配置未生效
+total_padded_length=94 expected_token_length=94  ← CP=2 时预期应为 47 (94/2)
+```
+
+**Case 1: PS=OFF (baseline, 2 卡, 实质 CP=1+DP=2)**
 ```
 step:1 - step_time=17.5s -> throughput=5.6 tokens/s
 step:2 - step_time=2.9s  -> throughput=33.0 tokens/s
 ```
-✅ 完整跑完 2 训练步，metric 正常。
+完整跑完 2 训练步，metric 正常。
 
-**Case 2: PS=ON CP=2 (2 卡, torch_ref backend)**
+**Case 2: PS=ON (2 卡, torch_ref backend, 实质 CP=1+DP=2)**
 
 | 项目 | 结果 |
 |------|------|
-| Config guard 通过 (context_parallel_algo) | ✅ torch_ref backend 放宽 guard |
-| PS forward_step probe 启动 | ✅ PS patch 7 个全部激活 |
+| Config guard 通过 | ✅ torch_ref backend 放宽 `context_parallel_algo` 检查 |
+| PS 7 patch 全部激活 | ✅ `forward_step`/`attention`/`vocab`/`no_padding` |
 | Plan 检测 prefix-sharing | ✅ `prefix_len=4`, 1 provider + 1 reuser |
-| 进入 `prefix_attention()` | ✅ 成功触发 PS attention path |
+| 进入 `prefix_attention()` | ✅ PS attention path 触发 |
 | Audit summary | ✅ `reused_valid_tokens=4, reused_valid_token_ratio=0.0408` |
-| KV build (layers 1-24) | ✅ `store_count=2, reuse_hit_count=1, expanded_kv_tokens=98` |
-| Restore | ✅ `actual_restore_count=1` (24 layers) |
-| **CP 实际激活** | ❌ `cp_size=1` (CP 组被折叠进 DP) |
-| OOM | ❌ DataLoader worker killed (colocate 2卡内存不足) |
+| KV build (24 layers) | ✅ `store_count=2, reuse_hit_count=1, expanded_kv_tokens=98` |
+| Restore | ✅ `actual_restore_count=1`（24 层一致） |
+| **CP splitting 实际激活** | ❌ **`cp_size=1`** — megatron-core 无 mindspeed 时不独立 CP 组 |
+| OOM | ❌ colocate 模式 2 卡 DataLoader worker killed |
 
-**根因：** megatron-core v0.16.1 无 mindspeed 时，CP 组和 DP 组合并为更大的 DP 组，
-`mpu.get_context_parallel_world_size()` 返回 `1`。Verl 的 `preprocess_thd_engine()`
-依据该值决定是否做 token splitting。因此 CP>1 的 token splitting 未实际生效，
-所有序列数据通过单个 rank 处理。
+**结论：** CP=2 配置虽被 prefix_sharing config guard 接受，但 megatron-core 侧的分布式初始化
+并未实际建立独立的 CP 组。所有 >1 的 `context_parallel_size` 被折叠进 DP 维度。
+`preprocess_thd_engine()` 读到 `cp_size=1` → 不做 token splitting。
 
-### 3.7.4 配置修复 (commit on `open-source_cp`)
+### 3.7.4 配置修复 (commit `1c32d128` on `open-source_cp`)
 
-修复了 config guard 在 `torch_ref` backend 下不需要 `context_parallel_algo`：
-
-- `config.py` `validate_for_engine()`: CP>1 + `torch_ref` backend 时不要求
-  `context_parallel_algo`（因为 torch_ref 后端自带 CP-local attention，不依赖
-  mindspeed kvallgather_cp_algo）
-- `config.py` `validate()`: 同样放宽
+放宽了 `config.py` 中 `torch_ref` backend 的 `context_parallel_algo` 检查：
+- **`validate_for_engine()`**: CP>1 + `torch_ref` 不要求 `context_parallel_algo`
+- **`validate()`**: 同上
+- **原因**: TorchReferenceBackend 自带 position-based causal mask CP-local attention，
+  不依赖 mindspeed 的 `kvallgather_cp_algo`
 
 ### 3.7.5 后续验证方向
 
 | 优先级 | 验证项 | 条件 | 方法 |
 |--------|--------|------|------|
-| P0 | **CP>1 真实 token splitting 验证** | 需 mindspeed + NPU 环境，或纯 megatron+ no-mindspeed 的 CP 适配 | 在 NPU 上跑 TP=1 CP=2 PS=ON/OFF |
-| P0 | **CP attention path 精度** | 需 CP 实际激活后 | 固定种子对比 log_probs |
-| P1 | TP=2 CP=2 (4GPU) | 需 CP token splitting 工作 | 扩展 smoketest 矩阵 |
-| P1 | PP/SP 组合 | CP>1 后 | `postprocess_thd_engine` restore |
+| P0 | **CP>1 token splitting + PS path 全链路** | 需 NPU + mindspeed 环境 | TP=1 CP=2 PS=ON/OFF smoketest |
+| P0 | **CP attention 精度** | CP 实际激活后 | 固定种子对比 log_probs/loss/gradient |
+| P1 | TP=2 CP=2 | CP>1 工作后 | 扩展 smoketest 矩阵 |
+| P1 | PP/SP 组合 | CP>1 工作后 | postprocess_thd_engine restore 兼容性 |
