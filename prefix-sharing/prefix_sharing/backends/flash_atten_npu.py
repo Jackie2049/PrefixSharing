@@ -1,7 +1,7 @@
 """CANN/NPU Flash Attention backend for prefix sharing (s_packed mode).
 
 Uses MindSpeed's ``npu_fusion_attention`` fused kernel in **BSH layout** with a
-**s_packed custom causal mask**.
+**s_packed custom BSHD atten_mask** (sparse_mode=1).
 
 s_packed Mode
 -------------
@@ -13,6 +13,19 @@ Mask semantics: ``atten_mask``: True = masked (not participate), False = visible
 Shape = ``(batch_size, 1, max_q, s_packed_length)``:
   - Each batch's visible KV positions come from plan.s_packed_kv_ranges.
   - Padding rows/cols are left ``True`` so the kernel ignores them.
+
+Why BSH (not TND varlen)?
+-------------------------
+We considered migrating to TND varlen (``actual_seq_qlen``) to skip the
+Q padding to ``max_q`` and the K/V ``expand`` along the batch dim.  However,
+the varlen kernel (``FlashAttentionVarLenScore``) constrains
+``atten_mask`` to **SS format** ``(maxSq, maxSkv)`` -- a single shared matrix
+with no batch dimension.  Prefix sharing requires per-batch custom mask
+content (each batch has its own prefix_len -> different causal boundaries
+in the s_packed KV space), which cannot be expressed as a single SS matrix.
+``npu_prompt_flash_attention`` accepts ``(B, 1, S1, S2)`` masks but is
+inference-only and lacks training/grad support.  Therefore BSH remains the
+correct layout for prefix sharing on NPU.
 """
 
 from __future__ import annotations
@@ -62,7 +75,7 @@ def _torch() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# s_packed mask builder
+# s_packed mask builder (BSHD)
 # ---------------------------------------------------------------------------
 
 def _build_s_packed_mask(
@@ -177,6 +190,8 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         key: Any,
         value: Any,
         prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run prefix-sharing attention via BSHD ``npu_fusion_attention`` in s_packed mode.
@@ -200,7 +215,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         k = self._ensure_3d_thd(key, "key")
         v = self._ensure_3d_thd(value, "value")
 
-        packed_layout: PackedBatchLayout = kwargs.get("packed_batch_layout")
+        packed_layout: PackedBatchLayout = packed_batch_layout
         if packed_layout is None:
             raise FlashBackendValidationError(
                 "flash_atten_npu.attention requires packed_batch_layout kwarg."
