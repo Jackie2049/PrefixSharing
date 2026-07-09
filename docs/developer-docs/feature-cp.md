@@ -1016,11 +1016,9 @@ prefix_sharing.enable_prefix_sharing: True
    - 本地可完成 layout/index/restore mock 测试。
    - 真实 CP attention、NPU fusion attention、跨 rank saved logits 通信和性能数据必须在设备侧验证。
 
----
+### 3.7 测试报告
 
-## §3.7 测试报告
-
-### 2026.07.09周四11:00AM: CP 特性 round1 — 代码结构研读与本地 UT/IT
+#### 2026.07.09周四11:00AM: CP 特性 round1 — 代码结构研读与本地 UT/IT
 
 **本次测试要测什么内容？**
 - 阅读 feature-cp.md 设计文档，理解 CP 适配整体方案（Phases 0-5）
@@ -1055,7 +1053,7 @@ prefix_sharing.enable_prefix_sharing: True
 
 ---
 
-### 2026.07.09周四02:00PM: CP smoketest round1 — 服务器环境探查 + Config guard 修复
+#### 2026.07.09周四02:00PM: CP smoketest round1 — 服务器环境探查 + Config guard 修复
 
 **本次测试要测什么内容？**
 - 探查服务器 GPU 环境（8×4090）的 verl/Megatron/MindSpeed 安装情况
@@ -1109,7 +1107,7 @@ step:2 - step_time=2.9s  -> throughput=33.0 tokens/s
 
 ---
 
-### 2026.07.09周四06:00PM: CP guard 回滚 — torch_ref bypass 撤销
+#### 2026.07.09周四06:00PM: CP guard 回滚 — torch_ref bypass 撤销
 
 **本次测试要测什么内容？**
 - 审查上轮 commit `1c32d128` 中对 config.py 的改动是否正确
@@ -1133,7 +1131,7 @@ step:2 - step_time=2.9s  -> throughput=33.0 tokens/s
 
 ---
 
-### 当前测试总结与待验证矩阵
+#### 当前测试总结与待验证矩阵
 
 截至当前（2026.07.09 周四），CP 特性的验证状态：
 
