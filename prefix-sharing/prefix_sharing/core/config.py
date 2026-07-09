@@ -221,16 +221,12 @@ class PrefixSharingConfig:
                 "当前 CP 首版只支持静态 context parallel。"
             )
         if cp_size_int > 1:
-            if context_parallel_algo is None and self.backend != "torch_ref":
-                raise PrefixSharingConfigError(
-                    "[Config Error] context_parallel_algo 未设置。"
-                    "CP>1 需要 context_parallel_algo='kvallgather_cp_algo'，"
-                    "或使用 torch_ref backend（自带 CP-local attention）。"
-                )
-            if context_parallel_algo is not None and context_parallel_algo != self.supported_context_parallel_algo:
+            if context_parallel_algo != self.supported_context_parallel_algo:
                 raise PrefixSharingConfigError(
                     f"[Config Error] context_parallel_algo={context_parallel_algo!r} 不支持当前阶段。"
-                    f"CP 首版仅支持 context_parallel_algo='{self.supported_context_parallel_algo}'。"
+                    "CP>1 必须设置 context_parallel_algo='kvallgather_cp_algo'。"
+                    "当前环境如果无 mindspeed TE patch，CP 组无法独立初始化，"
+                    "get_context_parallel_world_size() 将始终返回 1，CP 不会实际生效。"
                 )
             if not use_remove_padding:
                 raise PrefixSharingConfigError(
@@ -297,16 +293,12 @@ class PrefixSharingConfig:
                 "当前 CP 首版只支持静态 context parallel。"
             )
         if cp_size_int > 1:
-            if context_parallel_algo is None and self.backend != "torch_ref":
-                raise PrefixSharingConfigError(
-                    "[Config Error] context_parallel_algo 未设置。"
-                    f"CP>1 需要设置 context_parallel_algo='{self.supported_context_parallel_algo}'，"
-                    "或使用 torch_ref backend（自带 CP-local attention，不依赖 mindspeed kvallgather_cp_algo）。"
-                )
-            if context_parallel_algo is not None and context_parallel_algo != self.supported_context_parallel_algo:
+            if context_parallel_algo != self.supported_context_parallel_algo:
                 raise PrefixSharingConfigError(
                     f"[Config Error] context_parallel_algo={context_parallel_algo!r} 不支持当前阶段。"
-                    f"CP 首版仅支持 context_parallel_algo='{self.supported_context_parallel_algo}'。"
+                    "CP>1 必须设置 context_parallel_algo='kvallgather_cp_algo'。"
+                    "当前环境如果无 mindspeed TE patch，CP 组无法独立初始化，"
+                    "get_context_parallel_world_size() 将始终返回 1，CP 不会实际生效。"
                 )
 
         # THD packed layout 需要 use_remove_padding
