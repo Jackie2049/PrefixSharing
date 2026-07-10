@@ -22,11 +22,11 @@ from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
-from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_mcore import _collect_kept_position_rows
-from prefix_sharing.integrations.verl_mcore import _extract_seq_from_nested_tensor
-from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-from prefix_sharing.integrations.verl_mcore import _trim_nested_batch
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
+from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _is_nested_tensor
+from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 
 _SUPPORTED_TRANSFORMERS_ATTENTIONS = {
     "flash_attention_2",

@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -31,18 +31,18 @@ from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
-from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
-
-
-@dataclass(frozen=True)
-class PrefixSharingRuntimeState:
-    prefix_sharing_plan: PrefixSharingPlan
-    attention_backend: Any
-    packed_batch_layout: PackedBatchLayout
-    parallel_info: MegatronParallelInfo
-    kept_position_ids: Any | None = None
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import _clone_batch
+from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
+from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _is_nested_tensor
+from prefix_sharing.integrations.verl_utils import _read_actor_bool
+from prefix_sharing.integrations.verl_utils import _read_actor_value
+from prefix_sharing.integrations.verl_utils import _trim_nested_batch
+from prefix_sharing.integrations.verl_utils import _trim_plain_batch_thd
+from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 
 
 @dataclass
@@ -528,95 +528,6 @@ def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
-def _clone_batch(batch: Any) -> Any:
-    if hasattr(batch, "clone"):
-        return batch.clone()
-    if hasattr(batch, "copy"):
-        return batch.copy()
-    return dict(batch)
-
-
-def _read_actor_bool(config: Any, dotted_name: str, default: bool) -> bool:
-    value = _read_actor_value(config, dotted_name, default)
-    return bool(value)
-
-
-def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
-    current = config
-    for part in dotted_name.split("."):
-        if current is None:
-            return default
-        if isinstance(current, Mapping):
-            current = current.get(part, default)
-        else:
-            getter = getattr(current, "get", None)
-            if callable(getter):
-                current = getter(part, default)
-            else:
-                current = getattr(current, part, default)
-    return current
-
-
-# ═══════════════════════════════════════════════════════════════
-# verl 0.8.0 engine 架构适配
-# ═══════════════════════════════════════════════════════════════
-
-
-def read_ps_config_from_engine_config(engine_config: Any) -> Any | None:
-    """从 verl080 engine_config 读取 PrefixSharing 配置。
-
-    优先读取内部实验入口 ``prefix_sharing_config``；若未配置，再读取 verl
-    PrefixGrouper 风格入口 ``use_prefix_grouper + prefix_grouper.mode``。
-    """
-    override = getattr(engine_config, "override_transformer_config", None)
-    if override is not None:
-        if isinstance(override, dict):
-            explicit_config = override.get("prefix_sharing_config")
-        else:
-            explicit_config = getattr(override, "prefix_sharing_config", None)
-        if explicit_config is not None:
-            return explicit_config
-
-    explicit_config = getattr(engine_config, "prefix_sharing_config", None)
-    if explicit_config is not None:
-        return explicit_config
-
-    return _prefix_sharing_config_from_prefix_grouper(engine_config)
-
-
-def _prefix_sharing_config_from_prefix_grouper(engine_config: Any) -> dict[str, Any] | None:
-    use_prefix_grouper = _read_actor_value(engine_config, "use_prefix_grouper", False)
-    if not use_prefix_grouper:
-        return None
-
-    prefix_grouper_config = _read_actor_value(engine_config, "prefix_grouper", None)
-    mode = _read_actor_value(prefix_grouper_config, "mode", "prompt_only")
-    normalized_mode = str(mode or "prompt_only").strip().lower()
-
-    if normalized_mode in {"prompt_only", "prompt-only", "prefix_grouper"}:
-        return {"enable_prefix_sharing": False}
-    if normalized_mode not in {"arbitrary_prefix", "arbitrary-prefix", "prefix_sharing"}:
-        raise ValueError(
-            "prefix_grouper.mode must be one of: prompt_only, arbitrary_prefix"
-        )
-
-    values: dict[str, Any] = {"enable_prefix_sharing": True}
-    for field_name in (
-        "detector",
-        "backend",
-        "min_prefix_len",
-        "min_group_size",
-        "boundary_strategy",
-        "validate_precision",
-        "integrate_mode",
-        "model_type",
-    ):
-        field_value = _read_actor_value(prefix_grouper_config, field_name, None)
-        if field_value is not None:
-            values[field_name] = field_value
-    return values
-
-
 def build_prefix_sharing_micro_batch_verl080(
     engine_self: Any,
     batch: Any,
@@ -727,227 +638,3 @@ def build_prefix_sharing_micro_batch_verl080(
     )
 
     return trimmed_batch, state
-
-
-# ═══════════════════════════════════════
-# Batch 物理裁剪（verl080 THD 路径必须改数据本身，不能只改 mask）
-# ═══════════════════════════════════════
-
-def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
-    """物理裁剪 NestedTensor batch（verl080 GPU THD 路径）。
-
-    preprocess_thd_engine 从 NestedTensor offsets/values 直接创建 packed 数据，
-    不看 attention_mask。因此必须物理裁剪 input_ids/position_ids，
-    去掉 reuser 的 prefix tokens，只保留 provider + reuser 的 kept 区段。
-    """
-    import torch
-
-    trimmed_batch = _clone_batch(batch)
-
-    input_ids = batch["input_ids"]
-    position_ids = batch["position_ids"]
-
-    # 裁剪 input_ids NestedTensor
-    trimmed_ids_seqs = _slice_nested_sequences(input_ids, plan)
-    new_input_ids = torch.nested.nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
-    trimmed_batch["input_ids"] = new_input_ids
-
-    # 裁剪 position_ids NestedTensor
-    if _is_nested_tensor(position_ids):
-        trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
-    else:
-        # position_ids 是 2D tensor → 需要用 attention_mask 的
-        # valid_indices 切片（keep_range 是序列偏移，不是列索引）
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask_bool = attention_mask.to(bool)
-        else:
-            import torch
-            # NestedTensor batch 无 explicit attention_mask → 所有位置都 valid
-            # 这意味着 position_ids 每行的有效位置从列 0 开始，
-            # valid_indices 等于 range(seq_len)，keep_range 可以直接当列索引用。
-            # 但仍然走 nonzero 路径保持一致性。
-            attention_mask_bool = torch.ones(
-                position_ids.shape[0], position_ids.shape[1],
-                dtype=torch.bool, device=position_ids.device,
-            )
-        trimmed_pos_seqs = _slice_2d_position_rows(
-            position_ids, plan, attention_mask_bool,
-        )
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
-    trimmed_batch["position_ids"] = new_position_ids
-
-    # loss_mask 也需要裁剪（如果存在）
-    loss_mask = batch.get("loss_mask")
-    if loss_mask is not None and _is_nested_tensor(loss_mask):
-        trimmed_loss_seqs = _slice_nested_sequences(loss_mask, plan)
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
-            trimmed_loss_seqs, layout=torch.jagged
-        )
-
-    return trimmed_batch
-
-
-def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
-    """物理裁剪 plain 2D tensor batch（verl080 NPU THD 路径）。
-
-    v080 THD 路径即使 input_ids 是 2D tensor，preprocess_thd_engine
-    也直接从 input_ids 数据创建 packed（不看 attention_mask）。
-    因此 2D 路径同样需要物理裁剪 input_ids/position_ids，
-    去掉 reuser 的 prefix tokens。
-
-    裁剪方式：将被移除的 prefix 位置用 padding 填充（0 值），
-    attention_mask 标记为 False，这样 Megatron 处理时只看 True 的位置。
-    同时将裁剪后的数据转为 NestedTensor 格式，确保
-    preprocess_thd_engine 正确处理。
-    """
-    import torch
-
-    input_ids = batch["input_ids"]
-    position_ids = batch["position_ids"]
-    attention_mask = batch.get("attention_mask")
-
-    if attention_mask is not None:
-        attention_mask_bool = attention_mask.to(bool)
-    else:
-        # 无 explicit attention_mask → 所有位置都 valid
-        attention_mask_bool = torch.ones(
-            input_ids.shape[0], input_ids.shape[1],
-            dtype=torch.bool, device=input_ids.device,
-        )
-
-    # 按 keep_ranges 从每个 row 中提取 kept 区段
-    kept_id_rows = []
-    kept_pos_rows = []
-    kept_mask_rows = []
-
-    for row in range(input_ids.shape[0]):
-        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-        keep_start, keep_end = plan.input_keep_ranges[row]
-        kept_indices = indices[keep_start:keep_end]
-        kept_id_rows.append(input_ids[row, kept_indices])
-        kept_pos_rows.append(position_ids[row, kept_indices])
-        # loss_mask 的 kept 区段（如果存在）
-        kept_mask_rows.append(torch.ones(
-            kept_indices.shape[0], dtype=torch.bool, device=input_ids.device,
-        ))
-
-    # 用裁剪后的序列构建 NestedTensor（jagged layout）
-    # 这样 preprocess_thd_engine 会从 offsets 正确计算 cu_seqlens
-    trimmed_batch = _clone_batch(batch)
-    trimmed_batch["input_ids"] = torch.nested.nested_tensor(kept_id_rows, layout=torch.jagged)
-    trimmed_batch["position_ids"] = torch.nested.nested_tensor(kept_pos_rows, layout=torch.jagged)
-
-    # loss_mask
-    loss_mask = batch.get("loss_mask")
-    if loss_mask is not None:
-        kept_loss_rows = []
-        for row in range(loss_mask.shape[0]):
-            indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-            keep_start, keep_end = plan.input_keep_ranges[row]
-            kept_indices = indices[keep_start:keep_end]
-            kept_loss_rows.append(loss_mask[row, kept_indices])
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
-            kept_loss_rows, layout=torch.jagged
-        )
-
-    return trimmed_batch
-
-
-def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list[Any]:
-    """从 NestedTensor 中按 keep_ranges 切片每个序列。
-
-    Provider 序列：保留全部 tokens。
-    Reuser 序列：只保留 keep_range 区段的 tokens。
-    """
-    offsets = nested_tensor.offsets()
-    values = nested_tensor.values()
-
-    sliced = []
-    for i in range(len(plan.input_keep_ranges)):
-        seq_values = values[offsets[i]:offsets[i + 1]]
-        keep_start, keep_end = plan.input_keep_ranges[i]
-        sliced.append(seq_values[keep_start:keep_end])
-
-    return sliced
-
-
-def _slice_2d_position_rows(
-    position_ids: Any,
-    plan: PrefixSharingPlan,
-    attention_mask_bool: Any,
-) -> list[Any]:
-    """从 2D position_ids 中按 keep_ranges 提取每个 row 的 kept 区段。
-
-    keep_range 指的是序列中第几个有效 token（在去掉 padding 后的偏移量），
-    不是 position_ids 张量的列索引。必须先通过 attention_mask 找到有效列索引，
-    再取子范围：kept_indices = valid_indices[keep_start:keep_end]。
-    """
-    kept_rows = []
-    for row in range(position_ids.shape[0]):
-        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-        keep_start, keep_end = plan.input_keep_ranges[row]
-        kept_indices = indices[keep_start:keep_end]
-        kept_rows.append(position_ids[row, kept_indices])
-    return kept_rows
-
-
-def _collect_kept_position_rows(
-    trimmed_batch: Any,
-    plan: PrefixSharingPlan,
-    is_nested_tensor: bool,
-    attention_mask_bool: Any | None = None,
-) -> list[Any]:
-    """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
-
-    用于 PackedBatchLayout.from_kept_position_rows 构建 layout。
-
-    当 position_ids 是 2D tensor 时，需要 attention_mask_bool 来定位有效列索引
-    （keep_range 是序列偏移，不是列索引）。当 position_ids 是 NestedTensor 时，
-    offsets/values 已包含裁剪后的正确数据，无需 attention_mask。
-    """
-    position_ids = trimmed_batch["position_ids"]
-
-    if is_nested_tensor or _is_nested_tensor(position_ids):
-        offsets = position_ids.offsets()
-        values = position_ids.values()
-        return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
-
-    # 2D tensor — 用 attention_mask 的 valid_indices 切片
-    if attention_mask_bool is None:
-        raise ValueError(
-            "attention_mask_bool is required when position_ids is 2D tensor; "
-            "keep_range is a sequence offset, not a column index"
-        )
-    rows = []
-    for i in range(len(plan.input_keep_ranges)):
-        indices = attention_mask_bool[i].nonzero(as_tuple=False).flatten()
-        keep_start, keep_end = plan.input_keep_ranges[i]
-        kept_indices = indices[keep_start:keep_end]
-        rows.append(position_ids[i, kept_indices])
-    return rows
-
-
-def _is_nested_tensor(tensor: Any) -> bool:
-    """安全检测 NestedTensor，避免在 NPU 上引用 torch.nested 模块。
-
-    NPU 不支持 torch.nested，直接 isinstance(tensor, torch.nested.NestedTensor)
-    会崩溃。使用 duck-typing: 有 offsets() 和 values() 方法即为 NestedTensor。
-    """
-    return (
-        hasattr(tensor, "offsets")
-        and callable(tensor.offsets)
-        and hasattr(tensor, "values")
-        and callable(tensor.values)
-    )
-
-
-def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
-    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。"""
-    offsets = nested_tensor.offsets()
-    values = nested_tensor.values()
-    return [
-        values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
-        for i in range(offsets.diff().shape[0])
-    ]
