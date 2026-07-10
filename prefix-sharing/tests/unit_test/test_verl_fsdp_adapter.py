@@ -458,25 +458,31 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
     assert grad[provider_prefix_ids].abs().sum() > 0
 
 
-def test_verl_fsdp_attention_patch_installs_and_rolls_back():
-    transformers_modeling_utils = pytest.importorskip("transformers.modeling_utils")
-    registry = transformers_modeling_utils.ALL_ATTENTION_FUNCTIONS
-    if "eager" not in registry:
-        pytest.skip("transformers eager attention function is unavailable")
+def test_verl080_fsdp_attention_patch_falls_through_without_context():
+    from prefix_sharing.setup.patches.verl080_fsdp.attention import patch_transformers_attention
 
-    original = registry["eager"]
-    handle = None
-    try:
-        handle = __import__(
-            "prefix_sharing.integrations.verl_fsdp",
-            fromlist=["VerlFSDPIntegration"],
-        ).VerlFSDPIntegration._install_transformers_attention_patch()
-        assert handle.active
-        assert registry["eager"] is not original
-    finally:
-        if handle is not None:
-            handle.disable()
-    assert registry["eager"] is original
+    def original_get_interface(attn_implementation, default=None):
+        del attn_implementation, default
+
+        def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
+            return ("original", module, query, key, value, attention_mask, args, kwargs)
+
+        return original_attention
+
+    patched_get_interface = patch_transformers_attention(original_get_interface)
+    patched_attention = patched_get_interface("eager")
+    result = patched_attention("module", "query", "key", "value", "mask", "arg", kw="value")
+
+    assert result == (
+        "original",
+        "module",
+        "query",
+        "key",
+        "value",
+        "mask",
+        ("arg",),
+        {"kw": "value"},
+    )
 
 
 def test_verl080_fsdp_forward_step_patch_runs_prefix_sharing_path():

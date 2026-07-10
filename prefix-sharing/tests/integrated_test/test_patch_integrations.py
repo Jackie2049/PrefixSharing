@@ -1,18 +1,8 @@
 import pytest
 
-from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.integrations.megatron_attention import (
-    IntegrationUnavailable,
-    MegatronAttentionIntegration,
-)
-from prefix_sharing.integrations.patch_manager import PatchManager
-from prefix_sharing.integrations.verl_mcore import (
-    VerlMCoreIntegration,
-    prefix_sharing_enabled,
-    read_ps_config_from_engine_config,
-)
-from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
+from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
+from prefix_sharing.setup.logged_patch import LoggedPatchManager
 
 
 class Target:
@@ -20,9 +10,9 @@ class Target:
         return "original"
 
 
-def test_patch_manager_installs_and_disables_patch():
+def test_logged_patch_manager_installs_and_disables_patch():
     target = Target()
-    manager = PatchManager()
+    manager = LoggedPatchManager()
 
     def replacement(instance):
         return "patched"
@@ -37,84 +27,14 @@ def test_patch_manager_installs_and_disables_patch():
     assert not handle.active
 
 
-def test_patch_manager_context_manager_restores_original():
+def test_logged_patch_manager_context_manager_restores_original():
     target = Target()
-    manager = PatchManager()
+    manager = LoggedPatchManager()
     manager.patch_attr(Target, "method", lambda instance: "patched")
 
     with manager.handle():
         assert target.method() == "patched"
     assert target.method() == "original"
-
-
-def test_patch_manager_installs_and_disables_dict_item_patch():
-    registry = {"eager": lambda: "original"}
-    original = registry["eager"]
-    manager = PatchManager()
-
-    def replacement():
-        return "patched"
-
-    manager.patch_item(registry, "eager", replacement)
-    handle = manager.handle()
-    assert registry["eager"]() == "patched"
-
-    handle.disable()
-    assert registry["eager"] is original
-
-
-def test_megatron_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "megatron.core.transformer.attention":
-            raise ModuleNotFoundError("No module named 'megatron'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
-    with pytest.raises(IntegrationUnavailable, match="Megatron"):
-        integration.install(model_config={})
-
-
-def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "verl":
-            raise ModuleNotFoundError("No module named 'verl'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = VerlMCoreIntegration(config=config)
-    with pytest.raises(IntegrationUnavailable, match="verl"):
-        integration.install(model_config={})
-
-
-def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "verl":
-            raise ModuleNotFoundError("No module named 'verl'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = VerlFSDPIntegration(config=config)
-    with pytest.raises(IntegrationUnavailable, match="verl"):
-        integration.install(model_config={})
 
 
 def test_setup_can_load_explicit_verl080_fsdp_patch_set():
@@ -205,17 +125,3 @@ def test_prefix_sharing_config_from_raw_accepts_env_enable(monkeypatch):
     config = PrefixSharingConfig.from_raw(None)
 
     assert config.enable_prefix_sharing is True
-
-
-def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
-    class FakeIntegration:
-        def __init__(self, config, backend=None):
-            pass
-
-        def install(self, model_config=None):
-            raise RuntimeError("install failed")
-
-    monkeypatch.setattr("prefix_sharing.integrations.verl_mcore.VerlMCoreIntegration", FakeIntegration)
-    with pytest.raises(RuntimeError, match="install failed"):
-        with prefix_sharing_enabled(PrefixSharingConfig(enable_prefix_sharing=True)):
-            pass

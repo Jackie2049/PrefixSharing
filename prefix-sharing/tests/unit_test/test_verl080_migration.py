@@ -24,7 +24,7 @@ from prefix_sharing.integrations.context import (
     prefix_sharing_runtime_context,
 )
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 
 
 # ═══════════════════════════════════════

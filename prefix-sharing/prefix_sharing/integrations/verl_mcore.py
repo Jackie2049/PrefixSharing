@@ -1,28 +1,19 @@
 """verl Megatron actor integration helpers.
 
-This module covers both v070 and v080 (verl 0.8.0 engine) paths:
-
-* v070: ``build_prefix_sharing_micro_batch_verl070`` and ``restore_reuser_prefix_columns_2d``
-  handle the invasive integration via ``megatron_actor.py``.
-* v080: ``build_prefix_sharing_micro_batch_verl080`` and ``read_ps_config_from_engine_config``
-  handle the monkey-patch integration via ``setup/patches/``.
+This module keeps the Megatron/MCore batch construction and restore helpers.
+Production monkey-patching is owned by ``prefix_sharing.setup`` patch sets;
+this module no longer exposes standalone patch installer classes.
 
 Both paths share the same core logic (plan -> trim -> layout -> state).
 
 ``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
 verl-style micro-batch payload into prefix-sharing metadata plus trimmed
 inputs/labels/masks, and it assembles restored logprobs after forward.
-``VerlMCoreIntegration`` installs the Megatron attention patch. The real
-Megatron QKV rewiring still requires the framework runtime and remains guarded
-by optional integration tests.
 """
 
 from __future__ import annotations
 
-import importlib
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -30,9 +21,7 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
-from prefix_sharing.integrations.patch_manager import PatchHandle
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 from prefix_sharing.integrations.verl_utils import _clone_batch
 from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
@@ -43,54 +32,6 @@ from prefix_sharing.integrations.verl_utils import _read_actor_value
 from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 from prefix_sharing.integrations.verl_utils import _trim_plain_batch_thd
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
-
-
-@dataclass
-class VerlMCoreIntegration:
-    config: PrefixSharingConfig
-    backend: Any | None = None
-
-    def install(self, model_config: Any | None = None) -> PatchHandle:
-        self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-        self._ensure_verl_importable()
-        backend = get_backend_instance(self.config, self.backend)
-        return MegatronAttentionIntegration(config=self.config, backend=backend).install(
-            model_config=model_config
-        )
-
-    @staticmethod
-    def _ensure_verl_importable() -> None:
-        try:
-            importlib.import_module("verl")
-        except ModuleNotFoundError as exc:
-            raise IntegrationUnavailable("verl is not importable in this environment") from exc
-
-
-def enable_prefix_sharing(
-    config: PrefixSharingConfig,
-    *,
-    model_config: Any | None = None,
-    backend: Any | None = None,
-) -> PatchHandle:
-    """Install Phase 1 prefix-sharing patches for the verl + Megatron path."""
-
-    return VerlMCoreIntegration(config=config, backend=backend).install(model_config=model_config)
-
-
-@contextmanager
-def prefix_sharing_enabled(
-    config: PrefixSharingConfig,
-    *,
-    model_config: Any | None = None,
-    backend: Any | None = None,
-) -> Iterator[PatchHandle]:
-    """Context manager wrapper around :func:`enable_prefix_sharing`."""
-
-    handle = enable_prefix_sharing(config, model_config=model_config, backend=backend)
-    try:
-        yield handle
-    finally:
-        handle.disable()
 
 
 def build_prefix_sharing_micro_batch_verl070(

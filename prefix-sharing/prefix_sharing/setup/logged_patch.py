@@ -1,12 +1,10 @@
-"""带日志的 monkey-patch manager — setup 专用。
+"""带日志的 monkey-patch manager — setup 生产 patch 入口专用。
 
-功能与 integrations/patch_manager.py 相同，但增加：
+提供：
 - patch_attr 时 INFO 日志
 - disable 时 INFO 日志（逐条打印恢复详情）
 - describe() 方法返回人类可读 patch 清单（含已应用和待挂起状态）
 - inspect_patch() 方法返回被替换函数的源码，供用户验证
-
-此文件独立于 integrations/patch_manager.py，不影响原有代码。
 """
 
 from __future__ import annotations
@@ -168,7 +166,7 @@ class PatchHandle:
 
 
 class LoggedPatchManager:
-    """安装属性 patch 并写日志，与 PatchManager 功能相同。"""
+    """安装属性 patch 并写日志，供 setup patch registry 使用。"""
 
     def __init__(self, records: list[PatchRecord] | None = None) -> None:
         # 支持传入外部共享列表，使 import hook 和即时 patch 共用同一份记录

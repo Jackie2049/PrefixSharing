@@ -24,7 +24,6 @@ Monkey-patch activation:
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
-from prefix_sharing.integrations.verl_mcore import enable_prefix_sharing, prefix_sharing_enabled
 
 
 __all__ = [
@@ -35,8 +34,6 @@ __all__ = [
     "PrefixReuseSpec",
     "PrefixSharingPlanner",
     "TriePrefixDetector",
-    "enable_prefix_sharing",
-    "prefix_sharing_enabled",
 ]
 
 # ── Monkey-patch auto-activation ──
@@ -44,10 +41,6 @@ __all__ = [
 # (config or env) at runtime and falls through to the native path when disabled.
 # This allows both ENABLE_PREFIX_SHARING env var and prefix_sharing_config yaml
 # key to independently control the feature — no separate "install gate" needed.
-#
-# For verl_v070 environments, the invasive import in megatron_actor.py
-# still works (enable_prefix_sharing / prefix_sharing_enabled), but the
-# setup module is not invoked — the old integration code handles everything.
 #
 # The setup.install() call is safe even when verl/Megatron are not present:
 # if the detected versions match no compat matrix entry, it raises
