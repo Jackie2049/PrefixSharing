@@ -34,32 +34,45 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 
 ### 1.3 核心概念与分类学
 
-在深入各方案之前，建立分类框架有助于理清思路。根据前缀复用的**技术路线**，现有方案可分为四大流派：
+在深入各方案之前，建立分类框架有助于理清思路。根据前缀复用的**技术路线**（如何让共享前缀只计算一次、多个 suffix 共享计算结果），现有方案可分为五大流派：
 
 **流派 A：Attention Decomposition（注意力分解）**
 - 将 grouped 输入拆分为 prefix 和 suffix，分别计算 attention，再合并输出
+- prefix 一次 self-attn → suffix 各自 concat-attn（prefix KV + suffix KV 拼接后再 attention）
 - 代表：CASIA PrefixGrouper, Meituan verl 集成
-- 特征：数学等价性严格保证、无 kernel 依赖、简单但仅支持扁平结构
+- 特征：**两次 attention 调用**、数学严格等价、无外部 kernel 依赖
+- 局限：仅 support 扁平（1-prefix + N-suffix）结构
 
 **流派 B：KV Cache Stack with Gradient Injection（KV 栈 + 梯度注入）**
-- 将多序列组织为 Trie 树，通过 Push-Pop 栈管理 KV cache，通过梯度注入机制实现分段 backward
+- 多序列组织为 Trie 树，DFS 序列化到一维栈，通过 Push-Pop 管理 KV cache 生命周期
+- Pop 时重构 suffix 计算图，`torch.autograd.backward(roots, grads)` 注入梯度跨段累积
 - 代表：快手 DynamicTreeAttn, 蚂蚁 AReaL DTA
-- 特征：支持多级树结构、KV 共享最大化、峰值内存可控但有梯度近似偏差
+- 特征：**分段 backward、梯度跨段注入**——prefix KV 只计算一次，backward 也只需一次 prefix 梯度的注入
+- 局限：梯度有 2-10% 近似偏差（leafization 合并导致）
 
-**流派 C：Flat Packing with Sparse Mask（扁平打包 + 稀疏 mask）**
-- 将所有序列打包为扁平 token layout，通过 block-sparse attention mask 或 NestedTensor 保证因果隔离
-- 代表：**PrefixSharing (本仓库)**, MiniMax Forge (声称), verl RFC #6401 (规划中)
-- 特征：一次 forward pass、标准 backward（无梯度注入）、无需修改 transformers 源码
-- 实现差异：PrefixSharing 用 NestedTensor + packed attention，无需外部 kernel；RFC #6401/Magi 用 block-sparse mask + MagiAttention
+**流派 C：Physical KV Expansion（KV 物理展开）**
+- 在一个 micro-batch 内物理扩展 KV 维度：reuser 的 KV = provider prefix KV + reuser suffix KV；reuser 的 Q 只保留 suffix 部分
+- 一次 `flash_attn_varlen_func` forward（Q 和 KV 序列长度不同），标准 backward
+- 代表：**PrefixSharing（当前版本，build_kv 路径——GPU FA/Torch ref）**
+- 特征：**一次性构建完整 KV 张量然后标准 attention**，数学严格等价，不修改 transformers 源码
+- 与流派 A 的区别：一次 forward 而非两次；与流派 B 的区别：不管理 KV 生命周期、标准 backward 无梯度注入
+- 局限：仅 support 扁平（1-prefix + N-suffix）结构，物理展开引入额外 KV 内存
 
-**流派 D：Schedule-Level Optimization（调度层优化）**
-- 不改变 attention 计算方式，在调度层面优化前缀复用的粒度（跨 micro-batch）
+**流派 D：Flat Packing with Sparse / Block-Causal Mask（扁平打包 + 稀疏 mask）**
+- 将所有序列打包为扁平 token layout，通过 block-causal mask 或 block-sparse attention mask 控制可见性，无需物理 KV 展开
+- 代表：**PrefixSharing（block_causal_mask 路径——NPU / TE）**, MiniMax Forge (声称), verl RFC #6401 (规划中)
+- 特征：一次 forward pass、不修改 KV 张量形状（靠 mask 而非 build_kv 控制因果）、标准 backward
+- 与流派 C 的区别：不物理展开 KV，靠 mask 控制可见性；两个路径在同一仓库中共存，按后端选择
+- 局限：需要后端支持显式 attention mask（NPU/TE 支持，FA 的 varlen path 不支持此类 mask）
+
+**流派 E：Schedule-Level Optimization（调度层优化）**
+- 不改变 attention 执行方式，在训练调度层面优化前缀复用的粒度（跨 micro-batch 复用）
 - 代表：腾讯/HKUST Schedule-Level Reuse
-- 特征：与上述三种路线正交，可在其上叠加使用
+- 特征：**正交维度**，可与上述四种路线叠加使用
 
 **另一个正交维度**是将 prefix sharing 应用于训练的**前后向**路径：
 - **前向共享**：所有方案都做——prompt 部分的 KV/attention 只计算一次
-- **后向共享**：DTA/AReaL 做——通过梯度注入减少 backward 计算图大小；PrefixGrouper 不做（标准 autograd backward）
+- **后向共享**：DTA/AReaL 做——通过梯度注入减少 backward 计算图大小；流派 A/C/D 不做（标准 autograd backward）
 - **双端共享**：RFC #6401 理论上做（一次 forward + 标准 backward），Magi 的 CP dispatch 在前后向都受益
 
 ## 2. 调研范围
