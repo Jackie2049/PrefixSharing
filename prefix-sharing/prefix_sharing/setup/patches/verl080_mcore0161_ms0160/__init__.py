@@ -40,14 +40,12 @@ PATCH_SET: list[PatchSpec] = [
         patch_factory=patch_verl_forward_step,
         description="MegatronEngineWithLMHead.forward_step → "
                     "micro-batch reorg + context (verl 0.8.0 engine)",
-        eager=True,  # verl Megatron engine 在 __init__.py 预加载，import hook 无法拦截
     ),
     PatchSpec(
         module_name="megatron.core.transformer.attention",
         target_getter=lambda mod: (getattr(mod, "Attention"), "forward"),
         patch_factory=patch_megatron_attention,
         description="Attention.forward → prefix-sharing intercept (mcore 0.16.1)",
-        eager=True,  # megatron.core 在 engine 初始化前已导入
     ),
     # verl080 算 logprob 的真正调用点在 transformer_impl 的 logits_processor
     # 闭包里（transformer_impl.py:932），该名字是模块加载时 from...import 绑定
@@ -65,7 +63,6 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
-        eager=True,  # 同 forward_step，模块已预加载
     ),
 ] + [
     PatchSpec(
@@ -73,7 +70,6 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "no_padding_2_padding"),
         patch_factory=patch_no_padding_2_padding,
         description=f"no_padding_2_padding in {mod_name} → PS trimming-aware",
-        eager=True,  # 这些模块在 PS hook 安装前已被 verl 加载
     )
     for mod_name in _NOPADDING_PATCH_MODULES
 ]
