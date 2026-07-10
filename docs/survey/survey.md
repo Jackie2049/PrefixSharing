@@ -23,7 +23,7 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 
 - **CASIA (中科院自动化所)**：提出 PrefixGrouper 算法和配套 Python 库，两阶段 attention decomposition 方案，数学等价性严格证明。论文发表于 arXiv 2506.05433。
 - **快手 (Kuaishou)**：开源 DynamicTreeAttn 代码，基于 Trie 树的 push-pop 栈式 KV cache + chunked backward 梯度注入机制。论文发表于 arXiv 2511.00413。
-- **蚂蚁 (Ant Group)**：AReaL 框架中实现了 DTA 引擎，支持 FSDP2/Megatron 双后端，生产级全异步流水线。Apache 2.0 开源。
+- **蚂蚁 (Ant Group)**：AReaL 框架中实现了 DTA 引擎，Trie 树 Push-Pop 栈式 KV cache + chunked backward。DTA 模式下平行化走 ZeRO-1（朴素 DP），FSDP/Megatron 尚未适配。Apache 2.0 开源。
 - **MiniMax**：在 Forge 框架博客中描述 Prefix Tree Merging + MagiAttention，声称 40x 加速（代码未公开）。
 - **美团 (Meituan) / SandAI**：在 verl 社区做出两份贡献——合入 PR #4368 (PrefixGrouper FSDP 集成 2026-01-05) 和 RFC #6401 (Prefix-Tree Shared Attention with MagiAttention 2026-05-19)。
 - **腾讯 / HKUST**：Schedule-Level Prefix Reuse (arXiv 2606.01143)，将前缀复用提升到训练步骤调度级别。
@@ -484,7 +484,9 @@ model = AutoModelForCausalLM.from_pretrained(args.model, dtype=args.dtype,
 
 #### 3.3.1 方案概述
 
-AReaL (Ant Reasoning RL) 是蚂蚁开源的 RL 训练框架（Apache 2.0）。其 DTA 引擎实现了与快手 DTA 类似的 Push-Pop 栈式 KV cache + Chunked Backpropagation，但更成熟：支持 FSDP2 和 Megatron 双后端、完整的全异步流水线、内置 loss scaling。
+AReaL (Ant Reasoning RL) 是蚂蚁开源的 RL 训练框架（Apache 2.0）。其 DTA 引擎实现了与快手 DTA 类似的 Push-Pop 栈式 KV cache + Chunked Backpropagation。
+DTA 模式下平行化走 ZeRO-1（朴素 DP，`parallelize_fn_zero1` 为 identity 不套 wrapper），FSDP/Megatron 尚未适配。
+完整的全异步训练流水线、内置 loss scaling。
 
 代码仓库：https://github.com/areal-project/AReaL
 
@@ -631,9 +633,7 @@ Step 7: 清理
 #### 3.3.7 优缺点
 
 **优点**：
-1. **生产级框架**：不是实验代码，是全异步 RL 框架的组成部分。
-2. **双后端支持**：FSDP2 + Megatron。
-3. **代码质量高**：模块依赖简洁，`pop()` 的 7 步骤逻辑清晰。
+1. **代码质量高**：模块依赖简洁，`pop()` 的 7 步骤逻辑清晰。
 4. **内存优化成熟**：一维栈式 KV cache、forkpos logits、cache_len 预计算。
 5. **数据并行负载均衡**：三种策略覆盖不同场景。
 
@@ -646,9 +646,7 @@ Step 7: 清理
 #### 3.3.8 适用场景
 
 - 全异步 RL 训练的大规模生产环境
-- FSDP2 或 Megatron 双后端需求
-- 可接受 2-10% 梯度近似（通过补偿机制缓解）
-- 有完整框架依赖 (AReaL) 的项目
+- 有 AReaL 框架依赖的项目（目前 DTA 模式下平行化走 ZeRO-1，仅朴素 DP 可用）
 
 ### 3.4 美团 verl PrefixGrouper 集成 (PR #4368)
 
@@ -914,7 +912,7 @@ Forge 的核心设计：
 | 论文 | 无 | arXiv 2506.05433 | arXiv 2511.00413 | 无 |
 | 加速比 | 40x (无细节) | 1.27-1.70x | 2.85-6.2x | 42%-3x |
 | 数学等价 | 声称 | 严格证明 | 近似 (2-10%) | 声称 |
-| 后端 | 未说明 | FSDP | FSDP2 + Megatron | Megatron |
+| 后端 | 未说明 | FSDP | ZeRO-1 (DTA 模式) | Megatron |
 
 #### 3.6.5 优缺点
 
@@ -1005,7 +1003,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
 | 代码量 | ~944 (core) | ~2,683 | ~1,406 | N/A | ~365 | N/A |
 | 数学精度 | 严格等价 | 近似 (2-10%) | 近似 (2-10%) | 声称等价 | 严格等价 | 声称等价 |
 | 注意力后端 | FA2/FA3/SDPA/eager | FA3/FA2/SDPA | FA3/FA2/SDPA | Magi (专有) | FA2/FA3/SDPA/eager | Magi FFA |
-| 训练后端 | FSDP | 单 GPU | FSDP2 + Megatron | 未说明 | FSDP only | Megatron |
+| 训练后端 | FSDP | Zero-1 (DTA 模式) | AReaL 框架 (DTA 模式走 ZeRO-1) | 未说明 | FSDP only | Megatron |
 | 树结构 | 扁平 | 多级 | 多级 | 多级 | 扁平 | 多级 |
 | 报告加速比 | 1.26-1.70x | 2.85-6.2x (论文) | N/A | 40x (不可验证) | 1.14-1.70x | 42%-3x |
 | 代码侵入度 | 中 | 高 | 高 | 极高 | 极低 | 中 |
@@ -1100,7 +1098,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
                 (美团, FSDP only)
                          │                                    │
   2026 Q2          快手 DTA                                 Ant DTA
-                 (开源, 梯度注入)                      (AReaL 框架, 双后端)
+                 (开源, 梯度注入)                      (AReaL 框架, DTA 模式 ZeRO-1)
                          │                                    │
   2026 Q3          Schedule-Level Reuse                     【待定】
                  (调度级优化, 论文)
@@ -1136,7 +1134,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
 | **FSDP + GRPO, 独立使用** | CASIA PrefixGrouper | API 极简，后端无关 |
 | **Megatron + GRPO** | RFC #6401 方向（跟进） | 目前唯一 Megatron 路径 |
 | **多级树 (MCTS / multi-turn)** | 快手 DTA / 蚂蚁 AReaL DTA | Trie 原生支持 |
-| **生产级框架 (双后端)** | 蚂蚁 AReaL DTA | FSDP2 + Megatron，全异步 |
+| **生产级框架 (DTA 模式 ZeRO-1)** | 蚂蚁 AReaL DTA | AReaL 框架集成，目前 DTA 模式走 ZeRO-1 朴素 DP |
 | **可接受 2-10% 梯度偏差** | DTA (快手/蚂蚁) | 更高加速比潜力 |
 | **正交调度优化** | Schedule-Level Reuse | 可与上面任意方案叠加 |
 | **纯训练加速** | PrefixGrouper | 最成熟，风险最低 |
