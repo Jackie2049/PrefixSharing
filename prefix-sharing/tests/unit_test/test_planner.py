@@ -79,7 +79,6 @@ def test_planner_no_shared_prefix_keeps_original_shapes():
     prefix_sharing_plan = planner.plan([[1, 2], [1, 3], [4, 5]], forward_id=1, micro_batch_id=1)
 
     assert not prefix_sharing_plan.has_sharing
-    assert prefix_sharing_plan.group_ids == [-1, -1, -1]
     assert prefix_sharing_plan.input_keep_ranges == [(0, 2), (0, 2), (0, 2)]
     assert prefix_sharing_plan.reuse_specs == []
     assert prefix_sharing_plan.prefix_last_restore == []

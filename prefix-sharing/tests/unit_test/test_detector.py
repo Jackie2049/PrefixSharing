@@ -57,13 +57,6 @@ def test_trie_detector_builds_per_sample_reuse_relations():
     assert result.provider_index == (0, 0, 0, 3, 3)
     assert result.prefix_lens == (0, 3, 5, 0, 2)
     assert result.is_provider == (True, False, False, True, False)
-    assert len(result.groups) == 3
-    assert result.groups[0].member_indices == (0, 1)
-    assert result.groups[0].prefix_len == 3
-    assert result.groups[1].member_indices == (0, 2)
-    assert result.groups[1].prefix_len == 5
-    assert result.groups[2].member_indices == (3, 4)
-    assert result.groups[2].prefix_len == 2
 
 
 def test_trie_detector_allows_reuser_to_provide_longer_prefix_later():

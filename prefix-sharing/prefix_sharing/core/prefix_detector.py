@@ -9,8 +9,6 @@ slice is. A provider may serve different reusers with different prefix lengths.
 Core Responsibilities:
     1. Identify common prefixes across multiple token sequences.
     2. Emit per-sample reuse relations using configurable thresholds.
-    3. Preserve compatibility group fields for diagnostics, while keeping
-       relation data as the semantic source of truth.
 
 Key Concepts:
     - Provider: The earlier sequence in a reuse relation whose logical KV can
@@ -21,17 +19,15 @@ Key Concepts:
 Key Components:
     - PrefixReuseSpec: Represents one relation
       ``(reuse_idx_in_batch, provider_idx_in_batch, prefix_len)``.
-    - PrefixGroup: Compatibility/debug view grouping relations with identical
-      ``(provider_index, prefix_len)``.
     - PrefixDetectionResult: Container for detection output with per-sequence
-      metadata including group membership, provider assignment, and reuse flags.
+      metadata including provider assignment and reuse flags.
     - PrefixDetector: Abstract base class defining the detector interface.
     - TriePrefixDetector: Concrete implementation using a trie data structure.
     - common_prefix_len: Utility to compute common prefix length across sequences.
 
 Design Principles:
     - Per-sample relation first: ``provider_index[i]`` and ``prefix_lens[i]``
-      are the authoritative plan for each row. Groups are secondary.
+      are the authoritative plan for each row.
     - Online provider selection: Phase 1 follows PrefixTrain_dev's practical
       approach--a sequence may reuse the longest prefix found in earlier
       sequences, then becomes available as a provider for later sequences.
@@ -83,14 +79,6 @@ class PrefixDetector(ABC):
 
 
 @dataclass(frozen=True)
-class PrefixGroup:
-    group_id: int
-    member_indices: tuple[int, ...]
-    prefix_len: int
-    provider_index: int
-
-
-@dataclass(frozen=True)
 class PrefixReuseSpec:
     """One reuse edge: reuser row ``reuse_idx_in_batch`` borrows KV from ``provider_idx_in_batch``."""
 
@@ -104,8 +92,8 @@ class PrefixDetectionResult:
     """Per-batch detection output with per-sample reuse relations.
 
     ``reuse_specs`` is the semantic source of truth. The tuple fields
-    ``group_ids``, ``provider_index``, ``prefix_lens``, and ``is_provider`` are
-    indexed by batch position ``i`` for convenient planner use.
+    ``provider_index``, ``prefix_lens``, and ``is_provider`` are indexed by
+    batch position ``i`` for convenient planner use.
 
     Example (``TriePrefixDetector(min_prefix_len=2, min_group_size=2)``)::
 
@@ -134,8 +122,6 @@ class PrefixDetectionResult:
 
     batch_size: int
     reuse_specs: tuple[PrefixReuseSpec, ...]
-    groups: tuple[PrefixGroup, ...]
-    group_ids: tuple[int, ...]
     provider_index: tuple[int, ...]
     prefix_lens: tuple[int, ...]
     is_provider: tuple[bool, ...]
@@ -172,13 +158,10 @@ class TriePrefixDetector(PrefixDetector):
     def detect(self, input_ids: Sequence[TokenSequence]) -> PrefixDetectionResult:
         batch_size = len(input_ids)
         root = _TrieNode()
-        group_ids = [-1] * batch_size
         provider_index = list(range(batch_size))
         prefix_lens = [0] * batch_size
         is_provider = [True] * batch_size
         reuse_specs: list[PrefixReuseSpec] = []
-        group_key_to_id: dict[tuple[int, int], int] = {}
-        group_members: dict[int, list[int]] = {}
 
         for index, seq in enumerate(input_ids):
             node = root
@@ -210,13 +193,6 @@ class TriePrefixDetector(PrefixDetector):
                 prefix_lens[index] = matched
                 is_provider[index] = False
 
-                group_key = (matched_provider, matched)
-                group_id = group_key_to_id.setdefault(group_key, len(group_key_to_id))
-                group_ids[index] = group_id
-                if group_id not in group_members:
-                    group_members[group_id] = [matched_provider]
-                group_members[group_id].append(index)
-
             node = root
             node.indices.append(index)
             for token in seq:
@@ -229,24 +205,9 @@ class TriePrefixDetector(PrefixDetector):
                 node = child
                 node.indices.append(index)
 
-        groups = [
-            PrefixGroup(
-                group_id=group_id,
-                member_indices=tuple(members),
-                prefix_len=prefix_len,
-                provider_index=provider,
-            )
-            for (provider, prefix_len), group_id in sorted(
-                group_key_to_id.items(), key=lambda item: item[1]
-            )
-            for members in (group_members[group_id],)
-        ]
-
         return PrefixDetectionResult(
             batch_size=batch_size,
             reuse_specs=tuple(reuse_specs),
-            groups=tuple(groups),
-            group_ids=tuple(group_ids),
             provider_index=tuple(provider_index),
             prefix_lens=tuple(prefix_lens),
             is_provider=tuple(is_provider),

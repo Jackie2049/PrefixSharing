@@ -96,7 +96,10 @@ class PrefixSharingStats:
             for index in range(prefix_sharing_plan.batch_size)
             if prefix_sharing_plan.is_reuser(index)
         ]
-        sharing_group_ids = {prefix_sharing_plan.group_ids[index] for index in reuser_indices}
+        sharing_groups = {
+            (spec.provider_idx_in_batch, spec.prefix_len)
+            for spec in prefix_sharing_plan.reuse_specs
+        }
         return cls(
             forward_id=prefix_sharing_plan.forward_id,
             micro_batch_id=prefix_sharing_plan.micro_batch_id,
@@ -110,7 +113,7 @@ class PrefixSharingStats:
             ),
             provider_count=sum(prefix_sharing_plan.is_provider),
             reuser_count=len(reuser_indices),
-            sharing_group_count=len(sharing_group_ids),
+            sharing_group_count=len(sharing_groups),
             expected_reused_counts_per_layer=len(reuser_indices),
             expected_reused_prefix_tokens_per_layer=sum(
                 prefix_sharing_plan.prefix_lens[index] for index in reuser_indices
