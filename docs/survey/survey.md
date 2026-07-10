@@ -36,59 +36,51 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 
 在深入各方案之前，建立分类框架有助于理清思路。根据前缀复用的**技术路线**（如何让共享前缀只计算一次、多个 suffix 共享计算结果），现有方案可分为五大流派，以下从**理论性能极限**（执行效率上限、同等计算量下的最终加速潜力）和**工程复杂度**（实现难度、维护成本、可移植性）两个维度标注：
 
-**流派 A：Attention Decomposition（注意力分解）** — 性能极限 ★★★★☆  工程复杂度 ★★★☆☆
+**流派 A：Attention Decomposition（注意力分解）**
+- **性能极限：★★★★☆**（多一次 attention launch + scatter-gather 开销）
+- **工程复杂度：★★★☆☆**（需模型 forward 透传 param + 新模型独立适配）
 - 将 grouped 输入拆分为 prefix 和 suffix，分别计算 attention，再合并输出
 - prefix 一次 self-attn → suffix 各自 concat-attn（prefix KV + suffix KV 拼接后再 attention）
 - 代表：CASIA PrefixGrouper, Meituan verl 集成
 - 特征：**两次 attention 调用**、数学严格等价、无外部 kernel 依赖
 - 局限：仅 support 扁平（1-prefix + N-suffix）结构
-- 性能分析：prefix 自注意力从 N 次降到 1 次，但引入 index scatter-gather（3 个自定义 autograd Function）和两次 kernel launch 的额外开销。理论峰值低于流派 C 同等条件下的单次 forward，但计算量减少的幅度相同（prefix 计算从 N 倍到 1 倍）。
-- 工程复杂度分析：需要模型 forward 透传 prefix_grouper 参数、自定义 autograd 维护、每个新模型独立适配（目前只有 Qwen2.5-VL 的 example）。diff 量虽不大（~944 行核心库），但模型集成端的维护开销随模型数线性增长。
 
-**流派 B：KV Cache Stack with Gradient Injection（KV 栈 + 梯度注入）** — 性能极限 ★★★★★  工程复杂度 ★★★★★
+**流派 B：KV Cache Stack with Gradient Injection（KV 栈 + 梯度注入）**
+- **性能极限：★★★★★**（前后向都共享，理论最优）
+- **工程复杂度：★★★★★**（Pop/Push 状态机精密 + 梯度注入极易出错）
 - 多序列组织为 Trie 树，DFS 序列化到一维栈，通过 Push-Pop 管理 KV cache 生命周期
 - Pop 时重构 suffix 计算图，`torch.autograd.backward(roots, grads)` 注入梯度跨段累积
 - 代表：快手 DynamicTreeAttn, 蚂蚁 AReaL DTA
 - 特征：**分段 backward、梯度跨段注入**——prefix KV 只计算一次，backward 也只需一次 prefix 梯度的注入
 - 局限：梯度有 2-10% 近似偏差（leafization 合并导致）
-- 性能分析：理论上限最高——前向和后向都共享（流派 A/C/D 的 backward 仍需 reuser 各自的完整计算图）。Trie 树支持多级，复杂树场景下 prefix 共享比例可进一步放大。但也引入 Pop 时重新 forward（F1 tokens）的额外计算，block_size 分段降低了峰值内存但增加了总计算量。梯度近似偏差 2-10% 是精度代价。
-- 工程复杂度分析：最高。Pop/Push 状态机需要精密的 detach/requires_grad 控制、`torch.autograd.backward(roots, grads)` 的多 root 梯度注入不能有毫厘差错、cache_len 动态优化需前瞻性分析 Trie 结构、leafization 的梯度偏差需要验证。全栈复杂度在 ~2,683 行代码中体现。
 
-**流派 C：Physical KV Expansion（KV 物理展开）** — 性能极限 ★★★★☆  工程复杂度 ★☆☆☆☆
+**流派 C：Physical KV Expansion（KV 物理展开）**
+- **性能极限：★★★★☆**（路径最短单次 forward，但 KV 展开消耗内存带宽）
+- **工程复杂度：★☆☆☆☆**（纯 index 拼接 + 标准 backward，不碰 autograd）
 - 在一个 micro-batch 内物理扩展 KV 维度：reuser 的 KV = provider prefix KV + reuser suffix KV；reuser 的 Q 只保留 suffix 部分
 - 一次 `flash_attn_varlen_func` forward（Q 和 KV 序列长度不同），标准 backward
 - 代表：**PrefixSharing（当前版本，build_kv 路径——GPU FA/Torch ref）**
 - 特征：**一次性构建完整 KV 张量然后标准 attention**，数学严格等价，不修改 transformers 源码
 - 与流派 A 的区别：一次 forward 而非两次；与流派 B 的区别：不管理 KV 生命周期、标准 backward 无梯度注入
 - 局限：仅 support 扁平（1-prefix + N-suffix）结构，物理展开引入额外 KV 内存
-- 性能分析：GPU 上路径最短——单次 `flash_attn_varlen_func` 即可，无额外 kernel launch（流派 A 比 C 多一次 attention 调用+scatter-gather）。但物理展开使 KV 张量尺寸增大到 `sum(original_lengths)` 而非 `sum(kept_lengths_q)`，显存和带宽开销随 reuser 数量线性增长。当 prefix 占比很高（P >> S）时，展开的 KV 冗余很小，性能接近理论最优；当 suffix 很长时，展开的 prefix KV 相对 overhead 低。
-- 工程复杂度分析：最低。核心是 index 拼接操作（`torch.cat`/`torch.index_select`），不涉及自定义 autograd、不修改模型 forward、不依赖特定 kernel。后端选择通过 factory 模式路由。复杂度集中在 `PrefixSharingPlan` 的元数据计算（Q/KV 的 cumsum、offset、keep_ranges），这个是纯 Python 逻辑。
 
-**流派 D：Flat Packing with Sparse / Block-Causal Mask（扁平打包 + 稀疏 mask）** — 性能极限 ★★★☆☆  工程复杂度 ★★☆☆☆
+**流派 D：Flat Packing with Sparse / Block-Causal Mask（扁平打包 + 稀疏 mask）**
+- **性能极限：★★★☆☆**（显式 mask 路径比 varlen FA 慢）
+- **工程复杂度：★★☆☆☆**（mask 构造 O(n²) 直观但后端差异细节多）
 - 将所有序列打包为扁平 token layout，通过 block-causal mask 或 block-sparse attention mask 控制可见性，无需物理 KV 展开
 - 代表：**PrefixSharing（block_causal_mask 路径——NPU / TE）**, MiniMax Forge (声称), verl RFC #6401 (规划中)
 - 特征：一次 forward pass、不修改 KV 张量形状（靠 mask 而非 build_kv 控制因果）、标准 backward
 - 与流派 C 的区别：不物理展开 KV，靠 mask 控制可见性；两个路径在同一仓库中共存，按后端选择
 - 局限：需要后端支持显式 attention mask（NPU/TE 支持，FA 的 varlen path 不支持此类 mask）
-- 性能分析：显式 mask 的 attention 路径（如 TE 的 `core_attention_bias`）比 varlen FA（`causal=True`）的硬件优化路径慢。mask 计算有额外 kernel launch（`build_block_causal_mask`），但节省了物理展开的 KV 内存和带宽。总体而言，对 mask 友好的后端（NPU）比 GPU FA 的展开路径更高效；对 GPU FA 而言，展开路径（流派 C）优于 mask 路径。
-- 工程复杂度分析：中等。mask 构造逻辑是 O(total_q × total_kv) 的一次性计算，比流派 C 的 index 拼接更直观。但 mask 到 TE bias 的格式转换、mask 与 flash_attn varlen 的不兼容性、不同设备上的 mask 构造 dtype 差异等细节较多。
 
-**流派 E：Schedule-Level Optimization（调度层优化）** — 性能极限 ★★★★★ (与 attention 优化叠加)  工程复杂度 ★★★☆☆
+**流派 E：Schedule-Level Optimization（调度层优化）**
+- **性能极限：★★★★★**（跨 batch 放大复用，与 A-D 正交叠加）
+- **工程复杂度：★★★☆☆**（不碰 attention 层，但需调度器结构性改造）
 - 不改变 attention 执行方式，在训练调度层面优化前缀复用的粒度（跨 micro-batch 复用）
 - 代表：腾讯/HKUST Schedule-Level Reuse
 - 特征：**正交维度**，可与上述四种路线叠加使用
-- 性能分析：理论上可将 prefix 复用的收益因子放大到 batch 级（而非仅 micro-batch 内）。当不同 micro-batch 共享相同系统 prompt 时，跨 batch 复用可大幅增加共享 token 数。理想情况下加速比接近流派 C/D 的 `batch_level × micro-batch_level` 合力。但存在前缀检测的调度开销、cache eviction 决策复杂性、以及跨 batch 通信同步的瓶颈。当前仍是论文阶段，实际效果待验证。
-- 工程复杂度分析：中等偏高。不碰 attention 层，但需要训练调度器的结构性改造——缓存管理（L3 KV cache pool）、前缀跟踪（hash-based prefix_segments）、微批次调度重新排序。涉及系统级而非算法级复杂度。
 
 **另一个正交维度**是将 prefix sharing 应用于训练的**前后向**路径：
-- **前向共享**：所有流派都做——prompt 部分的 KV/attention 只计算一次
-- **后向共享**：仅流派 B 做——通过梯度注入减少 backward 计算图大小；流派 A/C/D 不做（标准 autograd backward）
-- **双端共享**：RFC #6401 理论上做（一次 forward + 标准 backward），Magi 的 CP dispatch 在前后向都受益
-
-**另一个正交维度**是将 prefix sharing 应用于训练的**前后向**路径：
-- **前向共享**：所有方案都做——prompt 部分的 KV/attention 只计算一次
-- **后向共享**：DTA/AReaL 做——通过梯度注入减少 backward 计算图大小；流派 A/C/D 不做（标准 autograd backward）
-- **双端共享**：RFC #6401 理论上做（一次 forward + 标准 backward），Magi 的 CP dispatch 在前后向都受益
 
 ## 2. 调研范围
 
