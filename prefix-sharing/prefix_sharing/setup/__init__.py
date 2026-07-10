@@ -46,9 +46,8 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
     """一键安装：版本探测 → 矩阵匹配 → 注册 patch → 应用 → 返回 handle。
 
     Args:
-        patch_set_id: 显式指定 patch set。FSDP 开发线建议使用
-            ``install("verl080_fsdp")``，避免在同时安装 Megatron/MindSpeed 的
-            环境中被兼容矩阵自动选到 Megatron patch set。
+        patch_set_id: 显式指定 patch set。未指定时兼容矩阵优先选择
+            ``verl080_fsdp``，Megatron/MCore 路线可显式传入对应 patch set。
 
     Returns: PatchHandle — 可调用 describe() 查看详情、disable() 回滚
     Raises: IncompatibleEnvironment — 版本组合不兼容
@@ -92,7 +91,10 @@ def _format_compat_matrix() -> str:
         parts = []
         if e.verl is not None:
             parts.append(f"verl={e.verl}")
-        parts.append(f"megatron-core={e.megatron_core}")
+        if e.megatron_core == "*":
+            parts.append("megatron-core=*")
+        else:
+            parts.append(f"megatron-core={e.megatron_core}")
         if e.mindspeed is not None:
             parts.append(f"mindspeed={e.mindspeed}")
         lines.append(f"  组合{e.patch_set_id}: " + " + ".join(parts))

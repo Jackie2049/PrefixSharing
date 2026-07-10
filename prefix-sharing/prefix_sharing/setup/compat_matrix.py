@@ -11,7 +11,7 @@ from prefix_sharing.setup.version_guard import DetectedVersions
 class CompatEntry:
     """一条兼容性规则，使用精确版本号匹配。
 
-    None 表示该库不需要/不关注。
+    None 表示该库必须不存在；"*" 表示该库不关注。
     """
 
     verl: str | None
@@ -36,8 +36,11 @@ def _version_match(required: str | None, detected: str | None) -> bool:
     """精确版本号匹配。
 
     - required 为 None：该库不需要，detected 为 None 时匹配
+    - required 为 "*"：该库不关注，任意 detected 值都匹配
     - required 为字符串：detected 必须完全等于 required
     """
+    if required == "*":
+        return True
     if required is None:
         return detected is None
     return detected == required
@@ -45,6 +48,15 @@ def _version_match(required: str | None, detected: str | None) -> bool:
 
 # ── 兼容矩阵：支持以下版本组合 ──
 COMPAT_MATRIX: list[CompatEntry] = [
+    # 首推开源路线：verl 0.8.0 + FSDP。Megatron/MindSpeed 是否安装不影响
+    # FSDP patchset 的默认选择；MCore 路线可显式 install("verl080_mcore0161_ms0160")。
+    CompatEntry(
+        verl="0.8.0.dev",
+        megatron_core="*",
+        mindspeed="*",
+        patch_set_id="verl080_fsdp",
+        notes="verl 0.8.0 FSDP first-class path; PrefixGrouper mode=arbitrary_prefix",
+    ),
     # 组合一：verl 0.8.0 + Megatron Core 0.16.1 + MindSpeed 0.16.0（Qwen3.5 NPU 配套）
     CompatEntry(
         verl="0.8.0.dev",

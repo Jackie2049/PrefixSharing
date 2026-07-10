@@ -147,12 +147,12 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
 
 # ═══════════════════════════════════════
-# compat_matrix 新条目匹配
+# compat_matrix FSDP-first 匹配
 # ═══════════════════════════════════════
 
 
-def test_compat_matrix_matches_qwen35_npu_combo():
-    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
+def test_compat_matrix_prefers_verl080_fsdp_even_when_mcore_is_installed():
+    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
     from prefix_sharing.setup.version_guard import DetectedVersions
 
     versions = DetectedVersions(
@@ -161,21 +161,23 @@ def test_compat_matrix_matches_qwen35_npu_combo():
         mindspeed="0.16.0",
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert len(matching) == 1
-    assert matching[0].patch_set_id == "verl080_mcore0161_ms0160"
+    assert matching
+    assert matching[0].patch_set_id == "verl080_fsdp"
+    assert any(e.patch_set_id == "verl080_mcore0161_ms0160" for e in matching)
 
 
-def test_compat_matrix_does_not_match_wrong_mcore():
+def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
     from prefix_sharing.setup.version_guard import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.8.0.dev",
-        megatron_core="0.16.0",  # 不匹配 0.16.1
-        mindspeed="0.16.0",
+        megatron_core=None,
+        mindspeed=None,
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert len(matching) == 0
+    assert matching
+    assert matching[0].patch_set_id == "verl080_fsdp"
 
 
 def test_compat_matrix_no_match_raises_incompatible():
@@ -326,5 +328,3 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is None
     assert prefix_sharing._patch_handle is None
-
-
