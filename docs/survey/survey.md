@@ -25,7 +25,8 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 - **快手 (Kuaishou)**：开源 DynamicTreeAttn 代码，基于 Trie 树的 push-pop 栈式 KV cache + chunked backward 梯度注入机制。论文发表于 arXiv 2511.00413。
 - **蚂蚁 (Ant Group)**：AReaL 框架中实现了 DTA 引擎，Trie 树 Push-Pop 栈式 KV cache + chunked backward。DTA 模式下平行化走 ZeRO-1（朴素 DP），FSDP/Megatron 尚未适配。Apache 2.0 开源。
 - **MiniMax**：在 Forge 框架博客中描述 Prefix Tree Merging + MagiAttention，声称 40x 加速（代码未公开）。
-- **美团 (Meituan) / SandAI**：在 verl 社区做出两份贡献——合入 PR #4368 (PrefixGrouper FSDP 集成 2026-01-05) 和 RFC #6401 (Prefix-Tree Shared Attention with MagiAttention 2026-05-19)。
+- **美团 (Meituan) / SandAI**：在 verl RFC #6401 提出 Prefix-Tree Shared Attention with MagiAttention 方案（2026-05-19）。另有独立实现 `verl_prefix_share` 分支集成 PrefixGrouper。
+- **社区 (kevssim)**：合入 PR #4368 (PrefixGrouper FSDP 集成 2026-01-05)，与美团实现同源相似但独立贡献。
 - **腾讯 / HKUST**：Schedule-Level Prefix Reuse (arXiv 2606.01143)，将前缀复用提升到训练步骤调度级别。
 - **verl 社区**：围绕多轨迹训练形成了完整的 PR/Issue 生态体系（#4368, #6401, #6122, #5443, #6271, #5375, #5790）。
 
@@ -46,9 +47,10 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 - 特征：支持多级树结构、KV 共享最大化、峰值内存可控但有梯度近似偏差
 
 **流派 C：Flat Packing with Sparse Mask（扁平打包 + 稀疏 mask）**
-- 将所有序列打包为扁平 token layout，通过 block-sparse attention mask 保证因果隔离
-- 代表：MiniMax Forge (声称), verl RFC #6401 (规划中)
-- 特征：一次 forward pass、支持多级树、依赖 MagiAttention 等外部 kernel
+- 将所有序列打包为扁平 token layout，通过 block-sparse attention mask 或 NestedTensor 保证因果隔离
+- 代表：**PrefixSharing (本仓库)**, MiniMax Forge (声称), verl RFC #6401 (规划中)
+- 特征：一次 forward pass、标准 backward（无梯度注入）、无需修改 transformers 源码
+- 实现差异：PrefixSharing 用 NestedTensor + packed attention，无需外部 kernel；RFC #6401/Magi 用 block-sparse mask + MagiAttention
 
 **流派 D：Schedule-Level Optimization（调度层优化）**
 - 不改变 attention 计算方式，在调度层面优化前缀复用的粒度（跨 micro-batch）
@@ -74,7 +76,8 @@ naive 实现中，每条 prompt+response 序列独立前向传播。给定 batch
 | DynamicTreeAttn | 快手 (Kuaishou) | 论文 (arXiv 2511.00413) + GitHub 代码 | 已开源 |
 | AReaL DTA | 蚂蚁 (Ant Group) | GitHub 代码 (Apache 2.0) | 开源框架 |
 | MiniMax Forge | MiniMax | 官方博客文章 | 仅博客 (闭源) |
-| Meituan PrefixGrouper (PR #4368) | 美团 / SandAI | verl 合入代码 | 已合入 verl main |
+| PrefixGrouper (verl PR #4368) | kevssim (社区贡献) | verl PR 合入代码 | 已合入 verl main |
+| PrefixGrouper (美团集成) | 美团 / SandAI | `verl_prefix_share` 分支代码 | 独立实现 |
 | RFC #6401 (Tree-based) | 美团 / SandAI | verl RFC Issue | 讨论中 |
 | Schedule-Level Reuse | 腾讯 / HKUST | arXiv 2606.01143 | 论文阶段 |
 | rStar-Math | 微软 | 论文 + 开源代码 | 已发布 |
@@ -648,11 +651,11 @@ Step 7: 清理
 - 全异步 RL 训练的大规模生产环境
 - 有 AReaL 框架依赖的项目（目前 DTA 模式下平行化走 ZeRO-1，仅朴素 DP 可用）
 
-### 3.4 美团 verl PrefixGrouper 集成 (PR #4368)
+### 3.4 verl PrefixGrouper 集成 (PR #4368)
 
 #### 3.4.1 方案概述
 
-美团团队在 verl 框架中集成 PrefixGrouper，实现 **365 行代码、8 个文件** 的低侵入性改动。这是目前已经合入 verl main 分支的 prefix sharing 方案。
+kevssim（社区贡献者）在 verl 框架中集成 PrefixGrouper，实现 **365 行代码、8 个文件** 的低侵入性改动。这是目前已经合入 verl main 分支的 prefix sharing 方案，与美团 `verl_prefix_share` 分支方案同源（都依赖 CASIA PrefixGrouper 库）但独立实现。
 
 verl PR #4368：`[fsdp] feat: integrate PrefixGrouper for GRPO training acceleration`
 状态：Closed, Merged (2026-01-05)
@@ -747,7 +750,7 @@ trainer:
 
 **优点**：
 1. **代码侵入极低**：365 行，8 文件。
-2. **已合入 verl main**：社区认可 baseline。
+2. **已合入 verl main**：社区认可 baseline，可由配置开关启用。
 3. **配置开关**：`use_prefix_grouper: True/False`。
 4. **零运行时开销**：pass-through 模式。
 5. **后端无关 + 精度等价**：FA2/FA3/SDPA/eager 均支持，严格数学等价。
@@ -995,7 +998,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
 
 ### 5.1 核心维度对比
 
-| 维度 | PrefixGrouper (CASIA) | DTA (快手) | AReaL DTA (蚂蚁) | Forge (MiniMax) | PG 集成 (美团/verl) | RFC #6401 (美团/verl) |
+| 维度 | PrefixGrouper (CASIA) | DTA (快手) | AReaL DTA (蚂蚁) | Forge (MiniMax) | PG 集成 (kevssim PR #4368) | RFC #6401 (美团/verl) |
 |------|----------------------|------------|-----------------|-----------------|-------------------|---------------------|
 | 代码可及性 | 开源 (PyPI) | 开源 (GitHub) | 开源 (Apache 2.0) | 仅博客 | 开源 (verl main) | 未实现 |
 | 论文 | arXiv 2506.05433 | arXiv 2511.00413 | — | 无 | — | — |
@@ -1094,7 +1097,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
                     (CASIA 论文)                          (美团 Issue)
                          │                                    │
   2025 Q4                │                                    │
-                PR #4368 合入 verl main                 (讨论中，未实现)
+                PR #4368 (kevssim) 合入 verl main                 (讨论中，未实现)
                 (美团, FSDP only)
                          │                                    │
   2026 Q2          快手 DTA                                 Ant DTA
@@ -1130,7 +1133,7 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
 
 | 场景 | 推荐方案 | 理由 |
 |------|---------|------|
-| **FSDP + GRPO, 严格等价** | 美团 PrefixGrouper | 已合入 verl main，365 行，数学等价 |
+| **FSDP + GRPO, 严格等价** | PrefixGrouper (PR #4368) / 美团 `verl_prefix_share` | PR #4368 已合入 verl main；美团独立实现同源 |
 | **FSDP + GRPO, 独立使用** | CASIA PrefixGrouper | API 极简，后端无关 |
 | **Megatron + GRPO** | RFC #6401 方向（跟进） | 目前唯一 Megatron 路径 |
 | **多级树 (MCTS / multi-turn)** | 快手 DTA / 蚂蚁 AReaL DTA | Trie 原生支持 |
