@@ -819,7 +819,54 @@ Setup
 
 ## Chapter 2：方案设计
 
-### 2.1 用户入口与配置策略
+本章将 Chapter 1 的研究结论转成可执行设计。设计原则是：先把开源主线收窄到 verl080 + FSDP + attention KV prefix sharing，再清理历史分支和过度抽象；所有改动必须保持 One-Forward + KV Injection + Prefix-Last Restore 的精度语义不变。
+
+### 2.1 总体目标架构
+
+重构后的目标架构：
+
+```text
+verl user config
+  use_prefix_grouper=true
+  prefix_grouper.mode=prompt_only
+    -> existing PrefixGrouper path
+  prefix_grouper.mode=arbitrary_prefix
+    -> PrefixSharing FSDP-first runtime
+
+prefix_sharing.core
+  config.py              # PrefixSharingConfig, env fallback, config validation
+  prefix_detector.py     # arbitrary-prefix reuse detection
+  planner.py             # PrefixSharingPlan: trim/KV/restore execution contract
+  prefix_store.py        # attention KV store only in first open-source line
+
+prefix_sharing.backends
+  kv_builder.py          # shared KV expansion, production path dependency
+  flash_atten_gpu.py     # production GPU FA backend
+  flash_atten_npu.py     # production NPU FA backend
+  torch_ref.py           # reference/correctness backend
+
+prefix_sharing.integrations
+  verl_utils.py          # FSDP/MCore shared config/batch/position helpers
+  runtime_state.py       # framework-independent runtime carrier
+  context.py             # store lifetime, restore index, audit
+  verl_fsdp.py           # first-class integration path
+  verl_mcore.py          # advanced/internal path, no longer owns shared helpers
+
+prefix_sharing.setup
+  patches/verl080_fsdp   # first-class patch set
+  patches/*              # advanced patch sets
+  registry/logged_patch  # single patch mechanism
+```
+
+验收标准：
+
+- FSDP path 不依赖 MCore 私有 helper。
+- GPU/NPU FA backend 不依赖 `TorchReferenceBackend.build_kv()`。
+- 主包导出不再暴露 Qwen3.5 / Gated DeltaNet 专门化类型。
+- `setup/` 是唯一生产 patch 机制，旧 `integrations/patch_manager.py` 体系删除。
+- README 和用户文档首推 PrefixGrouper 风格配置，不首推环境变量。
+
+### 2.2 用户入口与配置策略
 
 开源首选入口：
 
@@ -833,106 +880,371 @@ actor_rollout_ref:
       min_group_size: 2
 ```
 
-配置优先级建议：
+配置语义：
 
-1. verl 用户侧公开入口优先：`use_prefix_grouper + prefix_grouper.mode`。
-2. `prefix_sharing_config` 保留为内部兼容、测试、patch 未正式合入前的 escape hatch。
-3. `ENABLE_PREFIX_SHARING` 保留为开发/调试 fallback，不作为 README 首选。
+- `use_prefix_grouper=false`：不启用 PrefixGrouper / PrefixSharing。
+- `use_prefix_grouper=true, prefix_grouper.mode=prompt_only`：继续走 verl / PrefixGrouper 既有 prompt-only 路径。
+- `use_prefix_grouper=true, prefix_grouper.mode=arbitrary_prefix`：进入 PrefixSharing arbitrary-prefix path。
+- `prefix_sharing_config`：保留为内部兼容、测试和 patch 未正式合入前的 escape hatch，不作为 verl 用户公开主入口。
+- `ENABLE_PREFIX_SHARING`：保留为开发/调试 fallback，不作为 README 首选。
 
-`mode: arbitrary_prefix` 当前已经能触发 PrefixSharing：`read_ps_config_from_engine_config()` 会读取 `use_prefix_grouper=True`，并在 `prefix_grouper.mode` 为 `arbitrary_prefix` / `arbitrary-prefix` / `prefix_sharing` 时返回 `enable_prefix_sharing=True` 的配置；`prompt_only` / `prefix_grouper` 则返回 disabled。
+当前代码状态：
 
-PrefixGrouper 相关代码边界：
+- `read_ps_config_from_engine_config()` 已能读取 `use_prefix_grouper=True`。
+- `prefix_grouper.mode` 为 `arbitrary_prefix` / `arbitrary-prefix` / `prefix_sharing` 时，会生成 `enable_prefix_sharing=True`。
+- `prompt_only` / `prompt-only` / `prefix_grouper` 会返回 disabled，避免抢占 PrefixGrouper prompt-only 语义。
 
-- 只把 PrefixGrouper 当作 verl 用户入口、配置命名和 prompt-only baseline。
-- PrefixSharing arbitrary-prefix 不复用 PrefixGrouper `group_info` 作为内部 runtime 结构。
-- 仓库中不应存在 PrefixGrouper prompt-only 算法复刻；如果需要测试 prompt-only 行为，应使用 fake fixture 或外部 PrefixGrouper 依赖，而不是在 PrefixSharing 主包里实现一份。
-- 变量和文档命名可以保留 `prefix_grouper` 以兼容 verl 配置，但 runtime 对象应命名为 `prefix_sharing_*` 或更通用的 `shared_prefix_*`，避免误导读者。
+需要补齐的设计约束：
 
-### 2.2 Integration 分层
+- 若 `prefix_sharing_config` 与 `prefix_grouper.mode` 同时存在，必须显式记录优先级。短期建议保留当前内部配置优先级，但 README 不宣传；长期合入 verl 后应以 verl schema 为准。
+- 配置解析应集中到 `integrations/verl_utils.py` 或后续拆出的 `verl_config.py`，FSDP/MCore 不各自维护一套解析逻辑。
+- 所有配置 fallback 都要能给出可诊断信息，避免因为 env var 或 hidden config 让用户误判是否启用。
 
-目标分层：
+验收标准：
+
+- 单测覆盖 `prompt_only` 不启用 PrefixSharing。
+- 单测覆盖 `arbitrary_prefix` 启用 PrefixSharing。
+- 单测覆盖 `prefix_sharing_config` 和 PrefixGrouper 配置同时存在时的优先级。
+- README 示例不再把 `ENABLE_PREFIX_SHARING=1` 作为首选入口。
+
+### 2.3 PrefixGrouper 关系与代码边界
+
+对外定位：
+
+- PrefixGrouper 是 verl 已有用户入口和 prompt-only baseline。
+- PrefixSharing 是 PrefixGrouper 的 arbitrary-prefix 扩展模式。
+- 首批社区 PR 应表达为“扩展 PrefixGrouper mode”，而不是“新增另一个 prefix-sharing feature”。
+
+允许存在的代码：
+
+- 配置读取与兼容：`use_prefix_grouper`、`prefix_grouper.mode`、`prefix_grouper.min_prefix_len` 等。
+- 为复用 verl attention hook 心智而保留的薄 adapter / 参数透传。
+- 文档说明：`prompt_only` 归 PrefixGrouper，`arbitrary_prefix` 归 PrefixSharing。
+- 测试 fixture：用于验证分发逻辑的 fake PrefixGrouper 对象。
+
+不允许存在的代码：
+
+- 在 PrefixSharing 主包复刻 PrefixGrouper prompt-only 算法。
+- 维护独立 `group_info` runtime，并把它作为 arbitrary-prefix 的事实源。
+- 为了“看起来兼容 PrefixGrouper”而引入不参与主流程的 wrapper。
+- 把 PrefixGrouper group 模型强行塞进 `PrefixSharingPlan`。
+
+落地动作：
+
+- README 增加 “Relationship with verl PrefixGrouper” 小节。
+- 扫描 `prefix-sharing/prefix_sharing/` 中所有 `prefix_grouper` 命名，按“配置/接口允许，算法/runtime 不允许”的边界分类。
+- 对超过边界的代码，删除或下沉到 tests fixture。
+
+验收标准：
+
+- reviewer 能从 README 理解：为什么用户配置叫 `prefix_grouper`，但运行时对象叫 `prefix_sharing_plan`。
+- `PrefixSharingPlan` 不包含 PrefixGrouper `group_info`。
+- `PrefixGroup` / `group_ids` 删除后，不影响 arbitrary-prefix 检测与 restore。
+
+### 2.4 Core 层重构方案
+
+Core 层目标是保留 provider/reuser DAG 语义，删除不承载运行时事实的 group 噪音。
+
+#### 2.4.1 清理 mixer-specific store
+
+首批主线只保留 attention KV prefix sharing。
+
+处理范围：
+
+- 删除或下线 `StoredDeltanetState`。
+- 删除或下线 `PrefixDeltanetStore`。
+- 删除或下线 `PrefixDeltanetBackend`。
+- 删除或下线 `TorchReferenceBackend.build_deltanet_states()`。
+- `PrefixActivationStore` 如保留，只作为最小泛化基类，不对外承诺 GDN 能力。
+
+保留范围：
+
+- `StoredAttentionKV`
+- `PrefixAttentionStore`
+- `PrefixActivationSlotId` 如果 attention store 仍依赖该统一 key，可保留。
+
+验收标准：
+
+- `prefix_sharing.core.__all__` 不再导出 GDN/Qwen3.5 专门化类型。
+- backend capabilities 不再暴露 `supports_deltanet_state_reuse` 作为主线能力。
+- 相关测试改为 attention store 测试，或删除历史 GDN mock 测试。
+
+#### 2.4.2 删除 PrefixGroup / group_ids
+
+处理范围：
+
+- 删除 `PrefixGroup`。
+- 删除 `PrefixDetectionResult.groups`。
+- 删除 `PrefixDetectionResult.group_ids`。
+- 删除 `PrefixSharingPlan.group_ids`。
+- 删除 `PrefixLastRestoreSpec.group_id`。
+- `sharing_group_count` 改为从 `reuse_specs` 的 `(provider_idx_in_batch, prefix_len)` 唯一集合推导。
+
+不处理范围：
+
+- 暂不删除 `provider_index`、`prefix_lens`、`is_provider`。
+- 暂不把 `PrefixDetectionResult` 合并进 `PrefixSharingPlan`。
+- 暂不引入 `PrefixReuseIndex` / `RestorePlan` 等新子结构。
+
+理由：
+
+- group 字段不是当前 runtime 事实源。
+- 高频视图字段在 detector 阶段已经自然产生，删除后再重算没有收益。
+
+验收标准：
+
+- detector/planner 单测仍覆盖 one-provider、multi-reuser、chain reuse、no-sharing。
+- observability 中 group count 与删除前语义一致或更准确。
+- 无代码路径依赖 `PrefixGroup`。
+
+### 2.5 Backend 层重构方案
+
+Backend 层目标是把生产路径公共能力从 TorchRef 中拿出来，并逐步让社区主路径靠近 FlashAttention。
+
+#### 2.5.1 抽出 shared KV builder
+
+新增模块建议：
 
 ```text
-integrations/
-  verl_utils.py          # FSDP/MCore 共用配置、batch、position helper
-  runtime_state.py       # PrefixSharingRuntimeState
-  context.py             # PrefixSharingRuntimeContext
-  verl_fsdp.py           # FSDP 专属逻辑
-  verl_mcore.py          # Megatron/MCore 专属逻辑
+prefix_sharing/backends/kv_builder.py
 ```
+
+候选接口：
+
+```python
+def build_prefix_expanded_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    prefix_sharing_plan: PrefixSharingPlan,
+    store: PrefixAttentionStore,
+    *,
+    packed_batch_layout: PackedBatchLayout | None = None,
+    backend_name: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ...
+```
+
+职责：
+
+- 按 plan/provider-before-reuser 顺序 store provider valid KV。
+- 为 reuser 拼接 provider prefix KV + reuser suffix KV。
+- 排除 TP padding slot，不把 padding KV 存入 store。
+- 保持 autograd graph，不 `detach()`。
+- 保持输出 packed KV shape 与 FlashAttention backend 预期一致。
+
+非职责：
+
+- 不做 attention softmax。
+- 不做 RoPE。
+- 不做 GDN/cache_param。
+- 不处理 PrefixGrouper prompt-only `group_info`。
+
+调用关系：
+
+- `FlashAttentionGPUBackend.build_kv()` 调 shared builder。
+- `FlashAttentionNPUBackend.build_kv()` 调 shared builder。
+- `TorchReferenceBackend.build_kv()` 如保留，应只是调 shared builder 的薄 wrapper。
+
+验收标准：
+
+- GPU/NPU backend 文件不再 import `TorchReferenceBackend` 仅为了 `build_kv()`。
+- shared builder 单测覆盖 no-sharing、one-provider、chain、TP padding、gradient flow。
+- 旧 TorchRef build_kv 行为与 shared builder 等价。
+
+#### 2.5.2 TorchRef 定位收敛
+
+TorchRef 保留用途：
+
+- CPU correctness reference。
+- 小规模 attention mask 语义验证。
+- 与 FA backend 做数值对齐。
+
+TorchRef 不再承担：
+
+- 生产路径 KV expansion 唯一实现。
+- Qwen3.5/GDN reference。
+- GPU/NPU backend 公共父类职责。
+
+验收标准：
+
+- README / docs 不把 TorchRef 描述为性能路径。
+- factory 中 `torch_ref` 仍可用于单测和 debug。
+- FlashAttention backend 的生产语义不依赖 TorchRef 类。
+
+### 2.6 Integration 层重构方案
+
+Integration 层目标是让 FSDP 成为第一优先级路径，同时让 MCore 代码不再承载公共 helper。
+
+#### 2.6.1 新增 `verl_utils.py`
+
+第一阶段不要过度拆分，先新增一个公共模块：
+
+```text
+prefix_sharing/integrations/verl_utils.py
+```
+
+迁移内容：
+
+- `read_ps_config_from_engine_config()`。
+- `_prefix_sharing_config_from_prefix_grouper()`。
+- NestedTensor / dense batch trim helper。
+- kept position rows / valid indices helper。
+- FSDP/MCore 都使用的 batch field 读取工具。
+
+后续拆分条件：
+
+- 如果 `verl_utils.py` 超过约 400 行，或出现明显不同职责，再拆成：
+  - `verl_config.py`
+  - `verl_batch.py`
+  - `verl_positions.py`
+
+验收标准：
+
+- `verl_fsdp.py` 不再 import `verl_mcore.py`。
+- `verl_mcore.py` 不再拥有 PrefixGrouper 配置读取事实源。
+- FSDP/MCore 配置解析测试共用同一套 helper。
+
+#### 2.6.2 抽出 `runtime_state.py`
+
+新增模块建议：
+
+```text
+prefix_sharing/integrations/runtime_state.py
+```
+
+保留字段：
+
+- `prefix_sharing_plan`
+- `attention_backend`
+- `packed_batch_layout`
+- `parallel_info`
+- `kept_position_ids` 或兼容字段
+- `valid_indices` 或兼容字段
 
 原则：
 
-- `verl_fsdp.py` 不 import `verl_mcore.py`。
-- fake/local helpers 必须显式标注 test utility 或 local fallback。
-- 真实生产入口优先在 `setup/patches/verl080_fsdp/` 中体现。
+- RuntimeState 是 integration runtime carrier，不属于 MCore。
+- Context 仍负责进入 forward 前派生 store、restore index 等可执行状态。
+- 不把 Plan、RuntimeState、Context 合并。
 
-### 2.3 Backend 分层
+验收标准：
 
-目标分层：
+- FSDP/MCore/context/tests 均从公共模块 import RuntimeState。
+- `verl_mcore.py` 删除 RuntimeState 定义。
 
-```text
-backends/
-  base.py                # backend protocol/capabilities
-  kv_builder.py           # shared build_kv / KV expansion
-  flash_atten_gpu.py      # GPU FA production path
-  flash_atten_npu.py      # NPU FA production path
-  torch_ref.py            # correctness/reference path
-```
+#### 2.6.3 FSDP-first 接入整理
 
-原则：
+处理范围：
 
-- GPU/NPU backend 使用公共 KV builder，不依赖 TorchRef。
-- TorchRef 保留用于单测、精度对齐和 CPU fallback。
-- 首批主线只保留 attention KV；GDN/HybridAttention 等待真实训练引擎接口后重新设计。
+- `verl_fsdp.py` 中 fake/local helper 明确标注 test utility 或 local fallback。
+- 真实生产入口主推 `setup/patches/verl080_fsdp/forward_step.py`。
+- FSDP runtime 内部按 pack / run attention / scatter / restore 拆小函数。
 
-### 2.4 Patch 机制
+验收标准：
+
+- reviewer 能区分 fake helper 和生产 patch。
+- FSDP restore 函数有独立单测。
+- README 把 FSDP 列为第一推荐路径。
+
+### 2.7 Patch / setup 机制方案
 
 目标：
 
 - `setup/` 是唯一生产 patch 机制。
-- `integrations/patch_manager.py` 旧体系删除。
-- 保留两种安装方式：
-  - import 后自动 patch，服务 `VERL_USE_EXTERNAL_MODULES=prefix_sharing`。
-  - 显式 `prefix_sharing.setup.install("verl080_fsdp")`，服务可读接入和交互式调试。
+- 旧 `integrations/patch_manager.py` 体系删除。
+- import auto patch 和显式 install 双入口都保留。
 
-要求：
+保留入口：
 
-- patch 幂等。
-- patchset 选择清晰，FSDP 第一优先级。
-- import hook 行为有测试覆盖，失败路径可诊断。
-- import hook 整改前必须先画清楚触发链：
-  - import auto patch：`import prefix_sharing` 触发什么；
-  - external modules：verl 如何 import `prefix_sharing`；
-  - explicit install：用户手动调用 `prefix_sharing.setup.install(...)` 时如何避免重复 patch；
-  - fallback：patch target 尚未 import 时是否走 lazy hook，target 已 import 时是否走 eager patch。
+```python
+import prefix_sharing
+```
 
-### 2.5 调试与工具策略
+用于 `VERL_USE_EXTERNAL_MODULES=prefix_sharing` 的脚本化训练。
 
-调试逻辑处理分两步：
+```python
+import prefix_sharing
+prefix_sharing.setup.install("verl080_fsdp")
+```
 
-1. 短期：所有热路径 dump/print/logging 加统一注释标记，避免后续漏清理。
-2. 中期：集中到 `diagnostics` helper，生产 patch 只保留一行调用。
+用于显式、可读、可调试的集成。
 
-tools 目录处理原则：
+删除范围：
 
-- 一次性摸底脚本可以删。
-- 版本级精度验证、性能验证脚本必须保留，并补充用途说明。
-- 保留工具必须写清楚：命令入口、输入数据要求、输出结果含义、依赖环境、适合在哪类 PR 或 release 前复跑。
-- 删除工具前应确认其结论已经迁移到测试、文档或仍保留的 benchmark/report 中。
+- `integrations/patch_manager.py`
+- `integrations/megatron_attention.py`
+- `VerlMCoreIntegration`
+- `VerlFSDPIntegration`
+- 仅覆盖旧 patch manager 的测试
+
+保留范围：
+
+- `setup/logged_patch.py`
+- `setup/registry.py`
+- `setup/patches/verl080_fsdp`
+
+import hook 整改清单：
+
+- auto install 触发链：`prefix_sharing.__init__` 何时调用 `_auto_install_patches()`。
+- patchset 选择：`PREFIX_SHARING_PATCHSET`、compat matrix、显式 install 参数谁优先。
+- eager/lazy：target 已 import 时 eager patch，target 未 import 时 lazy hook。
+- 幂等：重复 import、重复 install、auto + explicit 混用不重复 patch。
+- 失败语义：target 缺失、版本不匹配、patch 函数异常分别如何处理。
+- 可观测性：默认不刷屏，debug 时能看出安装了哪个 patchset。
+
+验收标准：
+
+- `setup.install("verl080_fsdp")` 幂等。
+- import auto patch 与显式 install 混用不会重复 patch。
+- FSDP patchset 能通过 compat matrix 或显式 patchset 稳定选中。
+- 单测覆盖 patch target 已 import / 未 import 两种顺序。
+
+### 2.8 调试、日志与 tools 方案
+
+短期处理：
+
+- 所有热路径 dump/print/logging 用统一注释标记：
+  ```python
+  # PREFIX_SHARING_DIAGNOSTIC
+  ```
+- 明显可集中封装的 dump 入口移入 `diagnostics` helper。
+- 默认训练路径不输出 per-micro-batch print。
+
+中期处理：
+
+- 新增或整理 `prefix_sharing/diagnostics.py`。
+- 生产 patch 只调用少数 helper：
+  - `diagnostics.enabled()`
+  - `diagnostics.dump_fsdp_attention(...)`
+  - `diagnostics.dump_runtime_plan(...)`
+- audit 使用 logger，不直接 print。
+
+tools 保留标准：
+
+- 能复现关键精度结论：logprob/loss/grad 与 baseline 对齐。
+- 能复现关键性能结论：FSDP baseline、PrefixGrouper prompt-only、PrefixSharing arbitrary-prefix 三方对比。
+- 能作为 release / 重要 PR 前回归验证。
+- 依赖 GPU、verl、flash-attn、torch_npu 时，文件头写清楚环境要求。
+
+tools 删除标准：
+
+- 只服务某次临时排查，结论已经沉淀到文档或测试。
+- 与当前 verl080/FSDP-first 主线无关。
+- 输出格式、依赖、入口不可复现，且无人维护。
+
+验收标准：
+
+- 默认测试和本地训练不出现 PrefixSharing 热路径 print。
+- 保留工具都有用途说明。
+- 删除工具前能说明结论已经迁移到测试、文档或 benchmark。
 
 ## Chapter 3：测试验证
 
-首批重构需要覆盖：
+测试目标是证明重构没有改变 prefix-sharing 的核心精度语义，并让开源关键路径有足够保护。测试按 PR 粒度分层，不要求每个 PR 都跑 GPU/NPU optional 测试，但核心 CPU/torch 语义测试必须稳定。
 
-- Qwen3.5/GDN 清理后，公开导出、backend factory、store 单测仍通过。
-- shared KV builder 与旧 `TorchReferenceBackend.build_kv()` 在 no-sharing、one-provider、chain、TP padding 场景输出一致。
-- FSDP/MCore 公共 helper 抽离后，两条 integration 测试路径不再出现 FSDP import MCore 私有函数。
-- `use_prefix_grouper=true + mode=arbitrary_prefix` 使能 PrefixSharing；`prompt_only` 不进入 PrefixSharing。
-- import auto patch 和显式 `setup.install()` 都可用、幂等、不会重复 patch。
-- 默认训练路径无热路径 print；诊断开关打开时 dump 路径仍可用。
+### 3.1 通用回归命令
 
-建议回归命令：
+标准回归：
 
 ```bash
 PYTHONPATH=prefix-sharing pytest -q \
@@ -941,36 +1253,446 @@ PYTHONPATH=prefix-sharing pytest -q \
   prefix-sharing/tests/system_test
 ```
 
-文档或计划类改动可不跑测试，但提交说明必须明确。
+可选环境变量：
+
+```bash
+PYTHONPYCACHEPREFIX=/private/tmp/prefix-sharing-refactor-pycache
+```
+
+文档-only 改动可不跑 pytest，但提交说明必须写明原因。
+
+### 3.2 PR-A：清理 Qwen3.5 / GDN 专门化代码
+
+测试范围：
+
+- `prefix_store` attention KV store 单测。
+- backend factory / capabilities 单测。
+- `core.__all__` / `backends.__all__` 导出检查。
+
+新增或调整测试：
+
+- 删除 GDN store/backend 相关测试，或迁移到历史实验目录后不作为主线 CI。
+- 新增断言：主包不导出 `PrefixDeltanetStore`、`StoredDeltanetState`、`PrefixDeltanetBackend`。
+- attention store 梯度流测试保留，验证 KV 不 detach。
+
+验收：
+
+- 所有 attention KV store 测试通过。
+- 没有主线测试依赖 Qwen3.5/GDN 类型。
+
+### 3.3 PR-B：shared KV builder
+
+测试范围：
+
+- no-sharing：输出 KV 等于输入 valid KV。
+- one-provider：reuser KV = provider prefix KV + reuser suffix KV。
+- chain reuse：多级 provider/reuser 顺序正确。
+- TP padding：padding slot 不进入 store，不进入 expanded KV。
+- gradient flow：provider prefix KV 被 reuser 使用时，梯度能回到 provider hidden states。
+
+新增测试：
+
+- `tests/unit_test/test_kv_builder.py`
+- GPU/NPU backend 不 import TorchRef 的静态/行为检查。
+- 与旧 TorchRef build_kv 的等价性测试，作为迁移保护。
+
+验收：
+
+- shared builder 输出与旧行为一致。
+- `flash_atten_gpu.py` / `flash_atten_npu.py` 不再为 `build_kv()` import TorchReferenceBackend。
+- FA backend 既有测试通过。
+
+### 3.4 PR-C：verl_utils / runtime_state 抽离
+
+测试范围：
+
+- 配置解析。
+- batch trim helper。
+- FSDP adapter。
+- MCore adapter。
+
+新增或调整测试：
+
+- `use_prefix_grouper=false` -> disabled。
+- `prompt_only` -> disabled，且不进入 PrefixSharing。
+- `arbitrary_prefix` / `arbitrary-prefix` / `prefix_sharing` -> enabled。
+- `prefix_sharing_config` 与 `prefix_grouper.mode` 同时存在时优先级稳定。
+- FSDP 不 import `verl_mcore.py` 私有 helper，可通过 `rg` 或 import-level 单测保护。
+
+验收：
+
+- FSDP/MCore 都从 `verl_utils.py` 读取配置。
+- `PrefixSharingRuntimeState` 从公共模块 import。
+- 现有 FSDP adapter 测试通过。
+
+### 3.5 PR-D：patch 体系收敛
+
+测试范围：
+
+- `setup.install("verl080_fsdp")`。
+- import auto patch。
+- lazy import hook。
+- repeated install。
+
+新增或调整测试：
+
+- 删除旧 `PatchManager` 专属测试。
+- 新增 auto + explicit 混用幂等测试。
+- 新增 target 已 import / 未 import 两种 patch 顺序测试。
+- 新增 `PREFIX_SHARING_PATCHSET=verl080_fsdp` 选中 FSDP patchset 测试。
+- 新增 patch 失败错误信息测试。
+
+验收：
+
+- `integrations/patch_manager.py` 删除后没有 import 残留。
+- setup patch set 测试覆盖真实生产入口。
+- 默认 import 不刷屏。
+
+### 3.6 PR-E：文档、README、compat matrix
+
+测试范围：
+
+- config docs 示例可被解析。
+- compat matrix 能识别 FSDP-first patch set。
+- README 命令与当前文件路径一致。
+
+新增或调整测试：
+
+- 若已有 docs lint，可加入 README snippet 检查。
+- 若无 docs lint，至少通过人工 review 和 `rg` 检查旧入口是否仍被首推。
+
+验收：
+
+- README 首屏不再把 Megatron-only 作为唯一定位。
+- `ENABLE_PREFIX_SHARING` 被描述为开发/调试 fallback。
+- PrefixSharing / PrefixGrouper 关系说明完整。
+
+### 3.7 PR-F：PrefixGroup / Plan 概念瘦身
+
+测试范围：
+
+- detector。
+- planner。
+- observability。
+- runtime context restore index。
+
+新增或调整测试：
+
+- 删除 group_fields 后，one-provider/multi-reuser/chain reuse plan 不变。
+- `sharing_group_count` 从 `reuse_specs` 推导。
+- `prefix_last_restore` 不依赖 `group_id`。
+
+验收：
+
+- `rg "PrefixGroup|group_ids|group_id" prefix-sharing/prefix_sharing` 无主线残留，除非文档或迁移说明。
+- Plan 字段减少但 backend/runtime 行为不变。
+
+### 3.8 真实环境验证
+
+首批开源前至少需要：
+
+- FSDP 单卡 smoke：Qwen2.5-0.5B，PrefixSharing disabled/enabled 都能跑通。
+- FSDP 精度对齐：固定 batch，logprob/loss/grad 与 baseline 对齐。
+- FSDP 性能对比：baseline、PrefixGrouper prompt-only、PrefixSharing arbitrary-prefix 三方对比。
+- optional GPU FA test：有 flash-attn 环境时跑。
+- optional NPU test：有 torch_npu 环境时跑。
+
+真实环境结果应写入文档或 release note，不要求每个本地 PR 都复跑。
 
 ## Chapter 4：开发计划
 
-建议顺序：
+开发计划按小 PR 切分。每个 PR 都必须能独立 review、独立回滚，避免把删除历史代码、抽公共模块、改用户入口混在一个大变更里。
 
-1. 清理 Qwen3.5 / Gated DeltaNet 专门化代码。
-2. 抽出 shared KV builder，修正 GPU/NPU backend 对 TorchRef 的依赖。
-3. 抽出 `verl_utils.py` 和 runtime state 公共模块。
-4. 删除旧 patch manager 体系。
-5. 更新 README、compat matrix、PrefixSharing/PrefixGrouper 关系说明。
-6. 再做 PrefixGroup / group_ids 删除和 Plan 字段说明。
+### 4.1 PR-A：清理 mixer-specific 历史代码
 
-每一步都应独立提交，避免把行为重构和大面积删除混成一个不可 review 的改动。
+目标：
+
+- 主线只保留 attention KV prefix sharing。
+- 删除 Qwen3.5 / Gated DeltaNet 专门化 store/backend/protocol。
+
+主要改动：
+
+- `core/prefix_store.py`
+- `core/__init__.py`
+- `backends/base.py`
+- `backends/torch_ref.py`
+- `backends/__init__.py`
+- 相关 unit tests
+
+注意事项：
+
+- 不引入新的 general activation abstraction。
+- 如果 `PrefixActivationStore` 没有实际价值，可以同步删除；如果 attention store 还复用 slot id，可保留最小基类。
+- 删除测试前确认它只覆盖 GDN mock，不覆盖 attention KV 梯度红线。
+
+测试：
+
+```bash
+PYTHONPATH=prefix-sharing pytest -q \
+  prefix-sharing/tests/unit_test/test_prefix_store.py \
+  prefix-sharing/tests/unit_test/test_backend_factory.py
+```
+
+### 4.2 PR-B：抽出 shared KV builder
+
+目标：
+
+- `build_kv()` 成为 backend 公共能力，不再属于 TorchRef。
+
+主要改动：
+
+- 新增 `backends/kv_builder.py`。
+- 修改 `flash_atten_gpu.py` / `flash_atten_npu.py`。
+- 修改 `torch_ref.py` 为薄 wrapper 或直接使用 shared builder。
+- 新增 builder 单测。
+
+注意事项：
+
+- provider-before-reuser 顺序是核心算法约束，迁移时必须保留注释。
+- store/load 调用点必须保留注释，说明 provider prefix KV 先 store，reuser 后 load。
+- TP padding slot 不得进入 store。
+
+测试：
+
+```bash
+PYTHONPATH=prefix-sharing pytest -q \
+  prefix-sharing/tests/unit_test/test_kv_builder.py \
+  prefix-sharing/tests/unit_test/test_flash_attention_base.py \
+  prefix-sharing/tests/integrated_test
+```
+
+### 4.3 PR-C：抽出 integration 公共模块
+
+目标：
+
+- FSDP/MCore 共用 helper 进入 `verl_utils.py`。
+- RuntimeState 移到公共模块。
+
+主要改动：
+
+- 新增 `integrations/verl_utils.py`。
+- 新增 `integrations/runtime_state.py`。
+- 修改 `verl_fsdp.py` / `verl_mcore.py` / `context.py` imports。
+- 调整 tests import。
+
+注意事项：
+
+- 第一阶段用 `verl_utils.py` 承载公共逻辑，避免一开始拆太碎。
+- `verl_fsdp.py` 不得 import `verl_mcore.py`。
+- 保持 public behavior 不变。
+
+测试：
+
+```bash
+PYTHONPATH=prefix-sharing pytest -q \
+  prefix-sharing/tests/unit_test/test_config.py \
+  prefix-sharing/tests/unit_test/test_verl_fsdp_adapter.py \
+  prefix-sharing/tests/integrated_test
+```
+
+### 4.4 PR-D：删除旧 patch_manager 体系
+
+目标：
+
+- 生产 patch 机制只剩 `setup/`。
+
+主要改动：
+
+- 删除 `integrations/patch_manager.py`。
+- 删除 `integrations/megatron_attention.py`。
+- 删除旧 integration class 或迁移必要逻辑到 setup patch set。
+- 更新 `integrations/__init__.py`。
+- 重写 patch integration tests。
+
+注意事项：
+
+- 保留 import auto patch 与显式 install 双入口。
+- 删除前用 `rg` 确认旧类没有生产引用。
+- `setup/logged_patch.py` 中历史注释要改掉。
+
+测试：
+
+```bash
+PYTHONPATH=prefix-sharing pytest -q \
+  prefix-sharing/tests/integrated_test/test_patch_integrations.py \
+  prefix-sharing/tests/unit_test
+```
+
+### 4.5 PR-E：文档、README、compat matrix
+
+目标：
+
+- 用户入口、兼容矩阵、README 与 FSDP-first 定位一致。
+
+主要改动：
+
+- README。
+- `docs/user-guide/engine-fsdp.md`。
+- compat matrix。
+- `docs/developer-docs/impr-refactor.md` 必要跟进。
+
+注意事项：
+
+- Qwen2.5-0.5B 仍是首选模型。
+- 依赖统一按 verl080 描述，不按模型区分。
+- `ENABLE_PREFIX_SHARING` 降级为开发/调试 fallback。
+
+测试：
+
+- 文档检查。
+- 配置解析单测。
+- 如 compat matrix 有测试，必须更新。
+
+### 4.6 PR-F：删除 PrefixGroup / group_ids
+
+目标：
+
+- 删除 group 噪音，保留 provider/reuser DAG 事实源。
+
+主要改动：
+
+- `core/prefix_detector.py`
+- `core/planner.py`
+- `integrations/context.py`
+- observability / audit
+- detector/planner tests
+
+注意事项：
+
+- 不合并 DetectionResult 与 Plan。
+- 不删除 `provider_index`、`prefix_lens`、`is_provider`。
+- `is_provider` 只补注释，不改名。
+
+测试：
+
+```bash
+PYTHONPATH=prefix-sharing pytest -q \
+  prefix-sharing/tests/unit_test/test_prefix_detector.py \
+  prefix-sharing/tests/unit_test/test_planner.py \
+  prefix-sharing/tests/unit_test/test_runtime_context.py
+```
+
+### 4.7 PR-G：诊断与 tools 清理
+
+目标：
+
+- 清理热路径 print/dump 侵入。
+- tools 目录保留可复现验证工具。
+
+主要改动：
+
+- 新增或整理 diagnostics helper。
+- 标记或迁移 dump 调用。
+- 删除一次性工具。
+- 给保留工具补文件头或 README。
+
+注意事项：
+
+- 精度对齐阶段仍要保留必要 dump 能力。
+- 删除工具前确认结论已迁移。
+
+测试：
+
+- 默认路径不输出热路径 print。
+- 诊断开关打开时 dump helper 可用。
+
+### 4.8 推荐执行顺序
+
+强制顺序：
+
+1. PR-A：先清理 mixer-specific 历史代码，收窄主线。
+2. PR-B：再抽 shared KV builder，解决 backend 结构问题。
+3. PR-C：再抽 integration 公共模块，解决 FSDP/MCore 反向依赖。
+4. PR-D：再删旧 patch manager，避免前面改动还要同时维护两套 patch。
+
+可并行或后置：
+
+- PR-E 可在 PR-C 后并行推进。
+- PR-F 可在 PR-A/B/C 后推进，避免和前面大范围 import/字段变更冲突。
+- PR-G 可最后推进，因为调试能力在前几轮重构中仍可能用到。
 
 ## Chapter 5：当前结论
 
-本轮修正后的结论：
+当前研究分析已经足以支持进入执行阶段。结论如下。
 
-- 开源首推 verl080 + FSDP + Qwen2.5-0.5B 路线，依赖配置统一，不按模型区分依赖。
+### 5.1 开源路线
+
+- 第一优先级是 verl080 + FSDP + Qwen2.5-0.5B。
+- Megatron/MCore 保留为 advanced/internal path，不作为第一波开源默认路径。
+- NPU/MindSpeed/Megatron-Bridge 保留为后续扩展，不阻塞 FSDP-first。
+- Qwen3.5/3.6 HybridAttention/Gated DeltaNet 不进入当前开源主线。
+
+### 5.2 社区定位
+
 - PrefixSharing 对外应表现为 PrefixGrouper 的 `arbitrary_prefix` 扩展模式。
-- 首批主线只聚焦 attention KV prefix sharing，清掉 Qwen3.5/GDN 专门化设计。
-- `build_kv` 这类公共能力必须从 TorchRef 抽出来。
-- FSDP/MCore 共用 helper 必须进入公共模块。
-- import auto patch 和显式 install 都保留，直到正式合入 verl 后再决定是否下线。
+- 首批 PR 应尽量复用 verl 的 `use_prefix_grouper` 用户心智。
+- 不在 PrefixSharing 主包复刻 PrefixGrouper prompt-only 算法。
+- `prompt_only` 与 `arbitrary_prefix` 必须在配置和代码路径上清晰分流。
+
+### 5.3 技术红线
+
+- 精度一致性优先于性能。
+- Prefix KV store 不能 detach。
+- Prefix-Last Restore 不能删除或弱化。
+- provider-before-reuser 的 store/load 顺序必须保留注释和测试。
+- TP padding slot 不能进入 store 或影响 restore index。
+
+### 5.4 软件工程结论
+
+- `build_kv()` 必须从 TorchRef 抽出，成为 backend 公共能力。
+- FSDP/MCore 公共 helper 必须进入 `verl_utils.py` 或后续细分公共模块。
+- 旧 patch manager 体系应删除，`setup/` 是唯一生产 patch 机制。
+- import auto patch 与显式 install 都保留，直到正式合入 verl 后再决定是否下线。
+- tools 和 diagnostics 需要分级清理，不应一刀切删除。
+
+### 5.5 下一步判断
+
+下一步不应继续扩写方案，而应开始 PR-A 到 PR-D 的代码重构。每个 PR 都以“可 review、可测试、可回滚”为边界。若执行中发现某项改动会改变精度语义，应停止该 PR，把问题拆成独立设计与测试任务。
 
 ## Chapter 6：遗留问题
 
-- 上游 verl 最新 PrefixGrouper schema 与实际调用路径仍需在提交社区 PR 前再次核对。
-- Meituan prefix-tree RFC/PR 后续若进入主线，需要评估我们的 FSDP arbitrary-prefix 路线如何与其配置和语义共存。
+本章记录不阻塞当前重构、但后续必须显式处理的问题。遗留项按主题归类，后续可迁移到 issue 或 pending-items。
+
+### 6.1 上游 verl 与 PrefixGrouper
+
+- 上游 verl 最新 PrefixGrouper schema 需要在社区 PR 前重新核对。
+- 当前 `prefix_grouper.mode=arbitrary_prefix` 是本仓库侧已支持的配置读取；verl 上游 dataclass/schema 是否接受该字段仍需确认。
+- PrefixGrouper prompt-only 主流程调用点需要再次核实，避免社区 PR 接入到未被主流程调用的 helper。
+- 如果社区更倾向 `shared_prefix` 等中性命名，需要准备从 `prefix_grouper.mode` 迁移的兼容方案。
+
+### 6.2 Meituan prefix-tree / verl RFC
+
+- Meituan prefix-tree PR 和 verl RFC 可能进入主线，届时需要评估配置和语义共存。
+- 我们当前 FSDP-first arbitrary-prefix 路线不应提前改成 Magi/block-sparse 方案。
+- 后续可对齐 RFC 的 `prefix_segments` 概念，但不能牺牲现有 provider/reuser plan 的精度语义。
+
+### 6.3 真实环境验证
+
 - FSDP 真实 engine e2e fixture 仍需补强。
-- HybridAttention/Gated DeltaNet 等 mixer-specific 支持应等待训练引擎真实接口稳定后再重新设计。
+- 需要补 baseline、PrefixGrouper prompt-only、PrefixSharing arbitrary-prefix 三方性能对比。
+- 需要固定数据和随机种子，形成可复现的精度对齐脚本。
+- optional GPU/NPU 环境测试不能作为每个本地 PR 的硬门槛，但 release 前必须复跑。
+
+### 6.4 Patch 与 import hook
+
 - import hook 是否长期保留，需要等社区对 monkey patch 方式的反馈后再定。
+- 如果正式合入 verl，显式调用路径可能替代外部包 import auto patch。
+- 当前阶段必须保留 import auto patch，因为脚本化训练仍依赖 `VERL_USE_EXTERNAL_MODULES=prefix_sharing`。
+
+### 6.5 HybridAttention / Gated DeltaNet
+
+- 当前重构清理 Qwen3.5/GDN 专门化代码，不代表永久放弃 HybridAttention。
+- 后续需等待训练引擎侧真实接口稳定，再重新设计 activation/cache_param store。
+- 未来重新引入时，应以实际 mixer 类型命名，避免把 DeltaNet 泛化成所有 linear attention。
+
+### 6.6 Megatron / MCore / NPU
+
+- MCore path 保留 advanced/internal 定位。
+- NPU/MindSpeed/Megatron-Bridge 后续可继续支持，但不能阻塞 FSDP-first 开源主线。
+- 若后续重新提高 Megatron 优先级，需要单独补兼容矩阵、真实环境测试和文档。
+
+### 6.7 tools 与 diagnostics
+
+- tools 清理需要逐项判断，不能批量删除。
+- 保留工具必须补用途说明。
+- 诊断 dump 默认关闭，但精度对齐阶段仍需保留可开启路径。
