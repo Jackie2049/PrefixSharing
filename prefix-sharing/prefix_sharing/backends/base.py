@@ -21,8 +21,6 @@ class BackendCapabilities:
     supports_context_parallel: bool = False
     supports_pipeline_parallel: bool = False
     supports_flash_attention: bool = False
-    supports_gated_attention: bool = False
-    supports_deltanet_state_reuse: bool = False
 
 
 class PrefixAttentionBackend(Protocol):
@@ -49,31 +47,4 @@ class PrefixAttentionBackend(Protocol):
         ...
 
     def attention(self, query: Any, key: Any, value: Any, prefix_sharing_plan: PrefixSharingPlan, **kwargs: Any) -> Any:
-        ...
-
-    def gated_attention(
-        self,
-        query: Any,
-        key: Any,
-        value: Any,
-        gate: Any,
-        prefix_sharing_plan: PrefixSharingPlan,
-        **kwargs: Any,
-    ) -> Any:
-        ...
-
-
-class PrefixDeltanetBackend(Protocol):
-    capabilities: BackendCapabilities
-
-    def build_deltanet_states(
-        self,
-        state_update: Any,
-        store: Any,
-        prefix_sharing_plan: PrefixSharingPlan,
-        *,
-        packed_batch_layout: Any | None = None,
-        layer_id: int,
-        tp_rank: int = 0,
-    ) -> Any:
         ...

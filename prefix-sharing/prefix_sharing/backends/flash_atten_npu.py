@@ -150,8 +150,6 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         supports_cann=True,
         supports_different_q_kv_lengths=True,
         supports_prefix_last_restore=True,
-        supports_gated_attention=False,
-        supports_deltanet_state_reuse=False,
     )
 
     def __init__(self) -> None:

@@ -4,11 +4,9 @@ torch = pytest.importorskip("torch")
 
 from prefix_sharing.core.prefix_store import (
     PREFIX_STATE_TYPE_ATTENTION_KV,
-    PREFIX_STATE_TYPE_DELTANET_STATE,
     PrefixActivationSlotId,
     PrefixActivationStore,
     PrefixAttentionStore,
-    PrefixDeltanetStore,
 )
 
 
@@ -43,29 +41,6 @@ def test_prefix_attention_store_lifecycle_and_isolation():
         store.load(slot_id)
 
 
-def test_prefix_deltanet_store_lifecycle_and_tp_isolation():
-    store = PrefixDeltanetStore()
-    slot_id = PrefixActivationSlotId(1, 2, 3, 4, PREFIX_STATE_TYPE_DELTANET_STATE, 0)
-    recurrent_state = torch.randn(7, 4, requires_grad=True)
-
-    store.store(slot_id, recurrent_state=recurrent_state, prefix_len=7)
-    entry = store.load(slot_id)
-
-    assert entry.recurrent_state is recurrent_state
-    assert entry.prefix_len == 7
-    assert entry.recurrent_state.requires_grad
-
-    other_tp_rank = PrefixActivationSlotId(1, 2, 3, 4, PREFIX_STATE_TYPE_DELTANET_STATE, 1)
-    assert not store.contains(other_tp_rank)
-    with pytest.raises(KeyError):
-        store.store(slot_id, recurrent_state=torch.zeros_like(recurrent_state), prefix_len=7)
-
-    store.close()
-    assert store.closed
-    with pytest.raises(RuntimeError):
-        store.load(slot_id)
-
-
 def test_prefix_activation_store_base_rejects_duplicate_entries():
     store = PrefixActivationStore()
     slot_id = PrefixActivationSlotId(1, 2, 3, 4, "custom_state", 0)
@@ -76,3 +51,21 @@ def test_prefix_activation_store_base_rejects_duplicate_entries():
     assert store.load_entry(slot_id) is entry
     with pytest.raises(KeyError):
         store.store_entry(slot_id, entry=object())
+
+
+def test_prefix_store_public_api_is_attention_kv_only():
+    import prefix_sharing.core as core
+    import prefix_sharing.core.prefix_store as prefix_store
+
+    assert hasattr(core, "PrefixAttentionStore")
+    assert hasattr(core, "StoredAttentionKV")
+    assert hasattr(prefix_store, "PrefixAttentionStore")
+    assert hasattr(prefix_store, "StoredAttentionKV")
+
+    for name in (
+        "PREFIX_STATE_TYPE_DELTANET_STATE",
+        "PrefixDeltanetStore",
+        "StoredDeltanetState",
+    ):
+        assert not hasattr(core, name)
+        assert not hasattr(prefix_store, name)
