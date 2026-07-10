@@ -10,7 +10,6 @@ from prefix_sharing.integrations.patch_manager import PatchManager
 from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreIntegration,
     prefix_sharing_enabled,
-    read_ps_config_from_engine_config,
 )
 from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
 
@@ -142,56 +141,6 @@ def test_prefix_sharing_config_from_raw_accepts_nested_config():
     assert config.enable_prefix_sharing is True
     assert config.min_prefix_len == 4
     assert config.min_group_size == 3
-
-
-def test_read_ps_config_from_engine_config_prefers_explicit_prefix_sharing_config():
-    class EngineConfig:
-        prefix_sharing_config = {"enable_prefix_sharing": False}
-        use_prefix_grouper = True
-        prefix_grouper = {"mode": "arbitrary_prefix", "min_prefix_len": 8}
-
-    raw = read_ps_config_from_engine_config(EngineConfig())
-
-    assert raw == {"enable_prefix_sharing": False}
-
-
-def test_read_ps_config_from_prefix_grouper_prompt_only_disables_prefix_sharing():
-    class EngineConfig:
-        use_prefix_grouper = True
-        prefix_grouper = {"mode": "prompt_only"}
-
-    raw = read_ps_config_from_engine_config(EngineConfig())
-    config = PrefixSharingConfig.from_raw(raw)
-
-    assert config.enable_prefix_sharing is False
-
-
-def test_read_ps_config_from_prefix_grouper_arbitrary_prefix_enables_prefix_sharing():
-    class EngineConfig:
-        use_prefix_grouper = True
-        prefix_grouper = {
-            "mode": "arbitrary_prefix",
-            "min_prefix_len": 8,
-            "min_group_size": 3,
-            "strict": True,
-        }
-
-    raw = read_ps_config_from_engine_config(EngineConfig())
-    config = PrefixSharingConfig.from_raw(raw)
-
-    assert config.enable_prefix_sharing is True
-    assert config.min_prefix_len == 8
-    assert config.min_group_size == 3
-    assert "strict" not in raw
-
-
-def test_read_ps_config_from_prefix_grouper_rejects_unknown_mode():
-    class EngineConfig:
-        use_prefix_grouper = True
-        prefix_grouper = {"mode": "unknown"}
-
-    with pytest.raises(ValueError, match="prefix_grouper.mode"):
-        read_ps_config_from_engine_config(EngineConfig())
 
 
 def test_prefix_sharing_config_from_raw_rejects_legacy_enabled_key():
