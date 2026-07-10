@@ -14,7 +14,7 @@ from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.flash_atten_base import FlashAttentionMixin, FlashBackendValidationError
-from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+from prefix_sharing.backends.kv_builder import apply_rope_with_plan, build_prefix_expanded_kv
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
@@ -40,10 +40,9 @@ def _import_flash_attn_varlen() -> Any:
 class GpuFlashAttentionBackend(FlashAttentionMixin):
     """CUDA/GPU Flash Attention 2 backend.
 
-    ``apply_rope`` and ``build_kv`` are delegated to
-    :class:`TorchReferenceBackend` because RoPE position injection and KV
-    cache store/load are pure PyTorch operations that do not benefit from
-    fused attention kernels.
+    ``apply_rope`` and ``build_kv`` use shared PyTorch helpers because RoPE
+    position injection and KV cache store/load do not benefit from fused
+    attention kernels.
 
     Only ``attention()`` is replaced by the Flash Attention 2 kernel.
     """
@@ -57,9 +56,6 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         supports_prefix_last_restore=True,
         supports_flash_attention=True,
     )
-
-    def __init__(self) -> None:
-        self._torch_ref = TorchReferenceBackend()
 
     # ------------------------------------------------------------------
     # Validation
@@ -79,7 +75,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         prefix_sharing_plan: PrefixSharingPlan,
         **kwargs: Any,
     ) -> tuple[Any, Any]:
-        return self._torch_ref.apply_rope(query, key, prefix_sharing_plan, **kwargs)
+        return apply_rope_with_plan(query, key, prefix_sharing_plan, **kwargs)
 
     def build_kv(
         self,
@@ -93,7 +89,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         tp_rank: int = 0,
         stats: Any | None = None,
     ) -> tuple[Any, Any]:
-        return self._torch_ref.build_kv(
+        return build_prefix_expanded_kv(
             key, value, store, prefix_sharing_plan,
             packed_batch_layout=packed_batch_layout,
             layer_id=layer_id, tp_rank=tp_rank,
