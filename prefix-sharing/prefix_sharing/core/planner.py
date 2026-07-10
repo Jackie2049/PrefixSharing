@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixDetector, PrefixReuseSpec, TriePrefixDetector
+from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 
 
 @dataclass(frozen=True)
@@ -191,36 +191,10 @@ def _cumsum(lengths: Sequence[int]) -> list[int]:
     return values
 
 
-def _can_skip_detection_as_no_sharing(
-    input_ids: Sequence[Sequence[int]],
-    *,
-    min_prefix_len: int,
-    min_group_size: int,
-) -> bool:
-    """Return True when no sequence can meet the detector's prefix threshold.
-
-    A shared prefix of length >= ``min_prefix_len`` requires at least
-    ``min_group_size`` rows with the same first ``min_prefix_len`` tokens.
-    If no such signature bucket exists, running the trie detector cannot
-    produce any reuse relation.
-    """
-
-    signature_counts: dict[tuple[int, ...], int] = {}
-    for sequence in input_ids:
-        if len(sequence) < min_prefix_len:
-            continue
-        signature = tuple(int(token) for token in sequence[:min_prefix_len])
-        count = signature_counts.get(signature, 0) + 1
-        if count >= min_group_size:
-            return False
-        signature_counts[signature] = count
-    return True
-
-
 @dataclass
 class PrefixSharingPlanner:
     config: PrefixSharingConfig
-    detector: PrefixDetector | None = None
+    detector: TriePrefixDetector | None = None
     _micro_batch_counter: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -237,16 +211,6 @@ class PrefixSharingPlanner:
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        if _can_skip_detection_as_no_sharing(
-            input_ids,
-            min_prefix_len=self.config.min_prefix_len,
-            min_group_size=self.config.min_group_size,
-        ):
-            return self._plan_no_sharing(
-                input_ids,
-                forward_id=forward_id,
-                micro_batch_id=micro_batch_id,
-            )
         detection = self.detector.detect(input_ids)
         return self.plan_from_detection(
             input_ids,
@@ -363,47 +327,4 @@ class PrefixSharingPlanner:
             label_keep_ranges=label_keep_ranges,
             loss_mask_keep_ranges=loss_mask_keep_ranges,
             prefix_last_restore=restore_specs,
-        )
-
-    def _plan_no_sharing(
-        self,
-        input_ids: Sequence[Sequence[int]],
-        *,
-        forward_id: int | None = None,
-        micro_batch_id: int | None = None,
-    ) -> PrefixSharingPlan:
-        if forward_id is None:
-            forward_id = next(_forward_ids)
-        if micro_batch_id is None:
-            self._micro_batch_counter += 1
-            micro_batch_id = self._micro_batch_counter
-
-        batch_size = len(input_ids)
-        original_lengths = [len(seq) for seq in input_ids]
-        cu_seqlens = _cumsum(original_lengths)
-        keep_ranges = [(0, length) for length in original_lengths]
-
-        return PrefixSharingPlan(
-            forward_id=forward_id,
-            micro_batch_id=micro_batch_id,
-            batch_size=batch_size,
-            original_lengths=original_lengths,
-            reuse_specs=[],
-            group_ids=[-1] * batch_size,
-            is_provider=[True] * batch_size,
-            provider_index=list(range(batch_size)),
-            prefix_lens=[0] * batch_size,
-            suffix_lens=list(original_lengths),
-            kept_lengths_q=list(original_lengths),
-            expanded_lengths_kv=list(original_lengths),
-            cu_seqlens_q=list(cu_seqlens),
-            cu_seqlens_kv=list(cu_seqlens),
-            max_seqlen_q=max(original_lengths, default=0),
-            max_seqlen_kv=max(original_lengths, default=0),
-            q_position_offsets=[0] * batch_size,
-            kv_position_offsets=[0] * batch_size,
-            input_keep_ranges=list(keep_ranges),
-            label_keep_ranges=list(keep_ranges),
-            loss_mask_keep_ranges=list(keep_ranges),
-            prefix_last_restore=[],
         )
