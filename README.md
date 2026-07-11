@@ -65,23 +65,22 @@ PrefixSharing's prefix tree algorithm for arbitrary prefix reuse.
 
 ### 2.2 Integrating PrefixSharing
 
-Integrating PrefixSharing into verl pipeline is straightforward: the only operation required is to import the package inside verl and setup patch will be installed implicitly.
+Integrating PrefixSharing into verl pipeline is straightforward: import the package inside verl and setup patches will be installed implicitly. By default, PrefixSharing detects the installed training stack and installs all compatible patch sets, so an environment that supports both FSDP and Megatron-LM receives both patches.
 
-verl + FSDP pipeline (recommended):
-
-```python
-import prefix_sharing
-prefix_sharing.setup.install("verl080_fsdp")
-```
-
-verl + Megatron-LM pipeline:
+Default integration:
 
 ```python
 import prefix_sharing
-prefix_sharing.setup.install("verl080_mcore0161_ms0160")
 ```
 
-This activates the patches under `prefix-sharing/setup/`, which use Python's monkey patch to dynamically modify corresponding functions. `dependency/verl_cdd9014f/verl/workers/engine/megatron/transformer_impl.py:1039` provides an example.
+For debugging or narrowing the patch scope, set `PREFIX_SHARING_PATCHSET` before importing PrefixSharing:
+
+```bash
+PREFIX_SHARING_PATCHSET=verl080_fsdp python your_verl_entry.py
+PREFIX_SHARING_PATCHSET=verl080_fsdp,verl080_mcore0161_ms0160 python your_verl_entry.py
+```
+
+Programmatic `prefix_sharing.setup.install(...)` remains available for controlled environments that do not rely on import-time auto activation. This activates the patches under `prefix-sharing/setup/`, which use Python's monkey patch to dynamically modify corresponding functions. `dependency/verl_cdd9014f/verl/workers/engine/megatron/transformer_impl.py:1039` provides an example.
 
 ### 2.3 Run Your First Demo
 

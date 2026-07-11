@@ -49,6 +49,110 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
 
 
+
+def test_default_install_selects_all_matching_patch_sets(monkeypatch):
+    from prefix_sharing.setup import _resolve_patch_set_ids
+    from prefix_sharing.setup.compat_matrix import CompatEntry
+    from prefix_sharing.setup.version_guard import DetectedVersions
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup.COMPAT_MATRIX",
+        [
+            CompatEntry("0.8.0.dev", "*", "*", "verl080_fsdp"),
+            CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
+        ],
+    )
+
+    patch_set_ids = _resolve_patch_set_ids(
+        None,
+        versions=DetectedVersions("0.8.0.dev", "0.16.1", "0.16.0"),
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+def test_default_install_selects_fsdp_only_when_mcore_dependencies_absent(monkeypatch):
+    from prefix_sharing.setup import _resolve_patch_set_ids
+    from prefix_sharing.setup.compat_matrix import CompatEntry
+    from prefix_sharing.setup.version_guard import DetectedVersions
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup.COMPAT_MATRIX",
+        [
+            CompatEntry("0.8.0.dev", "*", "*", "verl080_fsdp"),
+            CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
+        ],
+    )
+
+    patch_set_ids = _resolve_patch_set_ids(
+        None,
+        versions=DetectedVersions("0.8.0.dev", None, None),
+    )
+
+    assert patch_set_ids == ["verl080_fsdp"]
+
+
+def test_explicit_patch_set_accepts_comma_separated_list():
+    from prefix_sharing.setup import _resolve_patch_set_ids
+
+    patch_set_ids = _resolve_patch_set_ids(
+        " verl080_fsdp, verl080_mcore0161_ms0160 ",
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+def test_explicit_patch_set_deduplicates_preserving_order():
+    from prefix_sharing.setup import _resolve_patch_set_ids
+
+    patch_set_ids = _resolve_patch_set_ids(
+        "verl080_fsdp,verl080_fsdp,verl080_mcore0161_ms0160",
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+
+def test_install_loads_all_resolved_patch_sets(monkeypatch):
+    from prefix_sharing.setup import install
+    from prefix_sharing.setup.logged_patch import PatchHandle
+    from prefix_sharing.setup.registry import PatchSpec
+
+    loaded_patch_sets = []
+    installed_specs = []
+
+    def fake_load_patch_set(patch_set_id):
+        loaded_patch_sets.append(patch_set_id)
+        return [
+            PatchSpec(
+                module_name=f"fake.{patch_set_id}",
+                target_getter=lambda module: (module, "target"),
+                patch_factory=lambda original: original,
+                description=f"patch {patch_set_id}",
+            )
+        ]
+
+    def fake_install_specs(specs):
+        installed_specs.extend(specs)
+        return PatchHandle([], specs=list(specs))
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup._resolve_patch_set_ids",
+        lambda patch_set_id: ["verl080_fsdp", "verl080_mcore0161_ms0160"],
+    )
+    monkeypatch.setattr("prefix_sharing.setup._load_patch_set", fake_load_patch_set)
+    monkeypatch.setattr("prefix_sharing.setup.PatchRegistry.install_specs", fake_install_specs)
+
+    handle = install()
+
+    assert loaded_patch_sets == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+    assert [spec.module_name for spec in installed_specs] == [
+        "fake.verl080_fsdp",
+        "fake.verl080_mcore0161_ms0160",
+    ]
+    assert handle.describe().startswith("PatchHandle")
+
+
 def test_prefix_sharing_config_from_raw_accepts_nested_config():
     config = PrefixSharingConfig.from_raw(
         {

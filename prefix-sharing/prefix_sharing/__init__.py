@@ -52,15 +52,14 @@ _patch_handle = None  # module-level reference for introspection / rollback
 def _auto_install_patches() -> None:
     """Install monkey patches on import.
 
-    Patch set selection order (first match wins):
+    Patch set selection order:
 
-    1. ``PREFIX_SHARING_PATCHSET`` env var — explicit patch set id (e.g.
-       ``verl080_fsdp``). Recommended for environments that install multiple
-       backends (Megatron + FSDP) where auto-detection would be ambiguous.
-       Aligns with docs/feature-fsdp.md §4.6.1 guidance.
-    2. Compat matrix auto-detection — picks a patch set based on detected
-       verl / megatron-core / mindspeed versions. Default path when no env
-       var is set.
+    1. ``PREFIX_SHARING_PATCHSET`` env var — explicit patch set id(s), e.g.
+       ``verl080_fsdp`` or ``verl080_fsdp,verl080_mcore0161_ms0160``. This is
+       intended for debugging or narrowing patch scope.
+    2. Compat matrix auto-detection — installs all patch sets matching the
+       detected verl / megatron-core / mindspeed versions. Default path when no
+       env var is set.
 
     Each patch wrapper checks the runtime switch (PrefixSharingConfig.from_raw,
     which respects both config file and env var) — when disabled, the wrapper

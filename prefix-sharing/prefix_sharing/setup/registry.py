@@ -40,11 +40,19 @@ class PatchRegistry:
 
     @classmethod
     def register(cls, spec: PatchSpec) -> None:
+        key = _spec_key(spec)
+        if any(_spec_key(existing) == key for existing in cls._specs):
+            return
         cls._specs.append(spec)
 
     @classmethod
     def install_all(cls) -> PatchHandle:
-        """应用所有已注册的 patch。
+        """应用所有已注册的 patch。"""
+        return cls.install_specs(cls._specs)
+
+    @classmethod
+    def install_specs(cls, specs: list[PatchSpec]) -> PatchHandle:
+        """应用给定 patch specs，不污染全局注册表。
 
         三种情况：
         1. 模块已加载且目标可解析 → 立即 patch
@@ -54,11 +62,12 @@ class PatchRegistry:
         所有 pending 最终统一由 import hook 处理。
         import hook 在模块加载完成后才尝试解析目标，确保类定义已完成。
         """
+        specs = _dedupe_specs(specs)
         shared_records: list[PatchRecord] = []
         mgr = LoggedPatchManager(shared_records)
         pending: list[PatchSpec] = []
 
-        for spec in cls._specs:
+        for spec in specs:
             module = sys.modules.get(spec.module_name)
             if module is None and spec.eager:
                 # Lazy-load 目标模块（如 verl FSDP engine），立即 patch，避免依赖
@@ -97,12 +106,28 @@ class PatchRegistry:
             else:
                 pending.append(spec)
 
-        handle = PatchHandle(shared_records, specs=list(cls._specs))
+        handle = PatchHandle(shared_records, specs=list(specs))
 
         if pending:
             _activate_import_hook(pending, shared_records)
 
         return handle
+
+
+def _spec_key(spec: PatchSpec) -> tuple[str, str]:
+    return spec.module_name, spec.description
+
+
+def _dedupe_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
+    seen: set[tuple[str, str]] = set()
+    result: list[PatchSpec] = []
+    for spec in specs:
+        key = _spec_key(spec)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(spec)
+    return result
 
 
 _original_import = None
