@@ -27,7 +27,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
             if (
-                _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+                diagnostic_dump_enabled()
                 and hasattr(self, "prepare_model_inputs")
                 and hasattr(self, "prepare_model_outputs")
             ):
