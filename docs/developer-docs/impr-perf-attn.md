@@ -104,7 +104,7 @@ PrefixSharingPlanner.plan()
      - 存入 store: store.store(slot_id, key_tensor=expanded_key_row, value_tensor=expanded_value_row, prefix_len=valid_length)
   4. 如果 row 是 reuser (plan.is_reuser(i)):
      - 从 store 加载 provider: entry = store.load(provider_slot_id)
-     - 复制 prefix: expanded_key_row[:prefix_len] = entry.key_tensor[:prefix_len].clone()
+     - 复制 prefix: expanded_key_row[:prefix_len].copy_(entry.key_tensor[:prefix_len])
      - 复制 suffix: expanded_key_row[prefix_len:] = key_row[:suffix_len]
      - expanded_value_row 同理
      - 重新发布（支持 transitive reuse）:
@@ -115,7 +115,9 @@ PrefixSharingPlanner.plan()
 
 **关键观察**：
 - Store 中的张量**never detach()**，保持 autograd graph 连续性，保证梯度流经共享 prefix KV
-- Reuser 的 KV = provider prefix KV **clone + detach** + suffix KV，实际上 prefix KV 在物理上复制了
+- Reuser 的 KV = prefix KV copy_ + suffix KV copy_，物理上 prefix KV 在 expanded KV 中复制了一份
+- grad 回流路径：`copy_()` 保证 gradient 从 expanded KV 传回 provider prefix KV：
+  `expanded_key[:prefix_len].grad → entry.key_tensor[:prefix_len].grad`，**gradient 没有断开**
 - transitive reuse：链式场景下，一个 reuser 的 expanded KV 可以被后续 reuser 引用作为新的 provider
 
 **GPU FA backend 调用链**（`flash_atten_gpu.py`）：
@@ -231,7 +233,7 @@ reuser:   entry = store.load(...)    # 加载 provider 的 KV
 **在 mask 方案中的角色**：如果采用"去重扁平布局即 provider prefix KV + reuser suffix KV 物理上只存一份"的布局：
 
 1. **无需 store**：provider prefix KV 和 reuser suffix KV 直接在 flattened Q/KV 张量中连续排列，不需要跨 layer 的 store/load 操作
-2. **无 tensor 复制**：不再需要 `entry.key_tensor[:prefix_len].clone()` — prefix KV 就是扁平张量的第一个 segment
+2. **无 tensor 复制**：不再需要 `copy_()` 操作 — prefix KV 就是扁平张量的第一个 segment
 3. **restore 路径保留**：`PrefixLastRestoreSpec` 仍然需要，但实现简化 — restored logprob 直接来自 flattened Q 输出中的对应位置
 
 **例外——多级树（chain）场景**：对于 transitive reuse（reuser B 引用 reuser A 的 expanded KV），如果采用纯扁平布局，则需要 chain 的每个中间节点仍然存一份 KV 供下游引用。此时 store 可能仍然需要，但不再是物理复制。
