@@ -1013,9 +1013,59 @@ MCTS 中每个搜索节点产生多个 rollouts（child 节点），这些 child
 
 #### 3.7.4 DualKV (arXiv 2605.15422)
 
-**团队**：亚马逊。直接在 FA2 kernel 层面修改，实现共享前缀的 KV cache 原子累加。
-**声称性能**：1.63x-3.82x 加速比。
-**与前缀复用的关系**：kernel 层面的 prefix sharing，与 PrefixGrouper（Python 层面）和 DTA（引擎层面）是不同抽象层次的方案。
+**团队**：亚马逊（Jiading Gai, Shuai Zhang, Xiang Song, Bernie Wang, George Karypis）
+
+**方案概述**：DualKV 修改 FlashAttention-2 的 CUDA kernel，在 kernel 内部将 Q/KV 分为两个物理区域——共享 context（prompt，只存 1 份）和 per-sequence decoded（response，N 份），在一个 kernel launch 内完成全部 attention 计算。同时配合 veRL 数据管线的 repacking 优化，micro-batch 从 `N(P+R)` tokens 减少到 `P + NR` tokens，使得**全部 per-token 运算**（layer norm、QKV projection、MLP、attention）都受益于 token 数减少——这是 DualKV 区别于其他方案的关键。
+
+**核心代码分析**（代码仓库 [amazon-science/dualkv-flash-attn-for-rl](https://github.com/amazon-science/dualkv-flash-attn-for-rl)，CC-BY-NC-4.0）：
+
+核心改动在 FA2 源码中添加两个 CUDA kernel 头文件：
+- `flash_fwd_kernel_dualkv_training.h`（477 行）：前向 kernel。在 `compute_attn_1rowblock` 基础上，将 KV 分为 context 块（单 batch，`kcontext_ptr`）和 decoded 块（per-sequence varlen，`kdecoded_ptr` + `cu_seqlens_k_decoded`），物理块布局为 `blocks[0..n_blocks_ctx-1] = context, blocks[n_blocks_ctx..] = decoded`，逻辑 KV position 相应偏移 `context_seqlen`。
+- `flash_bwd_kernel_dualkv_training.h`（733 行）：反向 kernel。对应策略实现梯度回传，原子累加 context 的梯度。
+
+针对 hdim=64/96/128/192/256、fp16/bf16、causal/non-causal、sm80 共编译 40 个 `.cu` 实例。
+
+veRL 集成在 `monkey_patch.py` 中新增 `_make_dualkv_flash_wrapper`（约 80 行）：拦截 `dualkv_context` kwarg，调用 `flash_attn_dualkv_varlen_func`。同时整合了 varlen context attention（`flash_attn_varlen_func` 计算 prompt 自注意力）+ DualKV 计算 decoded attention。支持 Ulysses SP 时 pre-attention all-to-all 再走 DualKV。
+
+实验脚本 4 个（`reproduce_table1.py` 263 行 kernel 级微基准、`reproduce_table2.py` 497 行 end-to-end 基准、`benchmark_qwen3_single_step.py`/`benchmark_qwen3_update_policy.py` 为单步和完整 policy update 评测）。
+
+**与现有方案的本质差异**：
+
+| 维度 | DualKV | PrefixGrouper / PrefixSharing |
+|------|--------|-------------------------------|
+| 抽象层次 | CUDA kernel 级（FA2 内部） | Python 级（attention 操作/布局） |
+| 共享范围 | 全部 per-token 运算（因 repacking 减少输入 token） | 仅 attention 层（Q/KV 形状变化） |
+| varlen 兼容 | 原生（context batch=1 + decoded varlen） | 原生（cu_seqlens_q ≠ cu_seqlens_kv） |
+| token 缩减率 | N(P+R) → P+NR（全模型受益） | N(P+R) → P+NR（仅 attention 层） |
+| 许可 | CC-BY-NC-4.0（非商用） | Apache 2.0 / MIT |
+| 硬件 | 仅 H100/A100（sm80+） | 跨平台（含 NPU） |
+
+**性能数据**：
+
+| 配置 | 加速比 | MFU 变化 |
+|------|--------|---------|
+| Qwen3-8B GRPO N=32, 8K ctx, 8×H100 | 1.63-2.09× policy-update | 36% → 76% |
+| DAPO 同配置 | 2.47× policy-update | → 77% |
+| 30B MoE 16×H100 | 3.82× policy-update, 3.38× end-to-end | — |
+| kernel-only fwd (FA2 vs DualKV) | 最大 6.2× | — |
+
+**优缺点分析**：
+
+**优点**：
+1. **下沉到 kernel 级**：优化路径最短，彻底消除 attention 内的 prefix 冗余计算
+2. **repacking 惠及全模型**：不是只缩减 attention 的 Q/KV 形状，而是减少输入 token 总数——layer norm、projection、MLP 的计算量都等比例减少
+3. **MFU 提升显著**：36% → 76%+，说明之前大多数 FLOPs 浪费在重复 prompt 计算上
+4. **支持 Ulysses SP**：集成 verl 的 all-to-all 序列并行
+5. **数学严格等价**：无近似
+
+**缺点**：
+1. **kernel 编译依赖**：非 pip 即用，需显卡匹配（sm80+），不支持 NPU 或 Apple Silicon
+2. **kernel 版本绑定**：基于 FA2，不兼容 FA3/FA4；kernel 接口变化导致维护成本
+3. **非商用许可**：CC-BY-NC-4.0 限制商业使用（预计用于研究验证）
+4. **仅支持扁平 GRPO 结构**：不支持多级树（N 个 response 共享一个 prompt），与 Trie 树方案（DTA/RFC #6401）不直接兼容
+5. **缺失 SP 下 backward 支持**：当前 verl 集成仅 DualKV forward 支持 SP，backward 未覆盖
+
+**在分类框架中的位置**：kernel 层 prefix sharing，与 attention 层（PrefixGrouper/流 C/流 D）、引擎层（DTA/流 B）处于不同抽象层次。与流 C/D/E 正交，理论上可在 attention 层优化基础上叠加使用。
 
 ## 4. 算法分类与抽象层次
 

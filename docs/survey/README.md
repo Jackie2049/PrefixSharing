@@ -12,6 +12,7 @@
 | ⭐⭐⭐ | DTA (蚂蚁) | 蚂蚁/AReaL | 同 issue #6401 | [code/](dta_areal/code/) (feat/dta branch) | Trie 树 DFS 序列化 + Pop/Push 栈式 KV cache + chunked backward | 同关注 RL 前缀复用、attention 层优化 | 他们走独立前缀复用调度器（1,406 行），DTA 模式下平行化走 ZeRO-1（朴素 DP），FSDP/Megatron 尚未适配 |
 | ⭐⭐⭐ | Prefix Sharing (快手) | 快手/Kwai | [arxiv 2511.00413](prefix-sharing_kuaishou/paper.pdf) | [code/](dynamic-tree-attn_kuaishou/code/) | Trie 树 + Pop/Push 栈式 KV cache + 梯度注入 chunked backward | 同前缀复用目标，同支持多 response 共享 prefix KV | 他们 Trie 栈可灵活弹出分叉部分，但梯度 2-10% 偏差；我们扁平 packed 精确等价 |
 | ⭐⭐ | Forge (MiniMax) | MiniMax | — | 闭源（见 [README](minimax/README.md)） | Prefix Tree Merging + MagiAttention + CISPO 算法 | 同关注 RL 训练前缀树合并（inspire RFC #6401） | 闭源专有，40x 加速无法验证；我们是开源软件栈 |
+| ⭐⭐ | DualKV | 亚马逊 | [arXiv 2605.15422](dualkv/README.md) | [code/](dualkv/code/) | 修改 FA2 kernel 实现共享 prompt 的 KV 原子累加 | 同为 RL 训练 prefix 冗余消除，数学严格等价 | kernel 层面实现，FA2 绑定（sm80+），非商用许可；我们是 Python 层面，跨硬件 |
 | ⭐⭐ | MagiAttention | SandAI | 无独立论文 | [SandAI-org/MagiAttention](https://github.com/SandAI-org/MagiAttention) | Chunk-level CP sharding + dispatch solver workload 均衡 | 同关注 tree layout 下 attention 效率，互为上下游 | 他们解决分布式执行层 workload 均衡；我们解决算法层的 prefix sharing |
 | ⭐⭐ | TreeRL | — | [arxiv 2506.11902](treerl/paper.pdf) | 无公开代码 | on-policy tree search + 前缀共享到分支点 | 同关注 RL 训练中前缀重复计算的冗余问题 | 他们搜索树层面（MCTS 训练框架）；我们是 attention 计算层面 |
 | ⭐ | rStar-Math | Microsoft | [arxiv 2501.04519](rstar-math/paper.pdf) | [microsoft/rStar](https://github.com/microsoft/rStar) | MCTS 深度思考 → 天然前缀共享树 | 同涉及前缀复用概念 | MCTS 推理框架，前缀共享是自然产物；我们是显式的训练阶段 attention 优化 |

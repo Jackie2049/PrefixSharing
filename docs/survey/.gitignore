@@ -1,3 +1,5 @@
 # 代码仓库太大，不纳入 git 管理
 code/
 code_verl/
+**/code/
+**/code_kernel/
