@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from prefix_sharing.diagnostics import diagnostic_dump_enabled
+
 from typing import Any
 
 
@@ -59,8 +61,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             # wrapper 在 forward 返回后 dump output + 入参 rotary_pos_emb 解包出 angle table，
             # 语义等价（唯一拿不到的是 rope_emb rotated q/k，在 forward 内部，但 rope_freqs
             # angle table 已够验证 RoPE）。
-            import os as _os
-            if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            if diagnostic_dump_enabled() is not None:
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs_off,
                 )

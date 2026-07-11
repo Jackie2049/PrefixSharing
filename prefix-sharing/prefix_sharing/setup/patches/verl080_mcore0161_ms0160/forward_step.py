@@ -8,6 +8,8 @@ thin wrapper：消费 batch → 读 config → 构建状态 → 设 context → 
 
 from __future__ import annotations
 
+from prefix_sharing.diagnostics import diagnostic_dump_enabled
+
 from typing import Any
 
 
@@ -122,8 +124,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         # ON: prefix_lens / original_lengths 取自 plan；
         # OFF: prefix_lens 全0、original_lengths 从 input_ids NestedTensor offsets diff 推。
         # cu_seqlens 取送进 forward 的 input_ids NestedTensor offsets（ON=裁剪后 packed 边界, OFF=完整）。
-        import os as _os
-        if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        if diagnostic_dump_enabled() is not None:
             from prefix_sharing.tools.diagnostic_dump_verl080 import (
                 dump_meta_verl080,
                 dump_attention_mask_verl080, dump_label_mask_verl080,
@@ -223,8 +224,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
             # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
             # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
-            import os as _os2
-            if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            if diagnostic_dump_enabled() is not None:
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
                     nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
                 )

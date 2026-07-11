@@ -9,6 +9,8 @@ PrefixSharing runtime，并在输出阶段做 interior / prefix-last restore。
 
 from __future__ import annotations
 
+from prefix_sharing.diagnostics import diagnostic_dump_enabled
+
 from typing import Any
 
 
@@ -22,8 +24,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
-            import os as _os_diag_off
-
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
             if (
@@ -163,8 +163,7 @@ def _forward_step_with_engine_prepare(
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
 
-    import os as _os_diag
-    if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+    if diagnostic_dump_enabled() is not None:
         from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_on_metadata_verl080
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
@@ -180,8 +179,7 @@ def _forward_step_with_engine_prepare(
     )
     with prefix_sharing_runtime_context(ps_state), autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
-        import os as _os_logits_on
-        if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        if diagnostic_dump_enabled() is not None:
             from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
 
             dump_raw_logits_verl080(raw_output)
