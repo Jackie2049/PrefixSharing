@@ -1444,7 +1444,7 @@ module_end_to_end_ms
 
 | 环境 / model | case | dtype | mode pair | packed token / position gate | restore logprob | loss | parameter grad rel-L2 / cosine | post-update parameter rel-L2 | 结论 |
 |---|---|---|---|---|---|---:|---|---|---|
-| 待回填 |  |  |  |  |  |  |  |  |  |
+| 2026-07-12 / 91de10fd / env-termius A100 sm80 | skipped — 需 Codex 完成 minimal Flex backend + FSDP patch，并集成 PrefixSharingFSDPAttentionRuntime | — | — | — | — | ❌ 不满足测试条件：PoC-2E 需要（1）Codex 的最小 Flex backend + FSDP patch（包含 use_remove_padding hook 替换）；（2）真实的 FSDP world_size=1 环境集成（非手工提取 layer-0 QKV）。文档 §2.2.6 明确写"此项在 Codex 完成最小 experimental Flex backend 和 FSDP patch 后执行"。第一阶段手工 PoC-D 已验证 attention-level 替换可行性，但完整 FSDP restore/loss/gradient 需 Codex 集成后验证。 |
 
 #### 2.2.7 PoC-2F：最小 verl actor 生命周期（后置 gate）
 
@@ -1491,9 +1491,33 @@ ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后�
 
 | 日期 / commit / 环境 | 2A 精度 | 2B block metadata | 2C 三路径性能/HBM | 2D lifecycle | 2E FSDP restore | 2F actor lifecycle | 第二阶段结论 |
 |---|---|---|---|---|---|---|---|
-| 待回填 |  |  |  |  |  |  |  |
+| 2026-07-12 / 91de10fd / env-termius | ✅ bf16 三路径等价（cos≈1.0）；fp32 expanded FA blocked 因 flash_attn 不支持fp32 | ✅ from_kv_blocks 可用；sched/logical 正确统计；第一阶段 <1 为误报 | ✅ Flex ~18ms 固定开销 vs FA ~1ms；KV 零冗余（最高 4.8x）；no-sharing fallback 必要 | ✅ 24层共用1 BlockMask；55% cache hit；同shape复用 | ❌ blocked：需 Codex minimal backend + FSDP patch（文档§2.2.6） | ❌ blocked：后置 gate，需 Codex 完成 Flex backend 集成后（文档§2.2.7） | Flex 首版技术路线可行，KF 零冗余和精度已验证。性能差距（~18ms overhead）在长序列高共享场景可被 KV 节省覆盖。方案设计中需包含 fallback 阈值和 metadata cache 策略。 |
 
-**阶段总结（待回填）**
+**阶段总结**
+
+### 已完成实验
+
+| PoC | 结论 | 对方案设计的影响 |
+|---|---|---|
+| **PoC-2A** 三路径精度 | bf16 下 expanded FA、dense oracle、Flex 三者输出等价（cos≈1.0，差异仅 1 bf16 bit） | 精度契约满足；fp32 验证因 flash_attn 限制用 SDPA oracle 替代 |
+| **PoC-2B** BlockMask 真实调度 | `from_kv_blocks` API 可用；`kv_num_blocks.sum()` 是真实调度量；第一阶段统计方法有误 | generic mask_mod 路径精度正确即支持首版；direct metadata 可作为优化候选 |
+| **PoC-2C** 三路径 HBM/速度 | FLEx ~18ms 固定开销（BlockMask ~8ms + attention ~10ms），FA ~1ms；KV 零冗余最高 4.8x | 需要 fallback 阈值（T<1000 或 压缩率<50%）；长序列高共享是唯一适用场景 |
+| **PoC-2D** metadata lifecycle | 24 层共用 1 个 BlockMask，无 per-layer 重建；同 shape 70% 缓存命中 | architecture 方向确认：BM 构建放在 micro-batch level，所有 layer 共享 |
+
+### 未完成实验（不满足测试条件）
+
+| PoC | 原因 |
+|---|---|
+| **PoC-2E** FSDP remove-padding + restore | 需要 Codex 完成 minimal experimental Flex backend + FSDP patch（文档 §2.2.6 明确标注"此项在 Codex 完成后执行"）。当前环境仅有 prefix-sharing 包 + Qwen2.5-0.5B，缺少 FSDP integration 和 restore 逻辑。第一阶段 PoC-D 已验证 attention-level 替换可行性。 |
+| **PoC-2F** minim verl actor lifecycle | 后置 gate（文档 §2.2.7），需要 real verl actor 生命周期（old_log_prob → ref_log_prob → actor update）。依赖 PoC-2E 先完成。可移至 Chapter 5 开发阶段并行。 |
+
+### 对 Chapter 3 方案设计的输入
+
+1. **Flex 首版 backend 选型**：精度通过，KV 零冗余验证，可进入方案设计。
+2. **Fallback 策略**：no-sharing 直走原生 FA；短序列（T<1000）或低压缩率（<50%）走 expanded FA。
+3. **BlockMask 构建**：micro-batch level，所有 layer 共享；cache 按 tree signature key。
+4. **Magi**：A100 sm80 上仅 Triton dispatch 路径可用，不投入 perf 优化；等待 H100/H200。
+5. **FP32 精度验证**：flash_attn 不支持 fp32，若需要可走 SDPA 路径（与文档要求有偏差，但 Flex 的 fp32 vs oracle 已验证通过）。
 
 ```text
 实际执行命令索引：
