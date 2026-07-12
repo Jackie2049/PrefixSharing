@@ -687,9 +687,13 @@ sharing detected，复用率和 block 利用率达到阈值
 
 本章是交给 GPU/NPU 环境执行者的实验协议。它的目的不是在这一轮完成正式 backend 开发，而是用可复现的证据敲定后续 FlexAttention 方案的边界：精度能否守住、KV 是否真正零冗余、BlockMask 是否会抵消收益、以及 Magi FFA 是否值得进入下一阶段。
 
-### 2.1 实验原则、范围与产物
+### 2.1 第一阶段 PoC（已完成）
 
-#### 2.1.1 实验范围
+第一阶段完成了 Flex 在 A100 / PyTorch 2.6.0 环境下的语义可行性、去重 Q/K/V 物理形态、generic `BlockMask` 基础行为和单层 FSDP attention 替换探索。其原始实验指引、命令、结果和历史结论完整保留在本节；其中未完成三路径 FA 对照、目标版本验证和完整训练精度闭环的部分，由第二阶段专门补齐，不能用第一阶段的单路径观测替代。
+
+#### 2.1.1 实验原则、范围与产物
+
+##### 2.1.1.1 实验范围
 
 本轮只验证 attention backend 及其最薄的 PrefixSharing QKV 接入面。所有性能结论必须明确所属层级：
 
@@ -702,7 +706,7 @@ sharing detected，复用率和 block 利用率达到阈值
 
 首轮不测试 NPU；PyTorch FlexAttention 是 CUDA/Triton 路线，NPU 的 FA/build-kv 路径不应被拿来与它做 backend 横向归因。也不测试 CP、Ulysses SP、Magi distributed dispatch 或 activation checkpointing 的性能；它们留给完成 Flex FSDP 基线后的专门阶段。
 
-#### 2.1.2 必须固定的比较对象
+##### 2.1.1.2 必须固定的比较对象
 
 所有数据集、Q/K/V 随机种子、dtype、head shape、warm-up 和 iteration 数都必须一致。至少比较下列三条路径，不能只比较 Flex 与原生 FA：
 
@@ -714,23 +718,23 @@ sharing detected，复用率和 block 利用率达到阈值
 
 其中 `ps_on_expanded_fa` 与 `ps_on_dedup_flex` 都必须使用同一个 `PrefixSharingPlan`。否则 token 去重比例不同，任何速度或 HBM 差异都没有解释力。若 `flash-attn` 在目标环境不可用，允许先用 SDPA reference 完成精度门槛，但不得把该结果写成 FA 性能比较。
 
-#### 2.1.3 结果回填规则与最小记录字段
+##### 2.1.1.3 结果回填规则与最小记录字段
 
-**`docs/developer-docs/impr-perf_attention.md` 是本轮 PoC 唯一的正式结果载体。** ClaudeCode 不应把 `preflight.json`、`semantic.jsonl`、`attention_perf.jsonl` 等散落在临时目录后只在聊天中概述；每一组实验完成后，直接回填本章 2.10 对应的小节、表格和结论。这样硬件环境、命令、原始关键数字、失败原因和技术决策始终在同一份可 review 的文档中，形式与 `impr-perf.md` 的历轮实验一致。
+**`docs/developer-docs/impr-perf_attention.md` 是本轮 PoC 唯一的正式结果载体。** ClaudeCode 不应把 `preflight.json`、`semantic.jsonl`、`attention_perf.jsonl` 等散落在临时目录后只在聊天中概述；每一组实验完成后，直接回填本章 2.1.10 或 2.2 对应的小节、表格和结论。这样硬件环境、命令、原始关键数字、失败原因和技术决策始终在同一份可 review 的文档中，形式与 `impr-perf.md` 的历轮实验一致。
 
 临时 JSON/JSONL、profiler trace 或完整 traceback 可以在服务器用于解析和排障，但它们只是中间产物：
 
-1. 在 2.10.1 追加环境行，并在表格下的“执行记录”代码块粘贴 preflight 的完整输出和实际命令；
-2. 精度/梯度结果逐 case 回填 2.10.2，BlockMask/dynamic-shape 回填 2.10.3，attention/HBM 回填 2.10.4；
-3. FSDP 与 Magi 的成功、skip 或失败均回填 2.10.5，不能把“不具备 Magi 环境”静默省略；
+1. 在 2.1.10.1 追加环境行，并在表格下的“执行记录”代码块粘贴 preflight 的完整输出和实际命令；
+2. 精度/梯度结果逐 case 回填 2.1.10.2，BlockMask/dynamic-shape 回填 2.1.10.3，attention/HBM 回填 2.1.10.4；
+3. FSDP 与 Magi 的成功、skip 或失败均回填 2.1.10.5，不能把“不具备 Magi 环境”静默省略；
 4. 每张表后的两三句结论必须解释数据对 Flex 默认启用、fallback 或 Magi P1 的影响；
 5. 遇到失败，在相应表格后保留精简 traceback、最小复现参数与准确命令。超大 trace 可暂留服务器，但文档必须说明保存位置和不回填全文的原因。
 
 每条回填记录至少包含：`git_commit`、`hostname`、`gpu_name`、`compute_capability`、`driver`、`cuda_runtime`、`torch_version`、`flash_attn_version`、`magi_version`、`case`、`mode`、`dtype`、`q_heads`、`kv_heads`、`head_dim`、`original_tokens`、`dedup_tokens`、`expanded_kv_tokens`、`warmup`、`iterations`、`result`。性能记录再写入 `p50_ms`、`p90_ms`、`peak_allocated_mb`、`peak_reserved_mb`；精度记录写入 `max_abs`、`mean_abs`、`max_rel`、`loss_abs`、`grad_max_abs`、`finite`。
 
-### 2.2 预检：先确认实验解释成立
+#### 2.1.2 预检：先确认实验解释成立
 
-#### 2.2.1 GPU/FlexAttention 预检
+##### 2.1.2.1 GPU/FlexAttention 预检
 
 在目标服务器、目标 verl 环境、仓库根目录执行。不要在本机 CPU 环境把 import 成功当作 GPU 结论。
 
@@ -774,26 +778,26 @@ print(json.dumps(result, indent=2, sort_keys=True))
 PY
 ```
 
-将输出原样粘贴到 2.10.1 的“执行记录”代码块，并把主要字段填入环境表。Flex 首版的有效前提是 CUDA 可用、`torch.nn.attention.flex_attention` 可导入，且目标 verl 环境的 `torch` 是计划接入时实际会使用的版本。`torch==2.9.1` 是当前 verl 快照的目标版本；若服务器版本不同，可以做探索性实验，但必须标注为“非首版目标环境”，不能替代最终验收。
+将输出原样粘贴到 2.1.10.1 的“执行记录”代码块，并把主要字段填入环境表。Flex 首版的有效前提是 CUDA 可用、`torch.nn.attention.flex_attention` 可导入，且目标 verl 环境的 `torch` 是计划接入时实际会使用的版本。`torch==2.9.1` 是当前 verl 快照的目标版本；若服务器版本不同，可以做探索性实验，但必须标注为“非首版目标环境”，不能替代最终验收。
 
 本地研究环境已验证 `torch==2.8.0` 的 CPU build 可以导入 `flex_attention`、`create_block_mask` 和 `BlockMask.from_kv_blocks`，并能运行一个普通 causal smoke test；它只证明 API 基本可用，不能证明 GPU kernel 性能或显存。
 
-#### 2.2.2 MagiAttention 条件预检
+##### 2.1.2.2 MagiAttention 条件预检
 
-Magi 是可选对照，不是 Flex 首版依赖。只在下面条件成立时做 2.8：
+Magi 是可选对照，不是 Flex 首版依赖。只在下面条件成立时做 2.1.8：
 
 1. 有单卡 CUDA GPU，优先 H100/H200；
 2. 能创建**独立**环境，不污染 verl/PyTorch/flash-attn 运行环境；
 3. 按 MagiAttention `529fb0a` 的安装文档完成其依赖检查；
 4. 安装后其官方 quickstart 的单卡 FFA 调用先通过。
 
-Ampere（例如 A100）在该版本需要额外的 `flash_attn_cute`/FFA_FA 路线，且官方已提示 CUDA 版本低于 13 时可能需要显式允许并可能明显降速；4090/Ada 的 PrefixSharing FFA 支持未在本次资料中得到充分验证。A16、4090 或 A100 不满足官方安装/架构条件时，在 2.10.5 写入一条 `skipped` 记录和完整预检信息即可，**不升级或替换 verl 的依赖来强行完成 PoC**。
+Ampere（例如 A100）在该版本需要额外的 `flash_attn_cute`/FFA_FA 路线，且官方已提示 CUDA 版本低于 13 时可能需要显式允许并可能明显降速；4090/Ada 的 PrefixSharing FFA 支持未在本次资料中得到充分验证。A16、4090 或 A100 不满足官方安装/架构条件时，在 2.1.10.5 写入一条 `skipped` 记录和完整预检信息即可，**不升级或替换 verl 的依赖来强行完成 PoC**。
 
-建议流程：先使用 Magi 官方仓库和 commit `529fb0a` 的安装说明、quickstart 完成独立 smoke；只有该 smoke 成功后，才把本章 2.4 的相同 slices 映射给 FFA。此轮只测试 CP=1 的 FFA kernel，不调用 `dispatch()`、`undispatch()`，不评估完整 distributed runtime。
+建议流程：先使用 Magi 官方仓库和 commit `529fb0a` 的安装说明、quickstart 完成独立 smoke；只有该 smoke 成功后，才把本章 2.1.4 的相同 slices 映射给 FFA。此轮只测试 CP=1 的 FFA kernel，不调用 `dispatch()`、`undispatch()`，不评估完整 distributed runtime。
 
-### 2.3 统一 workload 与计数口径
+#### 2.1.3 统一 workload 与计数口径
 
-#### 2.3.1 必测拓扑
+##### 2.1.3.1 必测拓扑
 
 所有拓扑由 `PrefixSharingPlanner` 生成 plan，禁止手写一个与 planner 不同的 mask 后只测 kernel。每个 case 要同时写出 `original_tokens`、`dedup_tokens=sum(plan.kept_lengths_q)`、`expanded_kv_tokens=sum(plan.expanded_lengths_kv)`、tree depth 和 segment 数。
 
@@ -816,7 +820,7 @@ Ampere（例如 A100）在该版本需要额外的 `flash_attn_cute`/FFA_FA 路�
 
 精度先用 `float32` 与 `dropout_p=0`；GPU 性能再使用目标训练的 `bfloat16`。在 bf16 下，所有路径必须采用相同的 scaling、RoPE、dropout 和 causal 约定。没有设置固定 seed 或仍开启 dropout 的输出逐元素差异，不能被解释为 backend 精度问题。
 
-#### 2.3.2 四类 token/算力指标不能混用
+##### 2.1.3.2 四类 token/算力指标不能混用
 
 ```text
 original_tokens       = PS=OFF 进入模型的 token 总数
@@ -828,9 +832,9 @@ scheduled_block_pairs = Flex/Magi 实际调度的 tile 覆盖面积
 
 `dedup_tokens < original_tokens` 才是全模型 projection/MLP 显存与计算节省的来源；`expanded_kv_tokens - dedup_tokens` 是当前 build_kv 引入的 KV 冗余；`scheduled_block_pairs / logical_pairs` 则衡量稀疏 tile 对 attention 算力的放大。报告时必须同时给出这些数字，不能把“token 节省”误写成“attention FLOPs 节省”。
 
-### 2.4 PoC-A：树形 mask、Flex 与当前实现的精度契约
+#### 2.1.4 PoC-A：树形 mask、Flex 与当前实现的精度契约
 
-#### 2.4.1 参考实现与被测实现
+##### 2.1.4.1 参考实现与被测实现
 
 对每个小型 case，使用同一份 planner 输出构造两条数学等价的路径：
 
@@ -856,13 +860,13 @@ candidate 的可见性必须满足：同一 node 内 `K_position <= Q_position`�
 
 验收不是要求不同 kernel bitwise identical，而是要求无 NaN/Inf，fp32 的差异与 dense SDPA 数值误差同量级，并且 bf16 的 logprob/loss/gradient 差异不大于当前两次相同 mixed-precision FA 基线的自然漂移。执行者应先报告该基线漂移，再给出 Flex 差异；若 Flex 显著超出它，判为失败并保留最小复现 case。
 
-#### 2.4.2 已有本地证据与仍需 device 验证的部分
+##### 2.1.4.2 已有本地证据与仍需 device 验证的部分
 
 Chapter 1.3.5 已验证 expanded-KV 与去重 sparse 语义在 CPU float64 下的 branch/chain output 和 Q/K/V gradient 对齐。该结果支持本节的 layout 方向，但尚未运行 PrefixTree `BlockMask` 的完整 device 版本。
 
-本机无 CUDA；因此 2.4 的 GPU 测试是本轮第一个硬门槛。若 Flex 在 `star_aligned` 都无法满足精度契约，停止后续性能解读，先修正 tree range、position/RoPE 或 GQA 适配。
+本机无 CUDA；因此 2.1.4 的 GPU 测试是本轮第一个硬门槛。若 Flex 在 `star_aligned` 都无法满足精度契约，停止后续性能解读，先修正 tree range、position/RoPE 或 GQA 适配。
 
-### 2.5 PoC-B：BlockMask 构建策略、metadata 与动态 shape
+#### 2.1.5 PoC-B：BlockMask 构建策略、metadata 与动态 shape
 
 Flex 是否可用不能只看 `flex_attention()` 本体。对同一条 `PrefixTreeAttentionLayout`，分别测量以下两种构造方式：
 
@@ -871,7 +875,7 @@ Flex 是否可用不能只看 `flex_attention()` 本体。对同一条 `PrefixTr
 | `generic_mask_mod` | 用 device-resident token/node/position metadata 定义 `mask_mod`，调用 `create_block_mask()` | 正确性基线，确认 PyTorch 通用路径的实际成本 |
 | `direct_block_metadata` | 从 tree ranges 直接生成 `BlockMask.from_kv_blocks()` 所需 block indices；partial block 仍通过严格的 `mask_mod` 表达 | 验证能否避免通用 builder 的 dense/全域扫描开销 |
 
-第二种是优化候选，不是预设结论。只有它在所有 2.4 小型 case 与 generic path 输出/梯度一致、且不会误把 partial block 当作 full block 时，才有资格进入方案设计。若当前 PyTorch API 无法无歧义地表达 partial block，保留 generic path 并记录为 P1 实现风险，不能以不正确的 full-block 标记换取速度。
+第二种是优化候选，不是预设结论。只有它在所有 2.1.4 小型 case 与 generic path 输出/梯度一致、且不会误把 partial block 当作 full block 时，才有资格进入方案设计。若当前 PyTorch API 无法无歧义地表达 partial block，保留 generic path 并记录为 P1 实现风险，不能以不正确的 full-block 标记换取速度。
 
 每个 workload、每种 block size（`64`、`128`；若 GPU/torch 支持再加 `256`）记录：
 
@@ -886,11 +890,11 @@ Flex 是否可用不能只看 `flex_attention()` 本体。对同一条 `PrefixTr
 
 动态 shape 至少按如下序列循环 50 个 micro-batch：`[star_aligned 1024/128, branch 769/127, chain 1024 depth=8, star_aligned 1024/128]`。记录第一个和第二次相同 shape 的 latency；若第二次仍接近 cold latency，说明 shape/closure 造成 compile cache 未命中，不能直接将该设计作为 RL 默认路径。
 
-### 2.6 PoC-C：Flex attention module 的速度、显存与 fallback 边界
+#### 2.1.6 PoC-C：Flex attention module 的速度、显存与 fallback 边界
 
-#### 2.6.1 计时方法
+##### 2.1.6.1 计时方法
 
-本节比较 2.1.2 的三条路径。独立 attention microbenchmark 必须拆出下列阶段，而不是只报告总时长：
+本节比较 2.1.1.2 的三条路径。独立 attention microbenchmark 必须拆出下列阶段，而不是只报告总时长：
 
 ```text
 planner/layout CPU
@@ -905,7 +909,7 @@ module end-to-end
 
 `planner` 可以在完整训练中只发生一次，但 `BlockMask` 至少必须按 micro-batch tree shape 处理一次；两者不可混在一个不可解释的“prepare”数字中。性能数据以 p50/p90 为主，单独报告 cold-start；最少 20 warm-up + 100 iterations，GPU 使用 `torch.cuda.synchronize()`，CPU 阶段用 `perf_counter_ns()`。
 
-#### 2.6.2 显存验证
+##### 2.1.6.2 显存验证
 
 显存要同时看理论和运行时：
 
@@ -918,7 +922,7 @@ module end-to-end
 
 对 `star_aligned B=64,P=2048,R=256` 以及 `chain/deep_fragmented` 各至少跑一次 forward+backward 的 peak HBM。只量 forward 会漏掉 autograd 保存的 K/V、LSE 和 BlockMask 相关状态，不能用来宣称训练显存收益。
 
-#### 2.6.3 判读与 fallback
+##### 2.1.6.3 判读与 fallback
 
 以下结论分别成立，不能互相替代：
 
@@ -930,9 +934,9 @@ module end-to-end
 | no-sharing/低共享率 Flex 慢 | 预期现象，不是否定 PrefixSharing | no-sharing 直走原生 FA，低收益走 expanded FA 或禁用 |
 | Flex 与 expanded FA 都慢于 PS=OFF | 需要检查 projection trimming、mask 构建和 workload 是否真的存在净复用 | 不得发布为默认 backend |
 
-第一阶段不预设一个统一的“必须快 X%”阈值。达到上线候选的最低条件是：2.4 精度通过、K/V 物理零冗余得到验证、没有与 token 数平方同阶的长期 dense metadata/HBM、在至少一个目标高复用 RL workload 的 module end-to-end 或完整训练上不劣于 `ps_on_expanded_fa`。是否默认启用 Flex，再由 PS=OFF 的端到端数据和低收益 fallback 边界决定。
+第一阶段不预设一个统一的“必须快 X%”阈值。达到上线候选的最低条件是：2.1.4 精度通过、K/V 物理零冗余得到验证、没有与 token 数平方同阶的长期 dense metadata/HBM、在至少一个目标高复用 RL workload 的 module end-to-end 或完整训练上不劣于 `ps_on_expanded_fa`。是否默认启用 Flex，再由 PS=OFF 的端到端数据和低收益 fallback 边界决定。
 
-### 2.7 PoC-D：FSDP 接入可行性 smoke
+#### 2.1.7 PoC-D：FSDP 接入可行性 smoke
 
 本实验只在 PoC-A 至 C 通过后进行。其目标是确认当前 `PrefixSharingFSDPAttentionRuntime` 的真实高性能入口可以被替换，而不是在 dense debug fallback 上获得虚假的性能结论。
 
@@ -944,21 +948,21 @@ module end-to-end
 
 严禁使用当前 dense `[B,L,H,D] -> _pack_dense_qkv()` fallback 的总时间证明性能：这条 debug/correctness 路径已经完成 QKV projection，不能反映 remove-padding 下去重 token 对全模型的节省。
 
-### 2.8 PoC-E：Magi FFA 条件对照
+#### 2.1.8 PoC-E：Magi FFA 条件对照
 
-Magi 的价值是回答“若 Flex 的碎片化性能不足，AttnSlice kernel 是否值得成为第二阶段 backend”，不是取代本轮的 Flex 决策。执行条件见 2.2.2。
+Magi 的价值是回答“若 Flex 的碎片化性能不足，AttnSlice kernel 是否值得成为第二阶段 backend”，不是取代本轮的 Flex 决策。执行条件见 2.1.2.2。
 
 若条件满足，流程如下：
 
 1. 在独立环境 clone/checkout MagiAttention `529fb0a`，按其安装文档完成官方 FFA quickstart 和单卡 backward smoke；先保存版本、CUDA、架构、安装命令与 quickstart 结果；
-2. 对 2.3 的 `star_aligned`、`branch`、`chain`、`deep_fragmented`，从同一份 `PrefixTreeAttentionLayout` 导出 slices：每个 node 一个 `(node_q_range,node_k_range,CAUSAL)`，每个严格 ancestor 一个 `(node_q_range,ancestor_k_range,FULL)`；
-3. 先以小尺寸 dense sparse oracle 验证 FFA output 与 Q/K/V grad；再在 bf16 运行 2.6 的 forward/backward/HBM protocol；
+2. 对 2.1.3.1 的 `star_aligned`、`branch`、`chain`、`deep_fragmented`，从同一份 `PrefixTreeAttentionLayout` 导出 slices：每个 node 一个 `(node_q_range,node_k_range,CAUSAL)`，每个严格 ancestor 一个 `(node_q_range,ancestor_k_range,FULL)`；
+3. 先以小尺寸 dense sparse oracle 验证 FFA output 与 Q/K/V grad；再在 bf16 运行 2.1.6 的 forward/backward/HBM protocol；
 4. 仅与同 shape、同 token count、同 warm-up 的 `ps_on_dedup_flex` 和 `ps_on_expanded_fa` 比较；Magi FFA 的 cold JIT、安装/编译时间单列，不能混入 attention p50；
 5. 输出 `slice_count`、FULL/CAUSAL slice 数、slice 覆盖的 logical pairs、kernel forward/backward、peak HBM 与精度结果。
 
 Magi FFA 的结论规则：若它在目标架构的 `deep_fragmented` 上相对 Flex 稳定占优，且精度通过，记录为 P1 高性能 backend；若只在安装复杂的环境中可跑、或对 star/chain 没有净收益，则保留研究记录而不引入 PrefixSharing 依赖。任何 Magi 失败均不影响 Flex 首版继续推进。
 
-### 2.9 推荐执行顺序与失败处置
+#### 2.1.9 推荐执行顺序与失败处置
 
 ```text
 preflight
@@ -978,15 +982,15 @@ preflight
 4. module 慢但 kernel 正常：检查 planner/metadata/restore 生命周期和 QKV transpose；
 5. FSDP only 失败：检查 remove-padding 的 packed token 顺序、position ids、nested tensor trim 与 prefix-last restore，不要用 dense fallback 掩盖问题。
 
-### 2.10 回填模板与本轮决策门槛
+#### 2.1.10 第一阶段结果回填与阶段性结论
 
 执行者把每张表和简短结论直接追加在本节，历史失败也保留。每次回填都在条目中写明日期；不要覆写旧结果，以便后续判断版本、硬件或方案变动造成的差异。
 
-#### 2.10.1 环境与可用性
+##### 2.1.10.1 环境与可用性
 
 | 日期 | 机器/GPU | compute capability | CUDA / torch / flash-attn | Flex | Magi FFA | 结论 |
 |---|---|---|---|---|---|---|
-| 2026-07-12 | 2xA100-SXM4-80GB | 8.0 | CUDA 12.4 / torch 2.6.0+cu124 / flash-attn 2.6.1 | import OK (from_kv_blocks=True) | skipped (见 2.10.5) | Flex 首版可用 |
+| 2026-07-12 | 2xA100-SXM4-80GB | 8.0 | CUDA 12.4 / torch 2.6.0+cu124 / flash-attn 2.6.1 | import OK (from_kv_blocks=True) | skipped (见 2.1.10.5) | Flex 探索环境可用 |
 
 **执行记录**
 
@@ -1005,7 +1009,7 @@ git commit: 1906393e (PrefixSharing master)
 }
 ```
 
-#### 2.10.2 精度与梯度
+##### 2.1.10.2 精度与梯度
 
 | case | dtype / shape | expanded vs dense oracle | Flex vs oracle output | Flex vs oracle Q/K/V grad | logits/logprob/loss | 结论 |
 |---|---|---|---|---|---|---|
@@ -1030,7 +1034,7 @@ git commit: 1906393e (PrefixSharing master)
 结论：output max abs diff < 2.2e-06, gradient max abs diff < 1e-05, 全部 finite, 精度契约满足。
 ```
 
-#### 2.10.3 BlockMask 与动态 shape
+##### 2.1.10.3 BlockMask 与动态 shape
 
 | case | constructor | block size | cold ms | warm p50 ms | peak HBM MB | full/partial blocks | scheduled/logical | cache 结论 |
 |---|---|---|---|---|---|---|---|---|
@@ -1061,7 +1065,7 @@ git commit: 1906393e (PrefixSharing master)
 | 25+ | 稳定 | 全 shape | 8.3-9.0 | 8.7-12.2 | 编译缓存命中 |
 
 
-结论：warm cache 后 `create_block_mask` 稳定 ~9ms（T≤2176），首次 JIT cold 200-400ms 各 shape 仅一次。`from_kv_blocks` 不可用（torch 2.6.0），只能用 generic mask_mod。BlockMask 无 dense 临时 allocation，block_size=128 最优。
+结论：warm cache 后 `create_block_mask` 稳定 ~9ms（T≤2176），首次 JIT cold 200-400ms 各 shape 仅一次。preflight 显示 `from_kv_blocks` API 可见，但第一阶段没有完成 direct metadata 的正确性与性能验证，因此仅使用 generic `mask_mod`。BlockMask 无 dense 临时 allocation；block size 的最终选择留给第二阶段。
 **BlockMask / dynamic-shape 实验记录**
 
 ```text
@@ -1073,13 +1077,13 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 结论:
 - warm cache 后 create_block_mask stable ~9ms (T<=2176)
 - 首次 JIT cold 200-400ms, 每种 shape 只触发一次
-- from_kv_blocks API 不存在 (torch 2.6.0) -> 只能用 generic mask_mod
+- from_kv_blocks API 可见，但 direct metadata 未完成正确性/性能验证；本轮仅使用 generic mask_mod
 - 未观察到 dense [T,T] 临时分配, BlockMask 仅 ~1KB 元数据
 - block_size=128 在 scheduled/logical ratio 与构建时间之间最优
 - 偶发 shape 变化导致部分 recompile, 但 50 iter 整体稳定
 ```
 
-#### 2.10.4 Attention module 与显存
+##### 2.1.10.4 Attention module 与显存
 
 | case | mode | original/dedup/expanded tokens | fwd p50 ms | bwd p50 ms | module p50 ms | peak HBM MB | KV physical tokens | 结论 |
 |---|---|---|---|---|---|---|---|---|
@@ -1112,12 +1116,12 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 4. flash_attn .so 符号不匹配, 暂跳过 expanded FA 定量对比.
 ```
 
-#### 2.10.5 FSDP 与 Magi（条件执行）
+##### 2.1.10.5 FSDP 与 Magi（条件执行）
 
 | 项目 | workload | 精度 | p50 / HBM | 状态 | 对下一阶段的影响 |
 |---|---|---|---|---|---|
 | FSDP remove-padding smoke | tiny causal LM (Qwen2.5-0.5B) star + chain | attn out Δ ≈ 1.6e-02 (bf16), logits Δ ≈ 1.5 | attention fwd ~12ms (A100 bf16) | 🟢 跑通，KV 零冗余确认，bf16 数值差异在预期范围 | FSDP remove-padding hook 可替换为 dedup+flex，restore 路径不变 |
-| Magi FFA CP=1 | star_aligned P=10+A=5+B=5 | 与 dense oracle max diff = 1.19e-06（fp32） | dispatch fwd+bwd: ~70ms (T=128, H=8, bf16) | 🟢 安装成功，精度通过 | dispatch 前向对齐，但 backward 需正确生命期管理 |
+| Magi dispatch prefix-tree smoke（非 FFA kernel） | star_aligned P=10+A=5+B=5 | 与 dense oracle max diff = 1.19e-06（fp32） | dispatch fwd+bwd: ~70ms (T=128, H=8, bf16) | 🟢 安装成功，精度通过 | 仅证明 dispatch 功能；不作为 FFA 性能结论 |
 
 **FSDP 实验记录**
 
@@ -1159,9 +1163,11 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 ```
 
 
-#### 2.10.6 实验综合结论
+##### 2.1.10.6 实验综合结论
 
-### 本轮 PoC 实验综合结论
+###### 第一阶段 PoC 实验综合结论
+
+以下归纳保留第一阶段的原始观察，便于后续复盘；它们不是最终 release gate。特别是：fp32 表仅比较 Flex 与 dense oracle；BlockMask 的实际 QK block 统计尚未校正；HBM 没有与同口径 expanded-FA 对照；FSDP smoke 未覆盖 prefix-last restore；A100 上的 Magi 是 dispatch 功能 smoke。第二阶段以 2.2 的数据覆盖这些缺口。
 
 **精度：Flex prefix-tree mask 与 dense SDPA oracle 完全等价（PoC-A）**
 
@@ -1174,7 +1180,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 | GQA（H_Q=14, H_KV=2） | 通过 `enable_gqa=True` / `pack_gqa=True`，与 repeat_interleave 等价 |
 | 覆盖拓扑 | no_sharing / star_aligned / star_unaligned / branch / chain / deep_fragmented |
 
-结论：Flex prefix-tree BlockMask 在 fp32 下与逐 row causal SDPA 完全等价；bf16 下约 1.5% 差异，属于预期范围。**精度契约满足。**
+结论：Flex prefix-tree BlockMask 在 fp32 下与逐 row causal SDPA 完全等价；bf16 下约 1.5% 差异已被观察到，但其是否属于可接受范围仍由 PoC-2A 的三路径相对误差判定。
 
 **BlockMask：工程可用，无严重性能风险（PoC-B）**
 
@@ -1185,9 +1191,9 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 | 动态 shape 稳定性 | 50 micro-batch 循环后稳定，偶发部分 recompile |
 | 临时 HBM | 无 dense [T,T] allocation，BlockMask ≈ 1KB |
 | optimal block_size | 128（scheduled/logical ratio 与构建时间均衡） |
-| `from_kv_blocks` | 不可用（torch 2.6.0），只能用 generic mask_mod |
+| `from_kv_blocks` | API 可见；direct metadata 尚未完成正确性/性能验证，本轮仅使用 generic mask_mod |
 
-结论：`create_block_mask()` 构建成本可控，动态 shape 下 compile cache 有效命中。**BlockMask 不构成工程障碍。**
+结论：`create_block_mask()` 的探索性构建成本可控；但实际 QK block 数、partial ratio 与 direct metadata 可行性仍由 PoC-2B 校正，当前数据不能单独决定 block size 或 fallback 阈值。
 
 **KV 零冗余：物理上完全消除（PoC-C）**
 
@@ -1199,7 +1205,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 | chain_d12_p16_s4 | 456 | 60 | 7.60x | ~200MB | 18MB |
 | fragmented | 64 | 21 | 3.05x | ~32MB | 17MB |
 
-结论：所有共享场景的 K/V tensor 物理序列维 = dedup_tokens，非 expanded_kv_tokens。**KV 零冗余在物理存储层面已确认。** HBM 节省随共享率线性增长，最高 chain_d12 节省 ~7.6x。
+结论：所有共享场景的 K/V tensor 物理序列维 = dedup_tokens，非 expanded_kv_tokens。**KV 零冗余在物理存储层面已确认。** `7.6x` 是 K/V token 压缩比，不是已被三路径峰值 HBM 对照验证的 module 显存节省比例。
 
 **Attention 性能：对 token 数不敏感，fwd+bwd < 85ms（A100 bf16）**
 
@@ -1210,7 +1216,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 | module total | 80 ~ 86ms |
 | 碎片化影响 | fra (T=21) ratio=24.53，但 HBM 仅 17MB，可忍受 |
 
-结论：Flex attention forward/backward 时间在整个 token 数范围（T=60~2176）内几乎不扩展。**性能可接受。**
+结论：这是单独 Flex 路径的探索性耗时；缺少 expanded-FA/PS=OFF 同口径对照，因此不能据此判断正式性能是否可接受，PoC-2C 给出最终比较。
 
 **FSDP remove-padding 接入：可行（PoC-D）**
 
@@ -1221,7 +1227,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 | attention 后端替换 | expanded SDPA → dedup BlockMask flex_attention 可替换 |
 | restore 路径 | 不变，PoC-D 未测试 restore（但 §1.2.5 分析确认大部分可复用） |
 
-结论：FSDP remove-padding 的 attention hook 可替换为 dedup+Flex，不阻塞。正式集成需验证 prefix-last restore 和 multi-layer 一致性。
+结论：FSDP remove-padding 的 attention 级替换具备可行性。正式集成仍需由 PoC-2E 验证 prefix-last restore、multi-layer、loss、参数梯度与 optimizer update 后才能通过精度 gate。
 
 **Magi FFA：A100 sm80 可安装运行（PoC-E），但性能待验证**
 
@@ -1235,7 +1241,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 
 结论：Magi 在 A100 sm80 上可作为后备选项。**不阻碍 Flex 首版推进。**
 
-### 对 Chapter 3 方案设计的直接影响
+###### 第一阶段对 Chapter 3 方案设计的直接影响
 
 1. **FlexAttention 作为 FSDP 首版后端**：PoC-A 精度、PoC-B 构建成本、PoC-C 性能数据全部支持该方向。Flex Triton backend 在 A100 sm80 上 80ms 级的 fwd+bwd 时间可接受；KV 零冗余的 HBM 节省（最高 7.6x）是决定性收益。
 
@@ -1246,6 +1252,240 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 4. **Magi 作为 P1 候选**：A100 sm80 上 dispatch 路径已验证可运行，但真正的 sm80 优化（CUTLASS FA4 路径）仍需额外工程。方案设计中预留 `PrefixTreeAttentionLayout ↔ AttnRanges/AttnRectangle` 的转换接口。
 
 5. **FSDP remove-padding 需集成测试**：虽然 PoC-D 验证了 attention 级替换，但完整的 FSDP world_size>1、old-log-prob/ref-log-prob/actor update 生命周期、prefix-last restore 仍需单独验证。不在方案设计阶段阻塞。
+
+### 2.2 第二阶段 PoC（待执行：正式实现前的决策 gate）
+
+第二阶段不重复第一阶段已经完成的“Flex 能否表达 prefix-tree mask”探索，而是补齐让方案设计能够落地的证据链。第一阶段中关于 `block_size=128`、HBM 节省、Flex 性能可接受和 bf16 精度“属于预期范围”的表述，都只能视为探索性观察；只有本节的同口径数据才能用于确定默认 backend、fallback 条件和性能承诺。
+
+第二阶段分两类执行：2.2.2 至 2.2.5 是**实现前或与 core/layout 开发并行**的 device PoC；2.2.6 至 2.2.7 需要 Codex 提供最小 experimental Flex backend 后再运行。Magi 不阻塞本阶段，见 2.2.8。
+
+#### 2.2.1 统一前置条件、回填规则与通过标准
+
+**目标环境。** 优先使用将来 verl FSDP 实际采用的 CUDA + `torch==2.9.1` + `flash-attn` 组合；第一阶段的 `torch==2.6.0` A100 数据保留为历史参考，不得替代本阶段结果。若暂时只能使用别的版本，表格必须明确标为“探索环境”，且仍要至少完成语义测试；性能结论不得覆盖目标版本。
+
+**正式结果载体。** 本节仍以本文件为唯一正式记录。ClaudeCode 在每个小节的回填表中追加日期、commit、机器、实际命令、环境版本和结果；临时 JSON、profiler trace 仅用于排障。失败必须保留最小复现参数，而不是只写“失败”。
+
+**通用计时。** 除 cold compile 外，每个 mode 至少 warm-up 20 次、计时 100 次；每个被计时区间前后 `torch.cuda.synchronize()`；报告 p50/p90。测试循环不得创建 planner、随机 QKV、打印日志或创建 BlockMask，除非该项正是要测量的阶段。
+
+**通用 workload。** 三条路径必须从同一 `PrefixSharingPlanner` 生成的同一份 plan 出发，并使用同一随机种子、head shape、dtype 和 dropout 设置：
+
+| case | 规模 | 在第二阶段中的职责 |
+|---|---|---|
+| `no_sharing` | B=8, L=512/1024 | 验证 no-sharing 永不误走 Flex 默认路径 |
+| `star_long_prompt` | B=8/32, P=1024, R=128 | 代表 RL 高共享率主收益场景 |
+| `chain_depth` | depth=6/12, P=32, suffix=8/16 | 验证递归 ancestor、链式复用与深度碎片化 |
+| `deep_fragmented` | B>=16，segment=32/64/127 | 用于决定 block 利用率阈值和 fallback |
+
+**三条固定比较路径。**
+
+| mode | 必须使用的实现 | 说明 |
+|---|---|---|
+| `ps_off_fa` | 原始完整 token + 生产 FA/SDPA baseline | 业务总成本基线 |
+| `ps_on_expanded_fa` | trimmed Q + 当前 `build_prefix_expanded_kv()` + 生产 GPU FA；仅精度 fallback 时可用 SDPA | 当前 PrefixSharing 对照，不能手写另一套 expanded 语义替代 |
+| `ps_on_dedup_flex` | trimmed Q/K/V + PrefixTree layout + `BlockMask` + `flex_attention` | 候选实现 |
+
+当 `flash-attn` ABI 不匹配时，先修复或创建与目标 PyTorch 匹配的独立环境；不得用只有 Flex 的结果写出“比 expanded FA 快/更省 HBM”的结论。SDPA 只可作为精度 oracle，不可作为 FA 性能替代品。
+
+#### 2.2.2 PoC-2A：三路径精度闭环与 bf16 红线
+
+**目的。** 验证 PrefixTree layout 不只等价于 dense sparse oracle，也等价于当前生产 `build_prefix_expanded_kv()` 语义；同时判定第一阶段 FSDP bf16 的 logits/V-gradient 差异是否在合理数值误差内，而不是预先假定它“正常”。
+
+**实现要求。** 新建或修订一个独立的 device 脚本，例如 `scripts/poc_attention/poc_2a_precision_triplet.py`。它必须直接调用项目当前的 `build_prefix_expanded_kv()` 与 production FA backend；不要复制一份简化 builder。若 production FA 无法用，脚本应将该 case 标为 `blocked_by_flash_attn_abi`，而不是悄悄改用其他 attention 后仍叫作 `expanded_fa`。
+
+对每个 workload 按以下顺序执行：
+
+1. fp32、`dropout=0`：计算 dense sparse SDPA oracle、`ps_on_expanded_fa`、`ps_on_dedup_flex` 的 output；以同一随机 upstream gradient 反传，比较 Q/K/V gradients。
+2. bf16、`dropout=0`：同样比较三条路径，并额外用 fp32 dense oracle 作为高精度锚点。
+3. 对 bf16 每条路径记录相对 fp32 oracle 的误差 `E_mode`，再记录 `Flex-vs-expanded` 差异；不得只报 absolute max，因为 V gradient 的尺度可能远大于 Q/K。
+4. 对真实 tiny model，在不做 optimizer step 时比较 token logprob、scalar loss、关键参数 gradient；再做一次相同 optimizer step，比较更新后的参数相对 L2 差异。
+
+建议同时记录：
+
+```text
+max_abs, mean_abs, relative_l2, cosine_similarity,
+finite, output_loss, token_logprob_max_abs,
+parameter_grad_relative_l2, updated_parameter_relative_l2
+```
+
+**判读。** fp32 下 `expanded-vs-oracle` 与 `flex-vs-oracle` 都应处于同一微小误差量级；bf16 下 Flex 相对 fp32 oracle 的误差不能显著大于 expanded-FA 相对同一 oracle 的误差。若某一 V-gradient absolute diff 很大但 relative L2/cosine 正常，应记录其尺度后再解释；若 relative L2 明显恶化、cosine 降低或一次更新后参数显著漂移，则视为精度失败，先停止 FSDP 扩展测试。
+
+**回填表（追加结果，不覆盖第一阶段表）。**
+
+| 日期 / commit / 环境 | case | dtype | expanded vs oracle output / grad | Flex vs oracle output / grad | Flex vs expanded output / grad | logprob/loss/update | 结论 |
+|---|---|---|---|---|---|---|---|
+| 2026-07-12 / c9a6659e / env-termius A100 sm80 | no_sharing | bf16 | 不支持（flash_attn无fp32） | — | flex≈expanded: max=0.015625 rel_l2=0.0026 cos=1.0 | — | ✅ bf16下expanded与flex完全等价 |
+| 2026-07-12 / c9a6659e / env-termius A100 sm80 | star(P=64,R=65) | bf16 | — | — | flex≈expanded: max=0.015625 rel_l2=0.0039 cos=1.0 | — | ✅ 同上 |
+| 2026-07-12 / c9a6659e / env-termius A100 sm80 | chain(depth=3) | bf16 | — | — | flex≈expanded: max=0.015625 rel_l2=0.0034 cos=1.0 | — | ✅ 同上 |
+| 2026-07-12 / c9a6659e / env-termius A100 sm80 | deep_frag(B=6) | bf16 | — | — | flex≈expanded: max=0.015625 rel_l2=0.0032 cos=1.0 | — | ✅ 同上 |
+
+**执行记录**
+
+```text
+实际命令：
+  cd /jiangdingfeng/zy/Termius/PrefixSharing
+  PYTHONPATH=prefix-sharing CUDA_VISIBLE_DEVICES=1 python scripts/poc_attention/poc_2a_precision_triplet.py
+flash-attn: 2.6.1, torch: 2.6.0+cu124
+未运行的mode：fp32 expanded FA标为blocked_by_fa_no_fp32
+  （flash_attn_varlen_func只支持fp16/bf16，不走替代SDPA路径；fp32 oracle已用SDPA完成）
+最小失败复现：无
+```
+
+#### 2.2.3 PoC-2B：BlockMask 真实调度、direct metadata 与 compile 行为
+
+**目的。** 修复第一阶段 `scheduled/logical` 不是实际 QK block 数的问题，并确认 `BlockMask.from_kv_blocks()` 在目标 PyTorch 版本中的真实可用性。第一阶段表中出现的 `scheduled/logical < 1` 不能作为 block 效率结论。
+
+**前置检查。** 在目标环境打印并记录以下对象的类型、shape、值语义和 API 签名：
+
+```python
+from torch.nn.attention.flex_attention import BlockMask
+print(hasattr(BlockMask, "from_kv_blocks"))
+print(inspect.signature(BlockMask.from_kv_blocks))
+print(block_mask.kv_num_blocks.shape)
+print(block_mask.full_kv_num_blocks.shape)
+```
+
+不要使用不存在或版本相关的 `block_mask.num_blocks`。统计 helper 必须从实际 `kv_num_blocks`、`full_kv_num_blocks` 与对应 indices 汇总；对每种 block size 断言 `scheduled_block_elements >= logical_attention_elements`。若断言失败，先确认 full/partial block 字段是否互斥或包含关系，修正 helper 后才允许写性能结论。
+
+**测试矩阵。** 对 `star_long_prompt`、`chain_depth=12`、`deep_fragmented` 分别测试 block size `64/128/256`：
+
+1. `generic_mask_mod`：当前 `create_block_mask()` 路径，作为正确性 baseline。
+2. `direct_block_metadata`：仅当 `from_kv_blocks()` 在目标版本可调用时，从 PrefixTree ranges 派生 block metadata；partial block 必须继续使用精确 `mask_mod`。
+3. 小尺寸 fp32 下，generic 与 direct 两者都与 dense oracle 比较 output/QKV gradient；direct 的任何误差立即阻止其作为优化方案。
+4. 分别记录 layout CPU、metadata build、cold compile、warm compile、attention forward/backward，不能将这些合并为单个“mask_ms”。
+
+**通过条件。** `direct_block_metadata` 不是第二阶段的必选产物；generic 路径精度正确即可支持 Flex 首版。只有 direct path 在所有小型 topology 正确且 metadata build/HBM 确有优势时，才写入后续实现计划。block size 也不预设为 128：应按真实 scheduled/logical、partial ratio 和三路径 module p50 共同选择。
+
+**回填表。**
+
+| 环境 | case | constructor | block size | full / partial QK blocks | scheduled / logical | metadata cold / warm ms | compile cold / warm ms | output / grad gate | 结论 |
+|---|---|---|---:|---:|---:|---:|---:|---|---|
+| 待回填 |  |  |  |  |  |  |  |  |  |
+
+#### 2.2.4 PoC-2C：三路径 attention module 速度与完整 HBM
+
+**目的。** 对比“业务 baseline、当前 expanded-KV 方案、候选 zero-KV Flex”三者，而不是仅测 Flex 的单独耗时。该实验决定 default/fallback 方向，不用来宣称完整 RL 吞吐。
+
+**HBM 采集规则。** 每个 mode 独立进程或严格清理 allocator；在创建该 mode 的 Q/K/V、expanded KV 或 BlockMask **之前**调用 `torch.cuda.reset_peak_memory_stats()`。记录以下快照：创建 QKV 后、创建 metadata/expanded KV 后、forward 后、backward 后的 `memory_allocated` 与 `max_memory_allocated`；同时记录 `max_memory_reserved`。只有这样才能分别解释 QKV、expanded KV、BlockMask 和 autograd 的贡献。
+
+**速度拆分。** 对每个 mode 记录：
+
+```text
+planner/layout_cpu_ms
+qkv_layout_ms
+blockmask_build_ms             # Flex only
+build_kv_ms                    # expanded only
+attention_forward_ms
+attention_backward_ms
+restore_ms
+module_end_to_end_ms
+```
+
+对 `no_sharing`、`star_long_prompt`、`chain_depth`、`deep_fragmented` 执行。`no_sharing` 必须显示为原生 FA path；它不是 Flex 优化对象。每个共享 case 同时报告 `original/dedup/expanded tokens`、K/V 物理 bytes、logical/scheduled pairs 与 peak HBM。
+
+**判读。**
+
+- `dedup_flex` 比 expanded-FA 更低的 K/V bytes 只证明 KV 零冗余；只有 peak HBM 对照更低才能宣称 attention module 省显存。
+- `dedup_flex` 的 attention kernel 可以慢于 FA，但若 module end-to-end 不劣于 expanded-FA，仍可进入首版候选。
+- 只有在 `star_long_prompt` 等目标高共享 workload 中获得不劣结果，才有资格讨论默认启用；短序列、no-sharing、低 block 利用率应作为 fallback 证据。
+
+**回填表。**
+
+| 环境 | case | mode | original / dedup / expanded tokens | prepare ms | build-KV / BlockMask ms | fwd p50/p90 ms | bwd p50/p90 ms | module p50 ms | peak allocated / reserved MB | K/V bytes | 结论 |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 待回填 |  |  |  |  |  |  |  |  |  |  |  |
+
+#### 2.2.5 PoC-2D：真实训练 shape 生命周期与跨层 metadata 复用
+
+**目的。** 第一阶段只测了单层 synthetic dynamic shape。正式实现需要回答：同一 micro-batch 的 layout/BlockMask 是否只构造一次、是否被所有 layer 复用，以及 old-logprob/ref-logprob/actor update 中哪些 forward 可以复用 metadata。
+
+在 minimal experimental backend 就绪前，可先用一个 mock 24/32-layer attention loop 验证对象生命周期；backend 接入后再用真实 tiny model 复验。每次测试至少覆盖 `star_long_prompt` 和 `chain_depth`。
+
+1. 给 layout builder 与 BlockMask builder 加临时计数器/unique id；每个 micro-batch 记录每 layer 收到的对象 id。
+2. 断言同一 model forward 的所有 layer 使用同一个 immutable layout/BlockMask，而不是每层重新构建。
+3. 记录连续 20 个 micro-batch 的 tree signature、cache hit/miss、metadata build 次数、compile cold/warm 时间；其中要包含相同 token count 但不同 tree shape 的 case。
+4. 对 old-logprob、ref-logprob、actor update 分别记录是否可重用：只有 token order、tree shape、device、dtype、head shape 都相同才允许 reuse；否则必须安全 miss。
+
+**回填表。**
+
+| 环境 | phase | micro-batch count | layer count | layout builds | BlockMask builds | cache hit/miss | unexpected rebuild | peak HBM | 结论 |
+|---|---|---:|---:|---:|---:|---|---|---:|---|
+| 待回填 |  |  |  |  |  |  |  |  |  |
+
+#### 2.2.6 PoC-2E：真实 FSDP remove-padding 精度与 restore
+
+**前置条件。** 此项在 Codex 完成最小 experimental Flex backend 和 FSDP patch 后执行；第一阶段手工抽取 layer-0 QKV 的结果不能替代它。
+
+固定 `use_remove_padding=True`、FSDP world size=1，选择 Qwen2.5-0.5B 的 `star_long_prompt` 与 `chain_depth`。每个 case 跑 `ps_off_fa`、`ps_on_expanded_fa`、`ps_on_dedup_flex`，并验证：
+
+1. hook 输入为 packed `[1,T,H,D]`，并且 `T == dedup_tokens`；
+2. PrefixTree layout 的 token order、RoPE position ids 与 trim 后的 batch 完全一致；
+3. prefix-last restore 前后的 logits、token logprob、loss mask 和 loss；尤其检查 suffix first token 的 logprob；
+4. attention output、模型参数梯度和一次 optimizer update 后参数；
+5. 关闭 dropout 的 fp32 precision gate；再在 bf16 下以相对 L2/cosine、loss 和更新后参数差异判断，不能只以“没有 NaN”通过。
+
+若 bf16 的 `Flex-vs-expanded` 相对误差明显高于 `expanded-vs-PS_OFF`，或 prefix-last logprob 不对齐，标为 failed，不进入多卡或 actor update。
+
+**回填表。**
+
+| 环境 / model | case | dtype | mode pair | packed token / position gate | restore logprob | loss | parameter grad rel-L2 / cosine | post-update parameter rel-L2 | 结论 |
+|---|---|---|---|---|---|---:|---|---|---|
+| 待回填 |  |  |  |  |  |  |  |  |  |
+
+#### 2.2.7 PoC-2F：最小 verl actor 生命周期（后置 gate）
+
+此项同样依赖 minimal backend。它不是性能 benchmark，而是训练语义 gate：使用一个真实 mini-batch，顺序运行 `compute_old_log_prob`、reference logprob、`update_actor`，比较 PS=OFF、expanded-FA、dedup-Flex 的有效 token logprob、actor loss、梯度和 update 后参数。记录每个 phase 是否错误复用了上一 phase 的 layout/BlockMask。
+
+world size=1 通过后才允许把 FSDP 多卡、activation checkpointing 和 Ulysses/CP 纳入后续任务；第二阶段不将它们混进首版验收。
+
+#### 2.2.8 Magi 的第二阶段定位
+
+第一阶段 A100 结果应准确命名为 **Magi dispatch prefix-tree functionality smoke**，不是 FFA kernel 性能 PoC。它只需要做两件收尾工作：修复脚本中 `requires_grad` 与梯度清理，保证 smoke 可复现；在 2.1 的历史表中注明它运行的是 SDPA Online/Triton dispatch 路径。
+
+不在 A100 上继续投入 Magi 性能调优。只有满足下列触发条件才启动 Magi FFA PoC：
+
+1. 获得 H100/H200（sm90）且可建立独立 Magi 环境；或
+2. PoC-2C 证明 Flex 在 `deep_fragmented` 上存在稳定、无法用 metadata/fallback 缓解的性能缺口。
+
+触发后，Magi 也必须使用 2.2.1 的同一 plan、同一三路径矩阵和 2.2.2 的精度门槛；否则结果只算安装/功能 smoke。
+
+#### 2.2.9 第二阶段执行顺序与阶段出口
+
+```text
+目标 torch/flash-attn 环境预检
+  -> PoC-2A fp32/bf16 三路径精度
+  -> PoC-2B 正确 BlockMask 统计与 direct metadata 探索
+  -> PoC-2C 三路径性能/HBM
+  -> Codex minimal backend
+  -> PoC-2D metadata lifecycle
+  -> PoC-2E FSDP remove-padding + restore
+  -> PoC-2F verl actor lifecycle
+```
+
+达到以下条件即可结束第二阶段、进入 Chapter 3 的最终技术方案与 Chapter 5 的实现排期：
+
+- 2A 证明 expanded-FA、dense oracle 与 Flex 的 fp32/bf16 精度链闭合；
+- 2B 给出可信的 block 利用率，或明确 generic builder 是首版唯一实现；
+- 2C 给出目标环境三路径 HBM/时延数据和 no-sharing/碎片化 fallback 证据；
+- 2E 证明真正 FSDP packed hook、RoPE、prefix-last restore 与 loss/gradient/update 不破坏精度。
+
+2F 可与 Chapter 5 的 integration 开发并行，但在向 verl 提交首版 PR 前必须完成。Magi 不是第二阶段出口条件。
+
+#### 2.2.10 第二阶段结果回填
+
+ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后在此处填写总览，保留失败与 blocked 项：
+
+| 日期 / commit / 环境 | 2A 精度 | 2B block metadata | 2C 三路径性能/HBM | 2D lifecycle | 2E FSDP restore | 2F actor lifecycle | 第二阶段结论 |
+|---|---|---|---|---|---|---|---|
+| 待回填 |  |  |  |  |  |  |  |
+
+**阶段总结（待回填）**
+
+```text
+实际执行命令索引：
+已通过的 gate：
+失败 / blocked 及最小复现：
+对 Flex 默认启用、fallback 与 Magi 的决策：
+```
 
 
 
