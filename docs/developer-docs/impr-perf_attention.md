@@ -1159,6 +1159,96 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 ```
 
 
+#### 2.10.6 实验综合结论
+
+### 本轮 PoC 实验综合结论
+
+**精度：Flex prefix-tree mask 与 dense SDPA oracle 完全等价（PoC-A）**
+
+| 维度 | 结果 |
+|---|---|
+| fp32 output Δmax | 1.31e-06 ~ 2.03e-06（全部 < 2.2e-06） |
+| fp32 gradient Δmax | 2.80e-06 ~ 8.11e-06（全部 < 1e-05） |
+| 异常（NaN/Inf） | 无 |
+| bf16 数值漂移（PoC-D Qwen2.5-0.5B） | attention output Δmax ≈ 1.6%，logits Δmax ≈ 1.5 |
+| GQA（H_Q=14, H_KV=2） | 通过 `enable_gqa=True` / `pack_gqa=True`，与 repeat_interleave 等价 |
+| 覆盖拓扑 | no_sharing / star_aligned / star_unaligned / branch / chain / deep_fragmented |
+
+结论：Flex prefix-tree BlockMask 在 fp32 下与逐 row causal SDPA 完全等价；bf16 下约 1.5% 差异，属于预期范围。**精度契约满足。**
+
+**BlockMask：工程可用，无严重性能风险（PoC-B）**
+
+| 维度 | 数据 |
+|---|---|
+| warm cache 构建时间 | ~9ms（T≤2176），不随 token 数线性增长 |
+| cold JIT 首次 | 200-400ms（每种 shape 仅一次） |
+| 动态 shape 稳定性 | 50 micro-batch 循环后稳定，偶发部分 recompile |
+| 临时 HBM | 无 dense [T,T] allocation，BlockMask ≈ 1KB |
+| optimal block_size | 128（scheduled/logical ratio 与构建时间均衡） |
+| `from_kv_blocks` | 不可用（torch 2.6.0），只能用 generic mask_mod |
+
+结论：`create_block_mask()` 构建成本可控，动态 shape 下 compile cache 有效命中。**BlockMask 不构成工程障碍。**
+
+**KV 零冗余：物理上完全消除（PoC-C）**
+
+| workload | original tokens | dedup tokens | 压缩比 | expand FA 预估 HBM | dedup Flex HBM |
+|---|---|---|---|---|---|
+| star_p64r65x4 | 645 | 389 | 1.66x | ~数 100MB | 70MB |
+| star_p512r128x8 | 5760 | 1664 | 3.46x | ~2-3GB | 928MB |
+| star_p1024r128x8 | 10368 | 2176 | 4.76x | ~4-5GB | 1565MB |
+| chain_d12_p16_s4 | 456 | 60 | 7.60x | ~200MB | 18MB |
+| fragmented | 64 | 21 | 3.05x | ~32MB | 17MB |
+
+结论：所有共享场景的 K/V tensor 物理序列维 = dedup_tokens，非 expanded_kv_tokens。**KV 零冗余在物理存储层面已确认。** HBM 节省随共享率线性增长，最高 chain_d12 节省 ~7.6x。
+
+**Attention 性能：对 token 数不敏感，fwd+bwd < 85ms（A100 bf16）**
+
+| 指标 | 值 |
+|---|---|
+| forward p50 | 12.6 ~ 15.9ms（T=96~2176） |
+| backward p50 | 59.9 ~ 72.1ms |
+| module total | 80 ~ 86ms |
+| 碎片化影响 | fra (T=21) ratio=24.53，但 HBM 仅 17MB，可忍受 |
+
+结论：Flex attention forward/backward 时间在整个 token 数范围（T=60~2176）内几乎不扩展。**性能可接受。**
+
+**FSDP remove-padding 接入：可行（PoC-D）**
+
+| 维度 | 结果 |
+|---|---|
+| Qwen2.5-0.5B star/chain | 前向、反向通过，无崩溃 |
+| KV 零冗余 | 确认（dedup token = kept Q token = attention K/V 序列维） |
+| attention 后端替换 | expanded SDPA → dedup BlockMask flex_attention 可替换 |
+| restore 路径 | 不变，PoC-D 未测试 restore（但 §1.2.5 分析确认大部分可复用） |
+
+结论：FSDP remove-padding 的 attention hook 可替换为 dedup+Flex，不阻塞。正式集成需验证 prefix-last restore 和 multi-layer 一致性。
+
+**Magi FFA：A100 sm80 可安装运行（PoC-E），但性能待验证**
+
+| 维度 | 结果 |
+|---|---|
+| 安装 | 成功（v1.1.1, sm80+FA4 配置，CUDA 12.5） |
+| 精度 | dispatch 路径与 dense oracle 对齐（Δ < 1e-06, fp32） |
+| backward | dispatch 包含完整 autograd，可反向传播 |
+| sm80 限制 | FlexFlashAttn kernel 仅支持 sm90；dispatch 通过 Triton SDPA Online 后端运行 |
+| 性能 | 约 ~70ms fwd+bwd（T=128, H=8）— 需同口径 benchmark 确认 |
+
+结论：Magi 在 A100 sm80 上可作为后备选项。**不阻碍 Flex 首版推进。**
+
+### 对 Chapter 3 方案设计的直接影响
+
+1. **FlexAttention 作为 FSDP 首版后端**：PoC-A 精度、PoC-B 构建成本、PoC-C 性能数据全部支持该方向。Flex Triton backend 在 A100 sm80 上 80ms 级的 fwd+bwd 时间可接受；KV 零冗余的 HBM 节省（最高 7.6x）是决定性收益。
+
+2. **BlockMask 构建策略**：只能用 `generic mask_mod`（`from_kv_blocks` 不可用），但 warm ~9ms 可接受。方案设计应将 BlockMask 构建放在 micro-batch level（复用所有 layer），不要 per-layer 重建。
+
+3. **保留 expanded-FA fallback**：碎片化场景（fra ratio=24.53）和短序列 case 中 Flex 的 scheduled/logical 浪费已确认，方案设计需要包含基于 block 利用率的 fallback 阈值。
+
+4. **Magi 作为 P1 候选**：A100 sm80 上 dispatch 路径已验证可运行，但真正的 sm80 优化（CUTLASS FA4 路径）仍需额外工程。方案设计中预留 `PrefixTreeAttentionLayout ↔ AttnRanges/AttnRectangle` 的转换接口。
+
+5. **FSDP remove-padding 需集成测试**：虽然 PoC-D 验证了 attention 级替换，但完整的 FSDP world_size>1、old-log-prob/ref-log-prob/actor update 生命周期、prefix-last restore 仍需单独验证。不在方案设计阶段阻塞。
+
+
+
 ## Chapter 3：方案设计
 
 待 PoC 结论回填后补充。重点包括：backend-neutral tree layout、Flex BlockMask 构造、backend 选择/fallback、restore map、配置与分层设计。
