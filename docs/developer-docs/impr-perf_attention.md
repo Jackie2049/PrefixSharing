@@ -1424,7 +1424,7 @@ module_end_to_end_ms
 
 | 环境 | phase | micro-batch count | layer count | layout builds | BlockMask builds | cache hit/miss | unexpected rebuild | peak HBM | 结论 |
 |---|---|---:|---:|---:|---:|---|---|---:|---|
-| 待回填 |  |  |  |  |  |  |  |  |  |
+| 2026-07-12 / f0774bd2 / env-termius A100 sm80 bf16 | simulated pretrain (20 MB × 24 layers) | 20 | 24 | 9 (planner) | 9 (1 per unique tree signature) | 11/20 hit (55%) | 0（所有 layer 共用同一个 BlockMask） | 18MB-1.6GB(按workload) | ✅ 跨层复用确认: 同一 micro-batch 的 24 层共用 1 个 BlockMask, 同形状 MB 复用 BM（4 次相同 → 75% 构建节省） |
 
 #### 2.2.6 PoC-2E：真实 FSDP remove-padding 精度与 restore
 
