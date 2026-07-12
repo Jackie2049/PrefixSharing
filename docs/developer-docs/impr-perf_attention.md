@@ -1359,7 +1359,11 @@ print(block_mask.full_kv_num_blocks.shape)
 
 | 环境 | case | constructor | block size | full / partial QK blocks | scheduled / logical | metadata cold / warm ms | compile cold / warm ms | output / grad gate | 结论 |
 |---|---|---|---:|---:|---:|---:|---:|---|---|
-| 待回填 |  |  |  |  |  |  |  |  |  |
+| 2026-07-12 / 23ee0ee1 / env-termius A100 sm80 | star_long_prompt (B=8,P=1024,R=128) | generic_mask_mod | 64 | kv_num_blocks=[1,1,34]; full_kv_total=417 | 0.078 | cold=330 warm=21 | — | ✅ `from_kv_blocks` 可用, full/partial区分需修正统计helper |
+| 2026-07-12 / 23ee0ee1 / env-termius A100 sm80 | star_long_prompt | generic_mask_mod | 128 | kv_num_blocks=[1,1,17]; full_kv_total=100 | 0.157 | cold=24 warm=22 | — | ✅ bs128平衡 |
+| 2026-07-12 / 23ee0ee1 / env-termius A100 sm80 | star_long_prompt | generic_mask_mod | 256 | kv_num_blocks=[1,1,9]; full_kv_total=22 | 0.479 | cold=42 warm=21 | — | sched/logical随bs增大 |
+| 2026-07-12 / 23ee0ee1 / env-termius A100 sm80 | chain_depth12 (T=60) | generic_mask_mod | 64 | nQ_blocks=1; full=0 partial=1 | 2.24 | cold=15 warm=11 | — | ⚠️ 片段化: partial block浪费 |
+| 2026-07-12 / 23ee0ee1 / env-termius A100 sm80 | deep_fragmented (T=21) | generic_mask_mod | 64 | nQ_blocks=1; full=0 partial=1 | 24.53 | cold=15 warm=15 | — | ⚠️ 高碎片化, HBM 17MB可接受 |
 
 #### 2.2.4 PoC-2C：三路径 attention module 速度与完整 HBM
 
