@@ -1396,7 +1396,18 @@ module_end_to_end_ms
 
 | 环境 | case | mode | original / dedup / expanded tokens | prepare ms | build-KV / BlockMask ms | fwd p50/p90 ms | bwd p50/p90 ms | module p50 ms | peak allocated / reserved MB | K/V bytes | 结论 |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 待回填 |  |  |  |  |  |  |  |  |  |  |  |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | no_sharing (B=8,L=128) | ps_off_fa | 1024/1024/1024 | 1.2 | — | — | — | 1.2 | 6 | 1024 | baseline,无共享 |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | no_sharing | ps_on_expanded_fa | 1024/1024/1024 | 1.6 | 0 | 0 | 0 | 1.6 | 6 | 1024 | build_kv约0,与ps_off相同 |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | no_sharing | ps_on_dedup_flex | 1024/1024/1024 | 18.0 | 0 | 9 | 9 | 18.0 | 196 | 1024 | ❌ Flex为no-sharing场景额外开销10x+ |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | star_long_prompt (B=8,P=1024,R=128,dedup=2176) | ps_off_fa | 10368/2176/10368 | 1.5 | — | — | — | 1.5 | 196 | 10368 | baseline,全量token |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | star_long_prompt | ps_on_expanded_fa | 10368/2176/10368 | 2.7 | 1.0 | 0 | 1.7 | 2.7 | 196 | 10368 | build_kv~1ms,attention~1.7ms |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | star_long_prompt | ps_on_dedup_flex | 10368/2176/10368 | 21.3 | 0 | 8 | 13 | 21.3 | 842 | 2176 | ⚠️ Flex fwd~13ms+BM~8ms,peakHBM842MB(含JIT),KV压缩4.8x |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | chain_depth6 (orig=72,dedup=40) | ps_off_fa | 72/40/72 | 0.3 | — | — | — | 0.3 | 842 | 72 | ⚠️ peakHBM含上一case残留 |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | chain_depth6 | ps_on_expanded_fa | 72/40/72 | 0.6 | 0.2 | 0 | 0.4 | 0.6 | 842 | 72 | build_kv~0.2ms |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | chain_depth6 | ps_on_dedup_flex | 72/40/72 | 17.4 | 0 | 8 | 9 | 17.4 | 9 | 40 | ✅ KV零冗余,KV=40vs72,peakHBM降至9MB |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | deep_frag (B=6,orig=64,dedup=21) | ps_off_fa | 64/21/64 | 1.0 | — | — | — | 1.0 | 9 | 64 | baseline |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | deep_frag | ps_on_expanded_fa | 64/21/64 | 1.9 | 0.8 | 0 | 1.0 | 1.9 | 9 | 64 | build_kv~0.8ms |
+| 2026-07-12 / 224e0cec / env-termius A100 sm80 bf16 | deep_frag | ps_on_dedup_flex | 64/21/64 | 17.7 | 0 | 7 | 10 | 17.7 | 8 | 21 | ✅ KV零冗余,KV=21vs64,peakHBM=8MB |
 
 #### 2.2.5 PoC-2D：真实训练 shape 生命周期与跨层 metadata 复用
 
