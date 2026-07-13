@@ -1240,164 +1240,293 @@ tools 删除标准：
 
 ## Chapter 3：测试验证
 
-测试目标是证明重构没有改变 prefix-sharing 的核心精度语义，并让开源关键路径有足够保护。测试按 PR 粒度分层，不要求每个 PR 都跑 GPU/NPU optional 测试，但核心 CPU/torch 语义测试必须稳定。
+本章是代码开发完成后的验证执行手册。验证目标不是只确认程序“不报错”，而是按由内到外的顺序证明：核心语义正确、patch 与训练引擎接线正确、开启 PrefixSharing 后训练数值与 baseline 一致，并在固定工作负载下量化性能影响。
 
-### 3.1 通用回归命令
+执行顺序固定为：开发自测 -> 功能验证 -> 集成验证 -> 精度对齐 -> 性能对比 -> 冒烟测试。前一层失败时，不进入后一层；设备或可选依赖缺失导致的 skip 必须如实记录，不能视作通过。
 
-标准回归：
+### 3.1 通用约定与结果交付
+
+所有命令从仓库根目录执行。推荐统一设置：
 
 ```bash
-PYTHONPATH=prefix-sharing pytest -q \
+export PYTHONPATH=prefix-sharing
+export PYTHONPYCACHEPREFIX=/private/tmp/prefix-sharing-refactor-pycache
+export PREFIX_SHARING_PATCHSET=verl080_fsdp
+```
+
+设备侧 FSDP 验证还需要：
+
+```bash
+export VERL_USE_EXTERNAL_MODULES=prefix_sharing
+```
+
+每一项验证应建立独立结果目录，例如 `artifacts/validation/<YYYYMMDD>-<device>/`，至少保存：
+
+- 实际执行的完整命令与 git commit；
+- `python --version`、`pip show torch verl flash-attn` 的版本信息；GPU 记录 `nvidia-smi`，NPU 记录 `npu-smi info`；
+- pytest 的 passed / failed / skipped 摘要及完整日志；
+- 精度或性能脚本生成的 JSONL、诊断 dump 和比较报告；
+- 对失败或 skip 的原因、复现方式和影响范围。
+
+验收口径：`PASS` 表示命令退出码为零且满足本节规定的数值标准；`SKIP` 仅能用于缺少明确 optional 依赖或设备；任何断言失败、NaN/Inf、训练进程异常、ON/OFF 输入不一致都记为 `FAIL` 或 `BLOCKED`，不得以平均指标掩盖。
+
+### 3.2 开发自测：UT、IT、ST
+
+这一层不依赖真实 verl 训练任务，负责保护 core、backend、patch 与轻量 FSDP adapter。必须先完成，作为所有后续设备验证的准入条件。
+
+#### 3.2.1 UT：模块语义和精度不变量
+
+执行：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider prefix-sharing/tests/unit_test
+```
+
+重点关注：
+
+- `test_detector.py`、`test_planner.py`：no-sharing、one-provider、多 reuser、chain reuse 的 provider/reuser 关系与裁剪 plan；
+- `test_kv_builder.py`、`test_prefix_store.py`：provider-before-reuser 的 KV store/load、TP padding 排除、KV 不 detach；
+- `test_packed_layout*.py`、`test_runtime_context.py`：TP packed layout、RoPE 位置与 prefix-last restore index；
+- `test_verl_fsdp_ch4_functional.py`：任意前缀、多 reuser、chain、fallback、position id；
+- `test_verl_fsdp_ch4_precision.py`：reuser suffix attention、梯度回传、interior prefix restore、prefix-last logprob restore。
+
+通过标准：所有已收集测试通过；由于本机缺少 `torch` 而 skip 的场景必须转到有 torch 的环境补跑，不能用 CPU-only collection 作为 UT 结论。
+
+#### 3.2.2 IT：patch、后端与可选设备集成
+
+基础集成测试：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider prefix-sharing/tests/integrated_test
+```
+
+GPU CUDA + FlashAttention 环境追加：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/integrated_test/optional/test_gpu_flash_backend.py
+```
+
+NPU + torch_npu + MindSpeed 环境追加：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/integrated_test/optional/test_npu_flash_backend.py
+```
+
+通过标准：
+
+- `test_patch_integrations.py` 覆盖 import auto patch、显式安装、重复安装、FSDP patchset 选择和 PrefixGrouper 配置分流，必须全过；
+- GPU/NPU 后端测试必须对齐 TorchReferenceBackend 的 attention 输出与 Q/K/V 梯度；当前测试中 fp16 的单元素最大绝对误差门槛为输出 `< 5e-2`、梯度 `< 2e-1`；
+- optional 测试只有在对应设备或依赖缺失时可以 skip；设备齐全但测试被 skip 时，应排查 skip 条件，不可直接接受。
+
+注意：`test_verl080_restore_e2e.py` 目前含真实 verl engine fixture 的 TODO 和显式 skip，它只说明测试接口预留，**不能**计入“真实 verl080 端到端验证通过”。真实接线验证以 3.4 为准。
+
+#### 3.2.3 ST：跨模块核心流程
+
+执行：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider prefix-sharing/tests/system_test
+```
+
+再执行一次完整开发回归：
+
+```bash
+python3 -m pytest -q -p no:cacheprovider \
   prefix-sharing/tests/unit_test \
   prefix-sharing/tests/integrated_test \
   prefix-sharing/tests/system_test
 ```
 
-可选环境变量：
+通过标准：`test_system_phase1_core.py` 证明 detector -> planner -> runtime context -> KV reuse -> restore 的框架无关主链路完整通过；完整回归中，非 optional 的失败数必须为零。
+
+### 3.3 功能验证：PrefixSharing 行为是否按设计生效
+
+功能验证使用固定、可人工检查的输入，验证“正确启用、正确回退、正确复用”，不以真实训练吞吐作为判断。建议优先在 CUDA 环境执行，也允许先在 CPU + torch 环境完成。
+
+#### 3.3.1 KV builder correctness guard
+
+CPU float32 先跑精确 oracle：
 
 ```bash
-PYTHONPYCACHEPREFIX=/private/tmp/prefix-sharing-refactor-pycache
+python3 prefix-sharing/tools/verify_p0_correctness.py \
+  --device cpu --dtype float32 \
+  --output artifacts/validation/<run>/p0-cpu.jsonl
 ```
 
-文档-only 改动可不跑 pytest，但提交说明必须写明原因。
+CUDA 环境追加生产精度检查：
 
-### 3.2 PR-A：清理 Qwen3.5 / GDN 专门化代码
+```bash
+python3 prefix-sharing/tools/verify_p0_correctness.py \
+  --device cuda --dtype bfloat16 \
+  --output artifacts/validation/<run>/p0-cuda-bf16.jsonl
+```
 
-测试范围：
+该脚本覆盖 no-sharing、one-provider、multi-provider、chain、短序列与最小前缀边界，并将当前 `build_kv` 与逐 row `torch.cat` reference 对比。
 
-- `prefix_store` attention KV store 单测。
-- backend factory / capabilities 单测。
-- `core.__all__` / `backends.__all__` 导出检查。
+通过标准：结果 JSONL 中每条记录的 `PASS` 为 true；CPU float32 的 expanded KV 必须精确等价；CUDA bf16 结果必须满足脚本内置 comparison，并且 provider prefix 对应梯度存在且非零。任何 `prefilter_correct=false`、KV 形状不符或梯度缺失都阻断后续阶段。
 
-新增或调整测试：
+#### 3.3.2 运行时分流与回退
 
-- 删除 GDN store/backend 相关测试，或迁移到历史实验目录后不作为主线 CI。
-- 新增断言：主包不导出 `PrefixDeltanetStore`、`StoredDeltanetState`、`PrefixDeltanetBackend`。
-- attention store 梯度流测试保留，验证 KV 不 detach。
+使用 `test_patch_integrations.py` 和 `test_verl_fsdp_ch4_functional.py` 验证以下矩阵：
 
-验收：
+| 配置 | 预期 |
+|---|---|
+| `use_prefix_grouper=false` | 不进入 PrefixSharing |
+| `mode=prompt_only` | 留在 PrefixGrouper 原路径 |
+| `mode=arbitrary_prefix` | 构建 PrefixSharing plan 并进入 runtime |
+| 无可共享前缀 / 单样本 | 返回原 batch，安全 fallback |
+| one-provider / 多 reuser / chain | reuser 指向正确 provider，保留原绝对 position id |
 
-- 所有 attention KV store 测试通过。
-- 没有主线测试依赖 Qwen3.5/GDN 类型。
+通过标准：每一行均能由现有测试或固定 batch 手工日志证明；尤其不能出现“feature 已开启但无共享时修改 batch”或“prompt_only 被 PrefixSharing 抢占”。
 
-### 3.3 PR-B：shared KV builder
+### 3.4 集成验证：真实 verl FSDP 接线
 
-测试范围：
+本阶段在目标设备上验证真正的 verl 训练引擎，而不是 fake adapter。首选环境为 `verl cdd9014f + torch 2.4 + Qwen2.5-0.5B + FSDP`；使用 packed 路径时必须设置 `actor_rollout_ref.model.use_remove_padding=true`。当前首版不把 Ulysses SP、ring attention、fused kernels 作为通过范围。
 
-- no-sharing：输出 KV 等于输入 valid KV。
-- one-provider：reuser KV = provider prefix KV + reuser suffix KV。
-- chain reuse：多级 provider/reuser 顺序正确。
-- TP padding：padding slot 不进入 store，不进入 expanded KV。
-- gradient flow：provider prefix KV 被 reuser 使用时，梯度能回到 provider hidden states。
+#### 3.4.1 接线前检查
 
-新增测试：
+确认版本与 patch：
 
-- `tests/unit_test/test_kv_builder.py`
-- GPU/NPU backend 不 import TorchRef 的静态/行为检查。
-- 与旧 TorchRef build_kv 的等价性测试，作为迁移保护。
+```bash
+python3 -c 'import prefix_sharing; import verl; import torch; print("torch", torch.__version__); print("verl", getattr(verl, "__version__", "snapshot"))'
+```
 
-验收：
+启动命令必须同时包含或导出：
 
-- shared builder 输出与旧行为一致。
-- `flash_atten_gpu.py` / `flash_atten_npu.py` 不再为 `build_kv()` import TorchReferenceBackend。
-- FA backend 既有测试通过。
+```bash
+export VERL_USE_EXTERNAL_MODULES=prefix_sharing
+export PREFIX_SHARING_PATCHSET=verl080_fsdp
+export ENABLE_PREFIX_SHARING=1
+```
 
-### 3.4 PR-C：verl_utils / runtime_state 抽离
+并在任务配置中启用 `use_prefix_grouper=true` 与 `prefix_grouper.mode=arbitrary_prefix`。当前环境变量是兼容开关；配置入口用于验证 verl 用户可见语义，两者都要记录。
 
-测试范围：
+#### 3.4.2 最小真实 forward/backward
 
-- 配置解析。
-- batch trim helper。
-- FSDP adapter。
-- MCore adapter。
+以固定 provider + reuser batch 执行一次 actor log-prob 与一次 actor backward。可以用现有 verl 任务入口缩小到一个 micro-batch，也可以由 Claude Code 创建最小 engine fixture；必须覆盖：
 
-新增或调整测试：
+1. provider 与至少一个 reuser 有长度不少于 `min_prefix_len` 的公共前缀；
+2. 一条无共享 batch，验证安全 fallback；
+3. reuser 的 suffix、interior prefix 和 prefix-last 三个输出区段；
+4. 一次 `loss.backward()`，验证 provider prefix 参数梯度非零且无 NaN/Inf。
 
-- `use_prefix_grouper=false` -> disabled。
-- `prompt_only` -> disabled，且不进入 PrefixSharing。
-- `arbitrary_prefix` / `arbitrary-prefix` / `prefix_sharing` -> enabled。
-- `prefix_sharing_config` 与 `prefix_grouper.mode` 同时存在时优先级稳定。
-- FSDP 不 import `verl_mcore.py` 私有 helper，可通过 `rg` 或 import-level 单测保护。
+通过标准：patch 安装成功；模型 forward/backward 无异常；audit/diagnostic 中能看到实际 reuse；无共享 batch 与关闭特性时走普通路径；输出 shape、NestedTensor offsets 或 packed lengths 与原 batch 长度一致。若真实 fixture 尚未补到 `test_verl080_restore_e2e.py`，本阶段的脚本、固定输入和日志必须作为测试产物保存，后续再将其固化为该测试文件。
 
-验收：
+#### 3.4.3 分布式覆盖
 
-- FSDP/MCore 都从 `verl_utils.py` 读取配置。
-- `PrefixSharingRuntimeState` 从公共模块 import。
-- 现有 FSDP adapter 测试通过。
+FSDP 按实际可用卡数依次验证 1、2、4、8 卡。每个规模使用相同模型、相同固定输入、相同每卡 micro-batch 配置，并单独记录 world size。TP 不属于 FSDP-first 首版硬性前置；若目标路径启用了 TP，则必须追加 `tests/unit_test/test_packed_layout*.py` 和对应的真实 packed layout 检查，确认 padding slot 不进入 KV store 或 restore。
 
-### 3.5 PR-D：patch 体系收敛
+通过标准：各规模均能完成至少一个 forward/backward；world size 变化不改变同一固定样本的语义结果；任何仅在多卡出现的 shape、collective、restore index 错误均为阻断问题。
 
-测试范围：
+### 3.5 精度对齐：PrefixSharing ON 与 baseline OFF
 
-- `setup.install("verl080_fsdp")`。
-- import auto patch。
-- lazy import hook。
-- repeated install。
+精度验证是发布红线。比较对象必须来自**同一模型权重、同一随机种子、同一固定输入、同一 dtype、同一并行配置**。不要使用随机 rollout 生成的不同 response 直接比较 logprob；先固定或回放 `input_ids`、`attention_mask`、`position_ids` 与 labels。
 
-新增或调整测试：
+#### 3.5.1 对照运行
 
-- 删除旧 `PatchManager` 专属测试。
-- 新增 auto + explicit 混用幂等测试。
-- 新增 target 已 import / 未 import 两种 patch 顺序测试。
-- 新增 `PREFIX_SHARING_PATCHSET=verl080_fsdp` 选中 FSDP patchset 测试。
-- 新增 patch 失败错误信息测试。
+分别执行两次同一 micro-batch：
 
-验收：
+```bash
+# baseline
+ENABLE_PREFIX_SHARING=0 PREFIX_SHARING_DIAG_DUMP=artifacts/validation/<run>/off <same-verl-command>
 
-- `integrations/patch_manager.py` 删除后没有 import 残留。
-- setup patch set 测试覆盖真实生产入口。
-- 默认 import 不刷屏。
+# PrefixSharing
+ENABLE_PREFIX_SHARING=1 PREFIX_SHARING_DIAG_DUMP=artifacts/validation/<run>/on <same-verl-command>
+```
 
-### 3.6 PR-E：文档、README、compat matrix
+若沿用 `docs/user-guide/engine-fsdp.md` 的诊断工具路径，先确认该工具在当前分支存在；不存在时由 Claude Code 使用 `diagnostics.py` 产物或直接保存 tensor，计算逐元素误差。不要伪造不存在的 `cmp_diag_verl080.py` 命令。
 
-测试范围：
+#### 3.5.2 必比指标与位置分段
 
-- config docs 示例可被解析。
-- compat matrix 能识别 FSDP-first patch set。
-- README 命令与当前文件路径一致。
+对每个 reuser 的完整原始序列分别比较：
 
-新增或调整测试：
+- `log_probs`：prefix interior、prefix-last、suffix-first、后续 suffix；
+- `entropy` 与 `logits`：可取得时逐元素比较；
+- 训练 loss：同一 reduction 后比较；
+- 关键参数或梯度 bucket：比较 max absolute difference、max relative difference、NaN/Inf；
+- provider prefix 的梯度：必须存在且非零，证明 KV store 没有 detach。
 
-- 若已有 docs lint，可加入 README snippet 检查。
-- 若无 docs lint，至少通过人工 review 和 `rg` 检查旧入口是否仍被首推。
+prefix-last 必须单独报告。它使用 provider 的最后一个 prefix logits 与 reuser label 重算；只比较 suffix 平均值无法覆盖此红线。
 
-验收：
+#### 3.5.3 容差与通过标准
 
-- README 首屏不再把 Megatron-only 作为唯一定位。
-- `ENABLE_PREFIX_SHARING` 被描述为开发/调试 fallback。
-- PrefixSharing / PrefixGrouper 关系说明完整。
+分两级执行：
 
-### 3.7 PR-F：PrefixGroup / Plan 概念瘦身
+- CPU float32 / TorchReference：`torch.equal` 或 `allclose(atol=1e-5, rtol=1e-5)`；
+- GPU/NPU bf16/fp16 实际训练：先使用 `allclose(atol=1e-4, rtol=1e-3)` 检查 logprob/loss；FA attention 单元级输出和梯度沿用现有 optional test 的最大误差阈值，输出 `< 5e-2`、梯度 `< 2e-1`。
 
-测试范围：
+若模型、kernel 或并行实现导致超出上述训练级阈值，不能直接放宽阈值。必须保存最大误差位置、对应 token、ON/OFF tensor 切片和环境信息，先定位是数值舍入、mask、position、restore 还是梯度图问题，再由项目负责人决定是否调整门槛。
 
-- detector。
-- planner。
-- observability。
-- runtime context restore index。
+精度报告至少列出：每类指标的 max/mean absolute difference、max relative difference、异常数量、prefix-last 最大误差、provider gradient norm、结论。所有受测点在阈值内且无 NaN/Inf 才可通过。
 
-新增或调整测试：
+### 3.6 性能对比：先测核心，再测真实训练
 
-- 删除 group_fields 后，one-provider/multi-reuser/chain reuse plan 不变。
-- `sharing_group_count` 从 `reuse_specs` 推导。
-- `prefix_last_restore` 不依赖 `group_id`。
+性能只在精度通过后执行。所有实验使用相同硬件、软件版本、模型权重、dtype、输入集、warmup 和重复次数；CUDA 计时必须同步。性能结果不得和不同输入或不同有效 token 数的 run 横向比较。
 
-验收：
+#### 3.6.1 standalone 基准
 
-- `rg "PrefixGroup|group_ids|group_id" prefix-sharing/prefix_sharing` 无主线残留，除非文档或迁移说明。
-- Plan 字段减少但 backend/runtime 行为不变。
+先运行聚焦 benchmark：
 
-### 3.8 真实环境验证
+```bash
+python3 prefix-sharing/tools/perf_baseline_benchmark.py \
+  --backend flash_atten_gpu --sync 1 --num-runs 50 \
+  --output artifacts/validation/<run>/perf-baseline.jsonl
+```
 
-首批开源前至少需要：
+再运行覆盖 sharing pattern、batch size、sequence length、模型 shape、CPU/device/memory 的矩阵：
 
-- FSDP 单卡 smoke：Qwen2.5-0.5B，PrefixSharing disabled/enabled 都能跑通。
-- FSDP 精度对齐：固定 batch，logprob/loss/grad 与 baseline 对齐。
-- FSDP 性能对比：baseline、PrefixGrouper prompt-only、PrefixSharing arbitrary-prefix 三方对比。
-- optional GPU FA test：有 flash-attn 环境时跑。
-- optional NPU test：有 torch_npu 环境时跑。
+```bash
+python3 prefix-sharing/tools/perf_comprehensive_benchmark.py \
+  --phase all --cpu-runs 50 --device-runs 20 \
+  --output artifacts/validation/<run>/perf-comprehensive.jsonl
+```
 
-真实环境结果应写入文档或 release note，不要求每个本地 PR 都复跑。
+GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果，不能外推为训练加速比。NPU 性能需单列脚本和结论，不能拿 GPU FA benchmark 代替。
+
+通过标准不是预设“必须加速多少”，而是结果完整、可复现、无 OOM，并能解释 no-sharing、one-provider、multi-provider、chain 四类输入的趋势。重点记录 detector/planner、KV builder、attention、端到端 step 的 p50/p90，以及 peak memory。
+
+#### 3.6.2 真实 FSDP 三方对比
+
+在固定 replay batch 上比较：
+
+1. baseline：`use_prefix_grouper=false` / `ENABLE_PREFIX_SHARING=0`；
+2. PrefixGrouper prompt-only：`mode=prompt_only`；
+3. PrefixSharing arbitrary-prefix：`mode=arbitrary_prefix`。
+
+每个场景至少 warmup 10 step、采样 30 step；计时范围必须相同，建议分别报告 actor forward、forward+backward、完整 train step 和峰值显存。输入至少包含 no-sharing、同 prompt 多 response、任意子前缀/chain 三类；报告总 token、有效 Q token、expanded KV token、reused token，防止只比较 wall time 却忽略工作量变化。
+
+通过标准：无数值回退、无 OOM、同一输入下精度仍在 3.5 阈值内。性能结果允许某些短序列或低复用率场景无收益，但必须如实展示，不得只筛选收益 case。
+
+### 3.7 冒烟测试：最小可训练任务
+
+冒烟测试验证从环境导入、patch 安装、verl 配置到训练任务收尾的完整可用性。使用 Qwen2.5-0.5B、最小数据集和最少 step，先单卡，再按资源扩展。
+
+前置条件：模型路径、训练/验证 parquet 路径有效；当前 `examples/run_verl_training.sh` 的配置名仍偏 Megatron，因此 FSDP smoke 应以 `docs/user-guide/engine-fsdp.md` 的 FSDP 参数为准或由 Claude Code 提供一个明确的 FSDP 启动命令，不能误将该脚本当作 FSDP smoke。
+
+执行步骤：
+
+1. 用 `ENABLE_PREFIX_SHARING=0` 跑 1-3 个 train step，确认 baseline 可启动、可完成 backward 和 checkpoint/log 输出；
+2. 保持除使能方式外所有配置不变，切到 `ENABLE_PREFIX_SHARING=1` 与 `mode=arbitrary_prefix`，再跑 1-3 step；
+3. 对有共享输入确认 runtime audit 显示实际 reuse；对无共享输入确认安全 fallback；
+4. 观察训练退出码、loss、显存峰值、NaN/Inf、worker 异常和 patch 安装信息；
+5. 在资源允许时将同一 smoke 扩展到 2/4/8 卡 FSDP。
+
+通过标准：ON/OFF 都能干净结束；ON 路径确实安装 `verl080_fsdp` patch 并发生 reuse；无共享数据不改变训练正确性；无 OOM、死锁、collective 超时、NaN/Inf 或 restore shape 错误。冒烟通过不替代 3.5 精度对齐与 3.6 性能结论。
+
+### 3.8 建议的执行与汇报顺序
+
+| 阶段 | 执行者 | 交付物 | 放行条件 |
+|---|---|---|---|
+| 开发自测 | 开发者 / CI | pytest 日志与计数 | 非 optional 测试零失败 |
+| 功能验证 | Claude Code | P0 JSONL、固定输入结论 | KV、梯度、fallback 正确 |
+| 集成验证 | Claude Code + device 环境 | real engine 日志、world-size 记录 | FSDP forward/backward 成功 |
+| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 |
+| 性能对比 | Claude Code + device 环境 | JSONL、汇总表、环境信息 | 结果完整且精度未回退 |
+| 冒烟测试 | Claude Code + device 环境 | 最小训练日志 | ON/OFF 均稳定跑通 |
+
+测试完成后，将结果摘要（命令、环境、通过/skip/失败数、精度阈值、性能结论、已知限制）更新到 PR 的 `## 测试结果` 小节；仍未覆盖的设备、并行策略或真实 e2e fixture 回填本文件 Chapter 6，并在 PR 中明确其潜在影响。
 
 ## Chapter 4：开发计划
 
