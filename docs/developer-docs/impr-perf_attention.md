@@ -1805,6 +1805,102 @@ partial_count + full_count == reconstructed_scheduled_block_count
 - 3D 若因环境 blocked，不阻塞 core/layout 和 experimental backend 开发，但阻塞 verl PR 的最终性能结论；
 - 2E/2F 不在第三轮重复，它们在 minimal backend 完成后转入 Chapter 4 的集成验证和精度验收。
 
+#### 2.3.8 第三阶段补充测试（待执行：关闭真实路径证据缺口）
+
+2026-07-13 回填的 3A/3B/3C 提供了有价值的探索性观察，但**尚未满足本节前述的硬性契约**。这不是要求重新做全部第三阶段实验，而是只补做以下三个精确的验证。完成前，不得将当前 bf16 精度、FA/Flex 时延、peak HBM 或 fallback 阈值标为 `PASS`、默认策略或对外性能结论。
+
+| 项目 | 可保留的探索性观察 | 仍未被证明的结论 | 本轮补充测试的唯一目标 |
+|---|---|---|---|
+| 3A | fp32 下手写 sparse mask 的 Flex 与 dense oracle 对齐 | 当前项目 `build_kv + production FA` 与 Flex 的 output / QKV gradient 一致 | 用相同语义、相同输入和完整 autograd 比较两条真实路径 |
+| 3B | generic BlockMask 可构造；长 star 的 block 数量较规整 | 每个逻辑可见 token pair 都被调度覆盖；tail block 计数准确 | 逐 token 验证 visibility/coverage，不只比较总量 |
+| 3C | 去重 K/V 的字节数更小；2.9.1 compile 值得继续研究 | 真实训练路径的 forward/backward 时延和 HBM | 调用 production backend、保留 autograd、独立进程测量 |
+
+所有补充脚本必须放在 `scripts/poc_attention/`，使用仓库相对路径或 `PYTHONPATH=prefix-sharing`，禁止硬编码服务器路径。每一个 `PASS` 必须由代码断言产生；脚本发现失败时必须以非零退出码退出。结果、环境、准确命令和脚本 commit 必须回填到本小节的表格。
+
+##### 2.3.8.1 补充 3A：真实 expanded 路径与 Flex 的精度/梯度闭环
+
+建议新建 `poc_3a_real_path_precision.py`；不要在原 3A 上继续堆分支，以免遗留的手写 reference 造成混淆。
+
+**必须比较的三条路径。** 每条路径都从同一份 `q0/k0/v0.detach().clone().requires_grad_(True)` 开始，使用同一个随机 `upstream_gradient`：
+
+```text
+A. project-expanded reference
+   build_prefix_expanded_kv() -> GpuFlashAttentionBackend.attention()
+
+B. sparse candidate
+   deduplicated Q/K/V -> generic BlockMask -> flex_attention()
+
+C. fp32 dense oracle
+   deduplicated Q/K/V -> token-level PrefixTree mask -> SDPA
+```
+
+这里 A 是**唯一**可用于验证当前 PrefixSharing 语义的 expanded reference。不得以逐 row `flash_attn_varlen_func`、手写 `torch.cat()`、普通 SDPA 或只比较 Flex/dense oracle 代替 A。
+
+**特别容易写错的因果位置。** 对 reuser，Q 是 suffix，而 expanded KV 是 `prefix + suffix`。如果确需写 SDPA oracle，Q 第 `q_offset` 个 token 对应 KV 第 `prefix_length + q_offset` 个位置；普通从 `(0, 0)` 开始的下三角会把 prefix 位置错当成 Q 的历史。优先调用既有 `TorchReferenceBackend`，而不是重新手写该 mask。
+
+**必须执行和断言。**
+
+1. spy `build_prefix_expanded_kv` 和 `GpuFlashAttentionBackend.attention`，断言两者都被调用；记录模块、qualname 和调用次数。
+2. fp32：A/B/C 比较 output、Q gradient、K gradient、V gradient，记录 `max_abs`、`mean_abs`、`relative_l2`、cosine、finite 和 norm。
+3. bf16：A/B 各自与同一 fp32 C oracle 对比；不得把 `relative_l2` 约 `0.75`、cosine 约 `0.5` 解释为正常 reduction 差异。若出现这类量级，测试必须 `FAIL` 并输出 first mismatched token / row / offset。
+4. provider directed-gradient：只对最深 leaf 的 **suffix 输出** 施加 loss；断言其 ancestor/provider prefix 的 K、V gradient norm 均严格大于零，并与 A/C 的对应位置一致。不能检查 provider Q gradient 代替 K/V gradient。
+5. 覆盖 `star_aligned`、`star_long_prompt`、`chain_depth3/6/12`、`deep_fragmented`、`multi_group`；每个共享 case 必须实际发生至少一次 reuse。
+
+**通过条件。** fp32 下 A/B/C 的 output 和 Q/K/V gradient 同量级对齐；bf16 下 B 相对 C 的误差不得显著劣于 A 相对 C；provider directed-gradient 对 A/B/C 都存在且语义一致。任何一项失败，3A 为 `FAIL`，不能仅保留“Flex vs dense PASS”。
+
+##### 2.3.8.2 补充 3B：逐 token BlockMask coverage 与 tail-block 统计
+
+建议新建 `poc_3b_exact_coverage.py`。
+
+**coverage 断言必须逐元素。** 对小/中等 case 构造 `logical_mask[T,T]`，从 `kv_indices` 和 `full_kv_indices` 重建 `scheduled_coverage[T,T]` 后，必须断言：
+
+```python
+assert torch.all((~logical_mask) | scheduled_coverage)
+```
+
+只检查 `scheduled_coverage.sum() >= logical_mask.sum()` 是无效验证：相同数量的 block 可能覆盖了错误位置。对每个 partial block 还要实际调用 `mask_mod`，确认 sibling/cross-tree token 不会被开放；对每个 full block，断言其有效 token pair 全部属于 `logical_mask`。
+
+**计数必须正确。** `partial_count = sum(kv_num_blocks)`，`full_count = sum(full_kv_num_blocks)`，两者相加后必须等于重建出的 scheduled block 数。`scheduled_elements` 必须按每个 Q/K block 的实际尾部长度计算，禁止统一使用 `block_size * block_size`。
+
+覆盖 `block_size=64/128/256`、tail block、star、chain、deep fragmented；每个 case 至少一次 fp32 output/QKV gradient 与 dense oracle 对齐。`from_kv_blocks()` 只有实际构造 direct BlockMask 并完成上述 visibility/精度验证时才能改为 `PASS`；否则继续保持 `API_PRESENT_NOT_VALIDATED`，这不阻塞 generic 首版。
+
+##### 2.3.8.3 补充 3C：production backend 的训练级性能与 HBM
+
+建议新建父进程 `poc_3c_real_backend_perf.py` 和单 case worker。父进程必须为每个 `(workload, mode)` 启动一个新的 Python worker，禁止在同一解释器顺序运行 `ps_off_fa`、expanded FA、Flex 后直接横向比较 peak memory。
+
+**三条必须真实执行的路径。**
+
+```text
+PS=OFF:                 production native packed FA
+PS=ON expanded:         build_prefix_expanded_kv() + GpuFlashAttentionBackend.attention()
+PS=ON deduplicated:     generic BlockMask + compiled flex_attention()
+```
+
+- expanded 路径必须保留 builder 返回 K/V 的 autograd 图，禁止 `detach()`、`requires_grad_(True)` 重建 K/V，禁止直接逐 row 调用 `flash_attn_varlen_func`。
+- 使用 spy/counter 记录 builder、`GpuFlashAttentionBackend.attention()` 和其内部 varlen FA 调用；结果表中填入实际 call audit。
+- Flex 在目标 torch 2.9.1 上必须分别报告 compile cold、compile warm 和 steady-state；若没有 `torch.compile` 会退化到 unfused/materialized-score 路径，需明确标记，不能与 compiled Flex 混在同一性能列。
+- 每个 worker 在 `empty_cache()`、`reset_peak_memory_stats()` 后再创建该 mode 的所有 Q/K/V、layout、store 和 metadata；记录 `after_qkv`、`after_metadata`、`after_forward`、`after_backward`、`peak_allocated`、`peak_reserved`。
+- warm-up 20 次、计时 100 次；每次使用固定随机 upstream gradient 完整 backward，并在下一次前清空 Q/K/V grad。报告 forward/backward p50/p90。
+- 运行 single-layer 与 model-like 24-layer 两种口径；24-layer 只允许复用 immutable BlockMask，不能复用不同 layer 的 Q/K/V 或 autograd graph。
+
+最低 workload：`no_sharing`、`star_long_prompt`（至少 B=8 和 B=32，P=1024/2048，R=128/256）、`chain_depth6/12`、`deep_fragmented`；至少两个实际模型的 Q/KV-head shape。no-sharing 必须 bypass Flex。
+
+**通过条件。** 该测试的产物只用于生成策略输入，不预设“Flex 必须更快”。它必须真实回答：去重路径的完整 peak HBM、forward/backward 开销、24-layer 摊销，以及在哪些 topology/shape 下 compiled Flex 值得选择。未满足真实 backend、保留 autograd、独立进程三项之一时，结果标记 `INVALID`。
+
+##### 2.3.8.4 补充测试回填与新的 gate
+
+| 日期 / commit / 环境 | 3A real-path output/QKV-grad | 3B exact coverage/tail | 3C real backend fwd/bwd/HBM | torch 2.9.1 compile cold/warm | 结论 / 未关闭项 |
+|---|---|---|---|---|---|
+| 2026-07-13 / env-torch291 torch2.9.1+cu128 A100 sm80 | ✅ builder_calls=1, 7/7 fp32 PASS (flex_vs_oracle max < 2.1e-06), provider KV grad > 0 全部通过. bf16 expanded-vs-flex: cos~0.99999 rel_l2~0.004. exp_vs_oracle 未记录因expanded backend输出含repad | 待回填 | 待回填 | torch 2.9.1: BM cold~6.6s warm=2.0ms; compile(flex) fwd+bwd 10x avg=1.2ms (vs 2.8.0 无compile ~35ms) | 3A PASS: 真实expanded路径精度门满足, 可冻结generic BlockMask correctness设计; 3B/3C待补充后更新 |
+
+补充测试结束后的决策规则：
+
+- 3A 和 3B 均 PASS：可以冻结 generic BlockMask 的 correctness 设计，并合入/推进依赖该结论的 Flex backend Phase 3；Phase 1 core layout 与 Phase 2 协议拆分仍可在补充测试期间并行推进；
+- 3A PASS、3B generic PASS、direct 未验证：首版继续使用 generic builder，direct 留为 P1 优化；
+- 3C 有效：才讨论显式 backend 的推荐 workload 与 auto selector；
+- 3C 显示 compiled Flex 在目标场景仍无竞争力：Flex 可以继续作为 KV 零冗余 / 社区验证路径，但不得把它作为当前业务高性能落地的默认路径；
+- 任意结果与上述契约不符：在表中写 `INVALID` 或 `BLOCKED`，不得用近似实现补齐结论。
+
 ## Chapter 3：方案设计
 
 ### 3.1 设计目标、范围与明确非目标
