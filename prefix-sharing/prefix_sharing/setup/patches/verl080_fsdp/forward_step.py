@@ -27,6 +27,11 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         if not ps_config.enable_prefix_sharing:
             import os as _os_diag_off
 
+            # ── Perf profiling for OFF baseline ──
+            if perf_profiler is not None:
+                perf_profiler.start_memory()
+                perf_profiler.start_phase(PerfProfiler.PHASE_FORWARD)
+
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
             if (
@@ -40,6 +45,14 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 dump_fsdp_baseline_verl080(micro_batch, result, "train")
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
+
+            if perf_profiler is not None:
+                perf_profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
+                perf_profiler.stop_memory()
+                import os as _os_perf_off
+                _perf_dir = _os_perf_off.environ.get("PREFIX_SHARING_PERF_DIR")
+                if _perf_dir is not None:
+                    perf_profiler.save(_perf_dir)
             return result
 
         if hasattr(micro_batch, "to"):
