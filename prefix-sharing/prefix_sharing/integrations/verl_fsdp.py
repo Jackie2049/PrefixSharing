@@ -373,7 +373,13 @@ def _run_packed_attention_runtime(
     *,
     layer_id: int,
 ) -> Any:
+    from prefix_sharing.tools.perf_profiler import PerfProfiler
+
     plan = ctx.prefix_sharing_plan
+    profiler = PerfProfiler.current()
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_KV)
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
         packed_key,
         packed_value,
@@ -384,13 +390,22 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
-    return ctx.attention_backend.attention(
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
+    output = ctx.attention_backend.attention(
         packed_query,
         expanded_key,
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
     )
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
+
+    return output
 
 
 def _create_prefix_sharing_attention_wrapper(original_fn: Any) -> Any:
