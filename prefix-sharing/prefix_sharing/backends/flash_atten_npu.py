@@ -1,31 +1,32 @@
 """CANN/NPU Flash Attention backend for prefix sharing (s_packed mode).
 
-Uses MindSpeed's ``npu_fusion_attention`` fused kernel in **BSH layout** with a
-**s_packed custom BSHD atten_mask** (sparse_mode=1).
+Uses MindSpeed's ``npu_fusion_attention`` fused kernel with a **s_packed custom
+atten_mask** (sparse_mode=1).
 
-s_packed Mode
--------------
-All inputs are packed into a single s_packed sequence with deduplicated KV
-storage (shared prefixes are stored once). A global custom causal mask
-(built from plan.s_packed_kv_ranges) controls visibility.
+Two layout paths are supported:
 
-Mask semantics: ``atten_mask``: True = masked (not participate), False = visible.
-Shape = ``(batch_size, 1, max_q, s_packed_length)``:
-  - Each batch's visible KV positions come from plan.s_packed_kv_ranges.
-  - Padding rows/cols are left ``True`` so the kernel ignores them.
+TND single-sample path (default, recommended)
+---------------------------------------------
+All samples are concatenated into a single "super-sample" in TND format.
+The planner's global custom mask ``(total_q, s_packed_length)`` in SS format
+is used directly as ``atten_mask``.  This eliminates Q padding, K/V batch
+expansion, and the quadratic ``(B, max_q, s_packed_length)`` mask.
 
-Why BSH (not TND varlen)?
--------------------------
-We considered migrating to TND varlen (``actual_seq_qlen``) to skip the
-Q padding to ``max_q`` and the K/V ``expand`` along the batch dim.  However,
-the varlen kernel (``FlashAttentionVarLenScore``) constrains
-``atten_mask`` to **SS format** ``(maxSq, maxSkv)`` -- a single shared matrix
-with no batch dimension.  Prefix sharing requires per-batch custom mask
-content (each batch has its own prefix_len -> different causal boundaries
-in the s_packed KV space), which cannot be expressed as a single SS matrix.
-``npu_prompt_flash_attention`` accepts ``(B, 1, S1, S2)`` masks but is
-inference-only and lacks training/grad support.  Therefore BSH remains the
-correct layout for prefix sharing on NPU.
+Memory reduction vs BSH: ~4-8x (eliminates batch dim and padding overhead).
+
+BSH fallback path
+-----------------
+Each sample is padded to ``max_q`` and stacked into ``(B, max_q, H)`` with
+K/V expanded along the batch dim.  The BSHD mask
+``(batch_size, 1, max_q, s_packed_length)`` is built per-sample.  Use this
+path if TND + sparse_mode=1 is not supported on a particular CANN version.
+
+Mask semantics
+--------------
+- TND path: ``atten_mask`` shape ``(total_q, s_packed_length)``,
+  True = masked (not participate), False = visible.
+- BSH path: ``atten_mask`` shape ``(batch_size, 1, max_q, s_packed_length)``,
+  True = masked (not participate), False = visible.
 """
 
 from __future__ import annotations
@@ -129,7 +130,12 @@ def _build_s_packed_mask(
 # ---------------------------------------------------------------------------
 
 class NpuFlashAttentionBackend(FlashAttentionMixin):
-    """Ascend NPU backend via ``npu_fusion_attention`` (BSH, s_packed mode)."""
+    """Ascend NPU backend via ``npu_fusion_attention`` (s_packed mode).
+
+    Supports two layout paths:
+    - **TND** (default): single super-sample, SS mask, no padding/expansion.
+    - **BSH** (fallback): per-sample padded batch, BSHD mask.
+    """
 
     capabilities = BackendCapabilities(
         name="flash_atten_npu",
@@ -142,8 +148,15 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         supports_deltanet_state_reuse=False,
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_tnd: bool = True) -> None:
+        """
+        Args:
+            use_tnd: If True (default), use the TND single-sample path which
+                eliminates Q padding, K/V batch expansion, and the quadratic
+                BSHD mask.  Falls back to BSH if set to False.
+        """
         self._torch_ref = TorchReferenceBackend()
+        self._use_tnd = use_tnd
 
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         config.validate(model_config=model_config)
@@ -182,7 +195,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         )
 
     # ------------------------------------------------------------------
-    # attention — s_packed mode via BSHD npu_fusion_attention
+    # attention — dispatch TND or BSH path
     # ------------------------------------------------------------------
     def attention(
         self,
@@ -194,15 +207,137 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         packed_batch_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run prefix-sharing attention via BSHD ``npu_fusion_attention`` in s_packed mode.
+        """Run prefix-sharing attention via ``npu_fusion_attention`` in s_packed mode.
 
-        Q: (total_q, n_heads, d) — per-input suffix tokens, padded per input
-        K/V: (s_packed_length, n_kv_heads, d) — s_packed unique KV (去重)
-        mask: (batch_size, 1, max_q, s_packed_length) — global custom causal
+        Dispatches to TND (default) or BSH path based on ``self._use_tnd``.
+
+        Q: (total_q, n_heads, d) — THD format
+        K/V: (s_packed_length, n_kv_heads, d) — THD format, deduplicated
+        """
+        if self._use_tnd:
+            return self._attention_tnd(query, key, value, prefix_sharing_plan, **kwargs)
+        else:
+            return self._attention_bsh(
+                query, key, value, prefix_sharing_plan,
+                packed_batch_layout=packed_batch_layout, **kwargs,
+            )
+
+    # ------------------------------------------------------------------
+    # TND path — single super-sample, SS mask (recommended)
+    # ------------------------------------------------------------------
+    def _attention_tnd(
+        self,
+        query: Any,
+        key: Any,
+        value: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        **kwargs: Any,
+    ) -> Any:
+        """TND single-sample path: all Q tokens as one sequence, SS custom mask.
+
+        Eliminates:
+        - Q padding to max_q (saves memory + compute)
+        - K/V batch expansion (avoids potential materialization)
+        - Quadratic (B, max_q, s_packed_length) mask
+
+        The planner's global custom mask ``(total_q, s_packed_length)`` with
+        ``True = visible`` is inverted to ``True = masked`` and passed directly
+        as the SS-format ``atten_mask`` to the TND kernel.
         """
         layer_id = kwargs.get('layer_id', '?')
         print(
-            f"[PS][backend][s_packed] flash_atten_npu attention: "
+            f"[PS][backend][s_packed] flash_atten_npu TND attention: "
+            f"layer={layer_id}, "
+            f"q_shape={tuple(query.shape)}, k_shape={tuple(key.shape)}, "
+            f"v_shape={tuple(value.shape)}"
+        )
+
+        torch = _torch()
+        npu_fusion_attention = _import_npu_fusion_attention()
+
+        q = self._ensure_3d_thd(query, "query")
+        k = self._ensure_3d_thd(key, "key")
+        v = self._ensure_3d_thd(value, "value")
+
+        plan = prefix_sharing_plan
+        total_q = sum(plan.s_packed_q_lengths)
+        s_packed_length = plan.s_packed_length
+
+        if q.shape[0] != total_q:
+            raise FlashBackendValidationError(
+                f"q.shape[0]={q.shape[0]} != total_q={total_q}"
+            )
+        if k.shape[0] != s_packed_length:
+            raise FlashBackendValidationError(
+                f"k.shape[0]={k.shape[0]} != s_packed_length={s_packed_length}"
+            )
+
+        if total_q == 0 or s_packed_length == 0:
+            return torch.zeros_like(q)
+
+        num_q_heads = q.shape[1]
+        head_dim = q.shape[-1]
+
+        # --- Mask: reuse planner's cached global custom mask, invert polarity ---
+        # planner: (total_q, s_packed_length), True = visible
+        # NPU:     (total_q, s_packed_length), True = masked
+        global_mask = plan.build_global_custom_mask(q.device)
+        atten_mask = ~global_mask
+
+        # --- Invoke TND npu_fusion_attention ---
+        scale = kwargs.get("softmax_scale") or (1.0 / math.sqrt(head_dim))
+        dropout_p = kwargs.get("dropout_p", 0.0)
+        keep_prob = kwargs.get("keep_prob", 1.0 - dropout_p)
+
+        try:
+            result = npu_fusion_attention(
+                q, k, v,
+                num_q_heads,
+                "TND",
+                atten_mask=atten_mask,
+                scale=scale,
+                keep_prob=keep_prob,
+                sparse_mode=1,
+                actual_seq_qlen=[total_q],
+                actual_seq_kvlen=[s_packed_length],
+            )
+        except Exception as exc:
+            raise FlashBackendValidationError(
+                f"npu_fusion_attention (TND s_packed) failed: "
+                f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+                f"mask={tuple(atten_mask.shape)}, "
+                f"total_q={total_q}, s_packed_length={s_packed_length}, "
+                f"num_q_heads={num_q_heads}"
+            ) from exc
+
+        output = result[0] if isinstance(result, (tuple, list)) else result
+        return output  # Already (total_q, N_q, D) — no unpacking needed
+
+    # ------------------------------------------------------------------
+    # BSH fallback path — per-sample padded batch, BSHD mask
+    # ------------------------------------------------------------------
+    def _attention_bsh(
+        self,
+        query: Any,
+        key: Any,
+        value: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """BSH fallback: per-sample padded batch with BSHD mask.
+
+        Use this path if TND + sparse_mode=1 is not supported on a particular
+        CANN version.
+
+        Q: (total_q, n_heads, d) → padded to (B, max_q, H)
+        K/V: (s_packed_length, n_kv_heads, d) → expanded to (B, s_packed, H)
+        mask: (B, 1, max_q, s_packed_length) built from scratch
+        """
+        layer_id = kwargs.get('layer_id', '?')
+        print(
+            f"[PS][backend][s_packed] flash_atten_npu BSH attention: "
             f"layer={layer_id}, "
             f"q_shape={tuple(query.shape)}, k_shape={tuple(key.shape)}, "
             f"v_shape={tuple(value.shape)}"
@@ -218,7 +353,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         packed_layout: PackedBatchLayout = packed_batch_layout
         if packed_layout is None:
             raise FlashBackendValidationError(
-                "flash_atten_npu.attention requires packed_batch_layout kwarg."
+                "flash_atten_npu BSH path requires packed_batch_layout kwarg."
             )
 
         plan = prefix_sharing_plan
@@ -246,13 +381,10 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         hidden_q = num_q_heads * head_dim
         hidden_kv = num_kv_heads * head_dim
 
-        # --- Step 1: split THD → per-sample rows (only Q needs split; K/V are
-        #            already the complete s_packed sequence and must NOT be re-split) ---
+        # --- Step 1: split THD → per-sample rows ---
         q_rows = _split_packed(q, packed_layout.padded_lengths)
 
         # --- Step 2: pad & stack → BSH ---
-        # K/V: each batch row receives the FULL s_packed K/V (no split needed).
-        # Reshape THD → (s_packed_length, hidden_kv) first, then expand to BSH.
         k_bsh = k.reshape(s_packed_length, hidden_kv).unsqueeze(0).expand(batch_size, -1, -1)
         v_bsh = v.reshape(s_packed_length, hidden_kv).unsqueeze(0).expand(batch_size, -1, -1)
 

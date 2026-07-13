@@ -31,7 +31,8 @@ def get_backend_instance(
     
     if config.backend == "flash_atten_npu":
         from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
-        return NpuFlashAttentionBackend()
+        use_tnd = config.npu_attention_layout == "tnd"
+        return NpuFlashAttentionBackend(use_tnd=use_tnd)
     
     raise ValueError(
         f"Unknown backend '{config.backend}'. "

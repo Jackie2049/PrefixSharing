@@ -67,6 +67,7 @@ class PrefixSharingConfig:
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
+    npu_attention_layout: str = "tnd"  # NPU backend layout: "tnd" (memory-efficient) or "bsh" (fallback)
 
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
     supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
@@ -80,6 +81,11 @@ class PrefixSharingConfig:
         _env_backend = os.getenv("PREFIX_SHARING_BACKEND")
         if _env_backend and self.backend == "torch_ref":
             object.__setattr__(self, "backend", _env_backend)
+        _env_layout = os.getenv("NPU_ATTENTION_LAYOUT")
+        if _env_layout and self.npu_attention_layout == "tnd":
+            normalized = _env_layout.strip().lower()
+            if normalized in {"tnd", "bsh"}:
+                object.__setattr__(self, "npu_attention_layout", normalized)
 
     @classmethod
     def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
@@ -130,6 +136,11 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_prefix_len must be >= 1")
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
+        if self.npu_attention_layout not in {"tnd", "bsh"}:
+            raise PrefixSharingConfigError(
+                f"npu_attention_layout='{self.npu_attention_layout}' is not supported. "
+                f"Supported: 'tnd' (memory-efficient, default), 'bsh' (fallback)"
+            )
 
         active_mode = integrate_mode or self.integrate_mode
         if active_mode != "verl_megatron_actor":
@@ -230,6 +241,11 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_prefix_len must be >= 1")
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
+        if self.npu_attention_layout not in {"tnd", "bsh"}:
+            raise PrefixSharingConfigError(
+                f"npu_attention_layout='{self.npu_attention_layout}' is not supported. "
+                f"Supported: 'tnd', 'bsh'"
+            )
 
         # THD packed layout 需要 use_remove_padding
         if not use_remove_padding:
