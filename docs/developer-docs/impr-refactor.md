@@ -1423,7 +1423,7 @@ python3 prefix-sharing/tools/verify_p0_correctness.py \
 > **P0 CUDA bf16 验证结果**：
 >
 > ```text
-> 15/15 PASS (0 FAIL)
+> 23/23 PASS (0 FAIL)
 > ```
 > 覆盖典型生产场景，builder KV 形状正确，provider prefix 梯度存在且非零。
 >
@@ -1621,11 +1621,11 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 | 阶段 | 执行者 | 交付物 | 放行条件 | 当前状态 |
 |---|---|---|---|---|
 | 开发自测 | 开发者 / CI | pytest 日志与计数 | 非 optional 测试零失败 | ✅ 完成（UT 213✅/4❌*、IT 61✅/29⏭️、GPU FA 23✅、ST 1✅、全回归 275✅/29⏭️/4❌*；*4 failed 均为测试隔离/已知问题） |
-| 功能验证 | Claude Code | P0 JSONL、固定输入结论 | KV、梯度、fallback 正确 | ✅ 完成（CPU 110/110 PASS, CUDA 15/15 PASS） |
-| 集成验证 | Claude Code + device 环境 | real engine 日志、world-size 记录 | FSDP forward/backward 成功 | ❌ 未执行（需要真实 verl 训练环境；当前设备已验证 UT/IT/ST/P0，但没有配置 verl 训练任务） |
-| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ❌ 未执行（需要 real engine ON/OFF 对比运行） |
+| 功能验证 | Claude Code | P0 JSONL、固定输入结论 | KV、梯度、fallback 正确 | ✅ 完成（CPU 110/110 PASS, CUDA 23/23 PASS） |
+| 集成验证 | Claude Code + device 环境 | real engine 日志、world-size 记录 | FSDP forward/backward 成功 | ❌ 环境限制（env-flex torch 2.8.0 + vllm 0.11.0 与 verl_cdd9014f 不兼容；vllm 降级 0.8.5 与 torch 2.8.0 ABI 冲突，无法启动 rollout。需 env-torch291 或其他兼容环境） |
+| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ❌ 环境限制（同上，需真实 verl 训练环境 + 兼容 vllm） |
 | 性能对比 | Claude Code + device 环境 | JSONL、汇总表、环境信息 | 结果完整且精度未回退 | ✅ 完成（perf baseline 12 records, perf comprehensive 10 records；详见 §3.6.1） |
-| 冒烟测试 | Claude Code + device 环境 | 最小训练日志 | ON/OFF 均稳定跑通 | ❌ 未执行（需要 vere 训练任务配置） |
+| 冒烟测试 | Claude Code + device 环境 | 最小训练日志 | ON/OFF 均稳定跑通 | ❌ 环境限制（同上。Patch 安装已成功验证：FSDPEngineWithLMHead.forward_step 被 patch，audit 显示 2 patches active，配置校验通过。但 rollout 启动阶段因 vllm 兼容性失败） |
 
 测试完成后，将结果摘要（命令、环境、通过/skip/失败数、精度阈值、性能结论、已知限制）更新到 PR 的 `## 测试结果` 小节；仍未覆盖的设备、并行策略或真实 e2e fixture 回填本文件 Chapter 6，并在 PR 中明确其潜在影响。
 
