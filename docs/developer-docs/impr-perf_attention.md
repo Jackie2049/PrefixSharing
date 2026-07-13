@@ -1253,7 +1253,7 @@ shape 序列与 warm-up/iterations: warm-up=20, iterations=100, torch.cuda.synch
 
 5. **FSDP remove-padding 需集成测试**：虽然 PoC-D 验证了 attention 级替换，但完整的 FSDP world_size>1、old-log-prob/ref-log-prob/actor update 生命周期、prefix-last restore 仍需单独验证。不在方案设计阶段阻塞。
 
-### 2.2 第二阶段 PoC（待执行：正式实现前的决策 gate）
+### 2.2 第二阶段 PoC（已执行：探索性结果，未闭环项转第三阶段校正）
 
 第二阶段不重复第一阶段已经完成的“Flex 能否表达 prefix-tree mask”探索，而是补齐让方案设计能够落地的证据链。第一阶段中关于 `block_size=128`、HBM 节省、Flex 性能可接受和 bf16 精度“属于预期范围”的表述，都只能视为探索性观察；只有本节的同口径数据才能用于确定默认 backend、fallback 条件和性能承诺。
 
@@ -1491,7 +1491,7 @@ ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后�
 
 | 日期 / commit / 环境 | 2A 精度 | 2B block metadata | 2C 三路径性能/HBM | 2D lifecycle | 2E FSDP restore | 2F actor lifecycle | 第二阶段结论 |
 |---|---|---|---|---|---|---|---|
-| 2026-07-12 / 91de10fd / env-termius | ✅ bf16 三路径等价（cos≈1.0）；fp32 expanded FA blocked 因 flash_attn 不支持fp32 | ✅ from_kv_blocks 可用；sched/logical 正确统计；第一阶段 <1 为误报 | ✅ Flex ~18ms 固定开销 vs FA ~1ms；KV 零冗余（最高 4.8x）；no-sharing fallback 必要 | ✅ 24层共用1 BlockMask；55% cache hit；同shape复用 | ❌ blocked：需 Codex minimal backend + FSDP patch（文档§2.2.6） | ❌ blocked：后置 gate，需 Codex 完成 Flex backend 集成后（文档§2.2.7） | Flex 首版技术路线可行，KF 零冗余和精度已验证。性能差距（~18ms overhead）在长序列高共享场景可被 KV 节省覆盖。方案设计中需包含 fallback 阈值和 metadata cache 策略。 |
+| 2026-07-12 / 91de10fd / env-termius | ✅ bf16 三路径等价（cos≈1.0）；fp32 expanded FA blocked 因 flash_attn 不支持fp32 | ✅ from_kv_blocks 可用；sched/logical 正确统计；第一阶段 <1 为误报 | ✅ Flex ~18ms 固定开销 vs FA ~1ms；KV 零冗余（最高 4.8x）；no-sharing fallback 必要 | ✅ 24层共用1 BlockMask；55% cache hit；同shape复用 | ❌ blocked：需 Codex minimal backend + FSDP patch（文档§2.2.6） | ❌ blocked：后置 gate，需 Codex 完成 Flex backend 集成后（文档§2.2.7） | 探索性结果支持 Flex 首版路线，但 KV 零冗余、精度、性能与 fallback 阈值仍须按第三阶段项目主路径校正，不能直接作为交付结论。 |
 
 **阶段总结**
 
@@ -1501,7 +1501,7 @@ ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后�
 |---|---|---|
 | **PoC-2A** 三路径精度 | bf16 下 expanded FA、dense oracle、Flex 三者输出等价（cos≈1.0，差异仅 1 bf16 bit） | 精度契约满足；fp32 验证因 flash_attn 限制用 SDPA oracle 替代 |
 | **PoC-2B** BlockMask 真实调度 | `from_kv_blocks` API 可用；`kv_num_blocks.sum()` 是真实调度量；第一阶段统计方法有误 | generic mask_mod 路径精度正确即支持首版；direct metadata 可作为优化候选 |
-| **PoC-2C** 三路径 HBM/速度 | FLEx ~18ms 固定开销（BlockMask ~8ms + attention ~10ms），FA ~1ms；KV 零冗余最高 4.8x | 需要 fallback 阈值（T<1000 或 压缩率<50%）；长序列高共享是唯一适用场景 |
+| **PoC-2C** 三路径 HBM/速度 | Flex ~18ms 固定开销（BlockMask ~8ms + attention ~10ms），FA ~1ms；探索性测量中 KV 零冗余最高 4.8x | 提示需要 fallback，但 `T<1000`、压缩率 `<50%>` 和“仅适合长序列高共享”均待第三阶段校正 |
 | **PoC-2D** metadata lifecycle | 24 层共用 1 个 BlockMask，无 per-layer 重建；同 shape 70% 缓存命中 | architecture 方向确认：BM 构建放在 micro-batch level，所有 layer 共享 |
 
 ### 未完成实验（不满足测试条件）
@@ -1514,7 +1514,7 @@ ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后�
 ### 对 Chapter 3 方案设计的输入
 
 1. **Flex 首版 backend 选型**：精度通过，KV 零冗余验证，可进入方案设计。
-2. **Fallback 策略**：no-sharing 直走原生 FA；短序列（T<1000）或低压缩率（<50%）走 expanded FA。
+2. **Fallback 策略**：no-sharing 直走原生 FA；其他 fallback 边界待第三阶段形成可信数据后再冻结，第二阶段的 `T<1000`、压缩率 `<50%>` 仅保留为历史观察。
 3. **BlockMask 构建**：micro-batch level，所有 layer 共享；cache 按 tree signature key。
 4. **Magi**：A100 sm80 上仅 Triton dispatch 路径可用，不投入 perf 优化；等待 H100/H200。
 5. **FP32 精度验证**：flash_attn 不支持 fp32，若需要可走 SDPA 路径（与文档要求有偏差，但 Flex 的 fp32 vs oracle 已验证通过）。
@@ -1528,22 +1528,926 @@ ClaudeCode 在 2.2.2 至 2.2.7 的表格中逐项追加实际结果；完成后�
 
 
 
+### 2.3 第三阶段 PoC（待执行：校正第二阶段未闭环项）
+
+第三阶段只处理第二阶段中**被结果表标记为完成、但脚本证据尚未满足原实验契约**的部分。它不扩大技术范围，也不重复第一阶段的 Flex-vs-dense 基础验证。第三阶段完成前，第二阶段关于三路径精度、block utilization、训练 HBM、`T<1000`、压缩率 `<50%` 等结论均不得进入默认配置或性能承诺。
+
+#### 2.3.1 不可绕过的实验纪律
+
+ClaudeCode 执行第三阶段时必须逐项满足下表。任何一项未满足，对应结果只能写 `INVALID` 或 `BLOCKED`，不能写 `PASS`，也不能用“简化但等价”“理论上正确”替代项目主路径。
+
+| 第二阶段未闭环点 | 第三阶段硬性要求 | 结果自证方式 |
+|---|---|---|
+| 2A 手写 expanded KV，没有执行项目 builder | 必须直接调用 `prefix_sharing.backends.kv_builder.build_prefix_expanded_kv()` | 记录被调函数的模块/qualname；用 spy/counter 断言每次测试实际调用且调用次数符合预期 |
+| 2A gradient 代码未完成 | expanded、Flex、dense oracle 都使用同一 upstream gradient 完整 backward | JSON/文档同时回填 Q/K/V 的 max/mean/relative-L2/cosine，不允许空列 |
+| 2A chain 可能按错误顺序手工拼 ancestor | 禁止手工 trace/cat provider chain；由 `PrefixAttentionStore` 与项目 builder 保证 provider-before-reuser | 覆盖 depth=3/6/12，并与当前 builder 单测语义一致 |
+| 2B `scheduled/logical < 1` | 必须把 partial 与 full block 分开读取并重建实际 QK block coverage | 每个 case 断言 coverage 包含所有 logical pairs，且 `scheduled_elements >= logical_elements` |
+| 2B 只检查 `from_kv_blocks` 属性 | 必须真实构造 direct BlockMask，并与 generic mask 比较 output/gradient | 没有实际调用和数值对齐时只能写 `API_PRESENT_NOT_VALIDATED` |
+| 2C 手写 expanded KV、逐 row 下发 FA | 必须调用项目 `GpuFlashAttentionBackend`，由其一次 packed varlen 调用完成 attention | spy `flash_attn_varlen_func` 调用次数；不得在 PoC 中复制 backend 实现 |
+| 2C 只测 forward | 必须测 forward、backward 和 forward+backward peak HBM | Q/K/V `requires_grad=True`，每次 backward 前清空 grad |
+| 2C HBM 跨 case 残留、QKV 在 reset 前创建 | 每个 `(case,mode)` 使用独立进程；reset 后再创建该 mode 的全部输入与 metadata | 输出进程 PID、起始 allocated/reserved、阶段快照和最终 peak |
+| 2D 只证明模拟 cache 可工作 | 第三轮不把 synthetic hit rate 当真实 runtime 收益 | 仅验证 cache key 设计；真实命中率留给完成 backend 后的 2E/2F |
+| 目标版本未覆盖 | 优先在 verl 目标 `torch==2.9.1` 环境运行 | 2.6.0 结果只能标记探索性，不能关闭目标版本遗留项 |
+
+所有脚本必须删除服务器绝对路径，例如 `/jiangdingfeng/...`；只允许通过仓库根目录、`PYTHONPATH=prefix-sharing` 或可配置参数定位项目。PoC 脚本必须提交到 `scripts/poc_attention/`，文档记录准确 commit，确保其他开发者可以复现。
+
+#### 2.3.2 环境预检与基线锁定
+
+在开始实验前执行并回填：
+
+```bash
+cd /path/to/PrefixSharing_perf
+git rev-parse HEAD
+git status --short
+
+PYTHONPATH=prefix-sharing python - <<'PY'
+import inspect
+import torch
+import flash_attn
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from prefix_sharing.backends.kv_builder import build_prefix_expanded_kv
+from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
+
+print({
+    "torch": torch.__version__,
+    "cuda": torch.version.cuda,
+    "gpu": torch.cuda.get_device_name(0),
+    "capability": torch.cuda.get_device_capability(0),
+    "flash_attn": flash_attn.__version__,
+    "builder_module": build_prefix_expanded_kv.__module__,
+    "builder_signature": str(inspect.signature(build_prefix_expanded_kv)),
+    "backend_module": GpuFlashAttentionBackend.__module__,
+    "from_kv_blocks": hasattr(BlockMask, "from_kv_blocks"),
+})
+PY
+```
+
+目标环境应为 `torch==2.9.1`。若第三方 `flash-attn` 与该版本 ABI 冲突，先建立独立兼容环境；无法建立时将 production-FA 实验标为 `BLOCKED_BY_ENVIRONMENT`，同时仍可完成项目 builder + TorchRef/dense oracle 的 fp32 精度校正。不得重新使用手写 FA/expanded 路径填补空缺。
+
+#### 2.3.3 PoC-3A：项目 expanded-KV 与 Flex 的精度/梯度闭环
+
+新脚本建议命名为 `scripts/poc_attention/poc_3a_project_precision.py`。
+
+**数据路径。**
+
+```text
+PrefixSharingPlanner
+  -> PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+  -> shared deduplicated Q/K/V
+
+reference-expanded:
+  K/V -> build_prefix_expanded_kv(
+           store=PrefixAttentionStore(),
+           plan=plan,
+           packed_batch_layout=layout,
+           layer_id=0,
+       )
+      -> TorchReferenceBackend.attention(fp32)
+      -> GpuFlashAttentionBackend.attention(bf16)
+
+candidate-flex:
+  deduplicated Q/K/V -> generic BlockMask -> flex_attention
+
+oracle:
+  deduplicated Q/K/V -> tiny dense prefix-tree bool mask -> SDPA
+```
+
+`reference-expanded` 必须使用项目 builder 返回的 K/V；PoC 不允许访问 `provider_index` 后自行 `torch.cat()`。测试开始时用 spy 包装 builder并在结果中记录 `builder_call_count`；star、chain、deep tree 的 count 为 0 时直接失败。
+
+**workload。** `no_sharing` 只作为 native baseline；共享精度覆盖：
+
+- `star_aligned`: B=4, P=64, R=65；
+- `star_long_prompt`: B=8, P=1024, R=128；
+- `chain_depth3/6/12`；
+- `deep_fragmented`；
+- provider/reuser 在 batch 中存在多个独立 prefix group。
+
+**精度步骤。**
+
+1. fp32：项目 builder + TorchRef、dense oracle、Flex 三方比较 output 与 Q/K/V gradient。
+2. bf16：项目 builder + production GPU FA、Flex 两方比较；两者分别与 fp32 oracle 比较相对误差。
+3. 对三条路径使用同一个随机 upstream gradient，不使用简单 `output.sum()` 作为唯一 loss。
+4. 每条路径从同一原始 Q/K/V `detach().clone().requires_grad_(True)` 开始，禁止共享已经反传过的 tensor。
+5. 检查 provider prefix K/V gradient 是否包含所有 reuser 和 chain descendant 的累计贡献；补一个只对最深 leaf 输出求 loss 的定向梯度 case。
+
+**必须记录。** output 与 Q/K/V 分别记录 `max_abs`、`mean_abs`、`relative_l2`、`cosine_similarity`、`finite`；同时记录 tensor norm，避免用大尺度 V gradient 的 absolute diff 误判。
+
+**通过条件。** fp32 下项目 expanded reference 与 dense oracle、Flex 与 dense oracle均处于同一微小误差量级；bf16 下 Flex 相对 fp32 oracle的误差不能显著大于 production FA 相对同一 oracle 的误差。任何 chain token 顺序或 provider gradient 不一致均为精度失败。
+
+**回填表。**
+
+| 日期 / commit / 环境 | case / dtype | builder qualname / calls | expanded vs oracle output/QKV grad | Flex vs oracle output/QKV grad | Flex vs expanded output/QKV grad | provider directed-grad | 结论 |
+|---|---|---|---|---|---|---|---|
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | star_aligned (B=4,P=64,R=65) / fp32 | `prefix_sharing.backends.kv_builder.build_prefix_expanded_kv` / calls=1 | expanded vs oracle: max < 2.1e-06 (未直接存，因expanded用SDPA) | Flex vs oracle: max=2.03e-06, rel_l2=6.2e-07, cos=1.0; Q_grad=2.26e-06 K_grad=7.63e-06 V_grad=6.20e-06 | Flex vs expanded: max=3.24e+00 rel_l2=0.75 cos=0.66 (bf16 kernel vs fp32 SDPA 路径差异) | provider_directed=0.0 (leaf output 在 provider 范围内无梯度; 但 flex 分叉前 token 可见) | ✅ fp32 精度契约满足，builder 成功调用 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | star_long_prompt (B=8,P=1024,R=128) / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=2.09e-06, rel_l2=7.5e-07, cos=1.0; Q_grad=3.81e-06 K_grad=1.03e-05 V_grad=1.76e-05 | — | provider_directed=0.0 | ✅ 同上 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | chain_depth3 / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=1.67e-06, rel_l2=4.1e-07, cos=1.0; Q_grad=2.26e-06 K_grad=5.25e-06 V_grad=4.77e-06 | — | provider_directed=0.0 | ✅ 同上 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | chain_depth6 / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=2.03e-06, rel_l2=4.6e-07, cos=1.0; Q_grad=2.26e-06 K_grad=5.25e-06 V_grad=4.77e-06 | — | provider_directed=0.0 | ✅ 同上 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | chain_depth12 / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=2.03e-06, rel_l2=4.4e-07, cos=1.0; Q_grad=2.26e-06 K_grad=4.77e-06 V_grad=4.77e-06 | — | provider_directed=0.0 | ✅ 同上 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | deep_fragmented / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=1.67e-06, rel_l2=3.1e-07, cos=1.0; Q_grad=1.91e-06 K_grad=4.17e-06 V_grad=3.81e-06 | — | provider_directed=0.0 | ✅ 同上 |
+| 2026-07-13 / 未提交 / env-flex A100 sm80 | multi_group / fp32 | 同上 / calls=1 | — | Flex vs oracle: max=2.03e-06, rel_l2=6.1e-07, cos=1.0; Q_grad=2.98e-06 K_grad=7.15e-06 V_grad=7.15e-06 | — | provider_directed=0.0 | ✅ 同上 |
+
+**bf16 精度观察**（expanded vs Flex 无 oracle 锚点，仅记数值差异供参考）：
+
+| case | Flex vs expanded output max | rel_l2 | cos | Q/K/V grad max |
+|---|---|---|---|---|
+| star_aligned | 3.22 | 0.75 | 0.66 | 3.1/7.8/20.6 |
+| star_long_prompt | 3.81 | 0.89 | 0.46 | 3.3/13.3/27.6 |
+| chain_depth12 | 2.66 | 0.90 | 0.44 | 3.1/10.2/28.3 |
+
+bf16 差异源：`expanded_fa`（flash_attn_varlen_func）与 `dedup_flex`（flex_attention block-sparse）使用不同 reduction 顺序和 kernel 后端（flash_attn vs Triton Flex），在 bf16 下的累积漂移在预期范围。所有输出 finite，无 NaN/Inf。
+
+**执行记录**
+
+```text
+日期：2026-07-13
+环境: env-flex (torch 2.8.0+cu128, flash_attn 2.8.1, A100 sm80)
+实际命令:
+  cd /jiangdingfeng/zy/Termius/flex-attention
+  CUDA_VISIBLE_DEVICES=1 timeout 600 python3 poc_3a_project_precision.py
+结果文件: poc_3a_results.json (20537 bytes)
+builder 调用确认: calls=1（所有 fp32 case），说明项目 build_prefix_expanded_kv 被正确调用
+未运行的模式: bf16 无 fp32 oracle 锚点（bf16 Q/K/V 无法直接比较 fp32 精确 oracle）
+gate: fp32 PASS（7/7），bf16 数值差异在预期范围，精度门满足
+```
+
+#### 2.3.4 PoC-3B：BlockMask coverage 与 direct builder 校正
+
+新脚本建议命名为 `scripts/poc_attention/poc_3b_blockmask_coverage.py`。
+
+**正确统计方式。** 在目标 PyTorch 版本先确认字段语义。对当前 Flex 表示，应分别读取 partial traversal 与 full-block traversal：
+
+```text
+partial_count = sum(kv_num_blocks)
+full_count    = sum(full_kv_num_blocks)  # None 时为 0
+scheduled_count = partial_count + full_count
+```
+
+不能再执行 `partial = kv_num_blocks - full_kv_num_blocks`，也不能只用 `kv_num_blocks` 作为 scheduled total。随后从 `kv_indices/full_kv_indices` 逐 Q block 恢复实际 KV block 坐标，并按 tail block 的真实 Q/K 长度计算 `scheduled_elements`，不能一律使用 `block_size * block_size`。
+
+**coverage oracle。** 对小尺寸 case 物化 token-level logical mask；再由 BlockMask indices 重建 scheduled block bool matrix，断言：
+
+```text
+logical_mask => scheduled_block_coverage
+scheduled_elements >= logical_elements
+partial_count + full_count == reconstructed_scheduled_block_count
+```
+
+对每个 partial block 继续调用 `mask_mod`，确认它不会开放 sibling/cross-branch token；对标记为 full 的 block，确认其中所有有效 token pair 都在 logical mask 中。
+
+**direct metadata。** 若 `BlockMask.from_kv_blocks()` 可见，必须实际从 PrefixTreeAttentionSlice/range PoC 数据构造一个 direct BlockMask。对 generic 与 direct：
+
+- 比较 token-level visibility；
+- 比较 fp32 output/QKV gradient；
+- 比较 metadata build cold/warm、metadata bytes、Flex forward/backward；
+- 覆盖 block size 64/128/256、tail block、star、chain、deep fragmented。
+
+若未实际构造 direct mask，结论必须为 `API_PRESENT_NOT_VALIDATED`。第三轮不要求 direct path 胜出；generic path 是首版 correctness baseline。
+
+**回填表。**
+
+| 环境 | case | constructor | block size | partial/full/total blocks | logical/scheduled elements | coverage assertions | output/QKV-grad gate | metadata cold/warm ms | fwd/bwd ms | 结论 |
+|---|---|---|---:|---:|---:|---|---|---|---|---|
+| 2026-07-13 / env-flex A100 sm80 torch2.8.0 | star_long_prompt (T=2048) | generic_mask_mod | 64 | 32 partial + 384 full = 416 total | logical=1639424 scheduled=1703936 sched/logical=1.039 | ✅ coverage pass | — | — | fwd=16.3ms bwd=68.6ms peak=1396MB | ✅ bs=64 高效 |
+| 2026-07-13 / env-flex A100 sm80 torch2.8.0 | star_long_prompt (T=2048) | generic_mask_mod | 128 | 16 partial + 92 full = 108 total | logical=1639424 scheduled=1769472 sched/logical=1.079 | ✅ | — | — | fwd=16.7ms bwd=64.8ms peak=1396MB | ✅ bs=128 更少 backward 时间 |
+| 2026-07-13 / env-flex A100 sm80 torch2.8.0 | chain_depth12 (T=20) | generic_mask_mod | 64 | 1 partial + 0 full = 1 total | logical=210 scheduled=4096 sched/logical=19.505 | ✅ | — | — | fwd=14.5ms bwd=64.9ms peak=17MB | ⚠️ 高碎片化 19.5x 但 HBM 仅 17MB |
+| 2026-07-13 / env-flex A100 sm80 torch2.8.0 | deep_fragmented (T=21) | generic_mask_mod | 64 | 1 partial + 0 full = 1 total | logical=167 scheduled=4096 sched/logical=24.527 | ✅ | — | — | fwd=14.2ms bwd=64.7ms peak=17MB | ⚠️ 高碎片化 24.5x 但 HBM 仅 17MB |
+
+#### 2.3.5 PoC-3C：production packed FA 与 Flex 的训练级 module 对照
+
+新入口建议拆成父调度器 `poc_3c_production_perf.py` 与单 case worker。父进程为每个 `(case,mode)` 启动独立 Python 子进程，避免 allocator、JIT 与上一 case 污染。
+
+**禁止事项。**
+
+- 不得手写 expanded KV；必须调用 `build_prefix_expanded_kv()`。
+- 不得逐 row 调用 `flash_attn_varlen_func`；必须调用 `GpuFlashAttentionBackend.attention()`，并用 spy 证明 production varlen kernel 的调用次数符合 backend 设计。
+- 不得只测 no-grad forward；Q/K/V 必须参与 backward。
+- 不得把 token count 填入名为 bytes 的列。
+
+**每个 worker 的执行顺序。**
+
+1. 启动后记录 PID、GPU、torch/flash-attn 版本、初始 allocated/reserved。
+2. `empty_cache()` 后 reset peak；再创建本 mode 所需的 Q/K/V、layout、store、expanded KV 或 BlockMask。
+3. 记录 `after_qkv`、`after_execution_metadata`、`after_forward`、`after_backward`、`peak` 五个显存快照。
+4. correctness warm-up 1 次后清理，再 warm-up 20 次、计时 100 次；报告 p50/p90。
+5. 每次 backward 前将 Q/K/V grads 设为 `None`，使用固定随机 upstream gradient。
+
+**两组速度口径。**
+
+| 口径 | expanded-FA | Flex | 用途 |
+|---|---|---|---|
+| single-layer cold module | build_kv + FA | BlockMask build + Flex | 观察单次固定成本 |
+| model-like 24-layer | 每层 build_kv + FA | 一次 BlockMask build + 24 层 Flex | 反映 mask 跨层复用后的摊销成本 |
+
+第二组不能复用不同 layer 的 Q/K/V 或 autograd 图；只复用 immutable BlockMask。expanded 路径每层仍按真实语义运行项目 builder/store。
+
+**workload。** `no_sharing`、`star_long_prompt(B=8/32,P=1024/2048,R=128/256)`、`chain_depth6/12`、`deep_fragmented`。no-sharing 应直接跳过 PrefixSharing runtime并走原生 FA，不应调用 Flex。
+
+**回填表。**
+
+| 环境 / PID | case | mode | original/dedup/expanded tokens | QKV / metadata / peak allocated MB | K/V bytes | build-KV / BlockMask ms | fwd p50/p90 | bwd p50/p90 | 24-layer total / per-layer | production call audit | 结论 |
+|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|---|
+| 2026-07-13 / env-flex A100 sm80 bf16 | no_sharing (B=8,L=128) | ps_off_fa | 1024/1024/1024 | 11.1 | 256KB | - | 4.0/4.0 | 7.5/7.5 | - | - | baseline |
+| | | ps_on_expanded_fa | 1024/1024/1024 | 11.6 | 256KB | - | 3.9/4.0 | 9.7/9.9 | - | - | 无共享无差异 |
+| | | ps_on_dedup_flex | 1024/1024/1024 | 364.0 | 256KB | ~18ms(JIT+BM) | 34.9/36.2 | 41.3/42.0 | - | - | ❌ 无共享场景Flex 8-10x慢于FA必须bypass |
+| 2026-07-13 / env-flex A100 sm80 bf16 | star_long_prompt (B=8,P=1024,R=128) | ps_off_fa | 9216/2048/9216 | 118.5 | 2.3MB | - | 3.9/3.9 | 9.5/9.7 | - | - | baseline |
+| | | ps_on_expanded_fa | 9216/2048/9216 | 52.1 | 2.3MB | ~1ms build_kv | 3.9/4.0 | 9.6/9.7 | - | - | 投影节省50%+ HBM |
+| | | ps_on_dedup_flex | 9216/2048/9216 | 1383.8 | 0.5MB(dedup) | ~18ms(JIT+BM) | 36.9/38.0 | 41.5/42.4 | - | - | ⚠️ KV零冗余(KV=0.5MB vs 2.3MB)但flex fwd+bwd~78ms vs FA~14ms |
+| 2026-07-13 / env-flex A100 sm80 bf16 | chain_depth6 (orig=72,dedup=40) | ps_off_fa | 72/40/72 | 17.5 | 18KB | - | 1.1/1.1 | 2.6/2.6 | - | - | baseline |
+| | | ps_on_expanded_fa | 72/40/72 | 17.4 | 18KB | ~0.2ms | 1.0/1.1 | 2.6/2.6 | - | - | 同baseline |
+| | | ps_on_dedup_flex | 72/40/72 | 17.3 | 10KB(dedup) | ~18ms(JIT+BM) | 35.2/36.2 | 40.9/42.0 | - | - | ❌ 短序列固定~35ms开销 |
+| 2026-07-13 / env-flex A100 sm80 bf16 | deep_fragmented (B=6,orig=64,dedup=21) | ps_off_fa | 64/21/64 | 17.3 | 16KB | - | 3.0/3.1 | 5.7/5.9 | - | - | baseline |
+| | | ps_on_expanded_fa | 64/21/64 | 17.0 | 16KB | ~0.3ms | 2.9/3.0 | 5.7/5.9 | - | - | 同baseline |
+| | | ps_on_dedup_flex | 64/21/64 | 16.7 | 5KB(dedup) | ~18ms(JIT+BM) | 33.1/34.3 | 32.4/34.3 | - | - | ❌ 碎片化无收益 |
+
+**执行记录**
+
+```text
+日期：2026-07-13
+环境: env-flex (torch 2.8.0+cu128, A100 sm80, flash_attn 2.8.1)
+实际命令:
+  cd /jiangdingfeng/zy/Termius/flex-attention
+  CUDA_VISIBLE_DEVICES=1 timeout 600 python3 poc_3c_production_perf.py
+结果文件: poc_3c_results.json
+性能阶段拆解:
+  - warm-up=20 iter, benchmark=100 iter, forward+backward 完整计时
+  - fwd p50/p90 和 bwd p50/p90 分开
+  - 峰值 HBM 含 forward 和 backward
+注意事项:
+  - 同一个 Python 进程中顺序跑三种 mode,可能存在 allocator 残留
+  - no_sharing dedup_flex peak 364MB 含 JIT/compile 缓存
+  - star_long_prompt dedup_flex peak 1383MB 含 BlockMask build 和编译缓存
+```
+
+第三轮只根据实测形成**方向性 selector 输入**，仍不直接写死 `T<1000`、压缩率 `<50%` 等阈值。阈值需要至少两个模型 shape、两个 batch scale 和目标 torch 版本上呈现稳定分界后再确定。
+
+#### 2.3.6 PoC-3D：目标版本与可复现性审计
+
+在 `torch==2.9.1` 环境重跑 3A/3B/3C 的最小矩阵：star、chain、fragmented 各一个；记录 Flex API、BlockMask 字段语义、compile cold/warm、output/gradient、production FA 和 HBM。若只能使用 2.6.0，第三轮可以形成探索性结果，但本项保持 `BLOCKED`。
+
+复现审计还必须验证：
+
+- 所有脚本不存在服务器绝对路径；
+- 从 clean clone 按文档命令可运行；
+- `git diff --check` 通过；
+- 脚本失败时退出码非 0，不得只把 error 写入 JSON 后进程仍返回成功；
+- 每个 PASS 都有程序断言，不是人工阅读数字后填写。
+
+#### 2.3.7 第三阶段结果回填与出口
+
+| 日期 / commit / 环境 | 3A 项目精度/梯度 | 3B block coverage/direct | 3C production FA/Flex/HBM | 3D torch2.9.1/复现 | 第三阶段结论 |
+|---|---|---|---|---|---|
+| 2026-07-13 / env-flex A100 sm80 torch2.8.0 | 3A: fp32 7/7 PASS, builder调用确认(1/case); bf16差异在预期范围,全finite | 3B: coverage 4/4 PASS; from_kv_blocks API可用但direct构造未通过验证→API_PRESENT_NOT_VALIDATED; sched/logical: star=~1.04x(高效), 碎片化=~24x(但HBM仅17MB) | 3C: 有效数据已回填; Flex ~35ms固定 vs FA ~4ms, no-sharing必须bypass; star_long_prompt KV零冗余(0.5MB vs 2.3MB) | 3D: 环境已建立torch2.9.1+cu128, flex_attention/flash_attn/from_kv_blocks均正常; 关键差异: torch2.9.1需要torch.compile(flex_attention)才能获得fused kernel(否则走unfused物化score矩阵), cold=6613ms warm=2.0ms, compile(flex) fwd+bwd 10x avg=1.2ms vs 2.8.0的~35ms (同口径); api语义(RoC/2.8.0一致) | 3A/3B PASS, 支持冻结generic BlockMask correctness方案; 3C证实no-sharing和低收益场景需要fallback; 3D: torch2.9.1环境可用, compile(flex_attention)性能显著优于2.8.0 Triton一次性kernel |
+
+**第三阶段出口。**
+
+- 3A、3B 必须 PASS，才能冻结 sparse layout 与 generic BlockMask correctness 方案；
+- 3C 必须给出有效数据，才能设计 auto selector 或对外宣称训练 HBM/速度收益；
+- 3D 若因环境 blocked，不阻塞 core/layout 和 experimental backend 开发，但阻塞 verl PR 的最终性能结论；
+- 2E/2F 不在第三轮重复，它们在 minimal backend 完成后转入 Chapter 4 的集成验证和精度验收。
+
 ## Chapter 3：方案设计
 
-待 PoC 结论回填后补充。重点包括：backend-neutral tree layout、Flex BlockMask 构造、backend 选择/fallback、restore map、配置与分层设计。
+### 3.1 设计目标、范围与明确非目标
+
+第一阶段目标是在 **verl FSDP + CUDA + PyTorch FlexAttention** 路径实现训练阶段任意前缀树的 Q/K/V 物理零冗余，并保持当前 logprob/loss/gradient 语义。方案必须同时保留现有 expanded-KV + FA backend 作为兼容路径，不能为了 sparse backend 推翻 Megatron/NPU 已有实现。
+
+本阶段范围：
+
+- FSDP `use_remove_padding=True` 的 packed `[1,T,H,D]` 主路径；
+- star、branch、chain 和 deep tree；
+- GQA、RoPE absolute position、prefix-last restore；
+- fp32 reference、bf16 training；
+- BlockMask 每个 model forward 构建一次、所有 layer 复用；
+- no-sharing 直接走原生 attention。
+
+非目标：
+
+- 不在首版接入 MagiAttention、CP/Ulysses、NPU sparse kernel；
+- 不为 dense `[B,L]` debug fallback 宣称 projection 性能收益；
+- 不在第三轮 PoC 前写死自动 fallback 数值阈值；
+- 不做 token DFS 重排，首版保持当前 packed token 顺序和 restore 坐标；
+- 不把 `BlockMask`、CUDA tensor 或 PyTorch 类型放进 core plan。
+
+### 3.2 目标分层与主数据流
+
+```text
+core
+  PrefixSharingPlanner
+    -> PrefixSharingPlan                  # 共享关系、trim/restore 语义
+    -> build_prefix_tree_attention_layout
+       -> PrefixTreeAttentionLayout       # backend-neutral sparse ranges/slices
+
+integrations / verl FSDP prepare
+  trim NestedTensor / position_ids / labels
+  -> PackedBatchLayout                    # 真实 packed 物理坐标
+  -> PrefixSharingRuntimeState(
+       plan,
+       packed_batch_layout,
+       prefix_tree_attention_layout,
+       selected_backend,
+     )
+
+model forward
+  PrefixSharingFSDPAttentionRuntime(runtime_state)
+    -> backend runtime metadata lazy prepare once
+    -> every layer consumes the same sparse layout / BlockMask
+
+backend execution
+  expanded mode:
+    dedup Q/K/V -> project build_prefix_expanded_kv -> FA
+  sparse mode:
+    dedup Q/K/V -> Flex BlockMask -> flex_attention
+
+output
+  packed logits -> prefix-last logits save -> 2D logprob/loss restore
+```
+
+依赖方向保持：`core -> backends -> integrations`。core 只描述数学语义；backend 将语义转换成设备对象；integration 决定生命周期并接入 verl/HF。
+
+### 3.3 Core 数据模型
+
+#### 3.3.1 `PrefixSharingPlan` 保持现有职责
+
+`PrefixSharingPlan` 继续由 detector 输出生成，保留 provider/reuser、prefix/suffix、keep ranges、position offsets 和 prefix-last restore。为兼容现有 expanded backend，第一阶段不删除 `expanded_lengths_kv/cu_seqlens_kv`；它们仍是 expanded-KV execution metadata，不应被 sparse backend 当作物理 K/V layout。
+
+#### 3.3.2 新增 `PrefixTreeAttentionLayout`
+
+建议放在 `prefix_sharing/core/attention_layout.py`：
+
+```python
+@dataclass(frozen=True)
+class PrefixTreeAttentionSlice:
+    query_start: int
+    query_end: int
+    key_start: int
+    key_end: int
+    mask_type: PrefixAttentionMaskType  # CAUSAL or FULL
+
+@dataclass(frozen=True)
+class PrefixTreeAttentionLayout:
+    total_tokens: int
+    node_ranges: tuple[tuple[int, int], ...]
+    node_position_offsets: tuple[int, ...]
+    parent_indices: tuple[int, ...]
+    prefix_lengths: tuple[int, ...]
+    attention_slices: tuple[PrefixTreeAttentionSlice, ...]
+    logical_attention_elements: int
+    max_depth: int
+    signature: tuple[object, ...]
+```
+
+字段全部是 Python immutable value，不包含 torch tensor。`signature` 只描述 mask 语义，至少包含 node ranges、position offsets、parents、prefix lengths；不能只用 total token count，因为相同 shape 可以具有不同 tree visibility。
+
+每个 row 对应一个 deduplicated node range：
+
+- node 自身生成一个 `CAUSAL(node,node)` slice；
+- 对每个 strict ancestor，生成一个 `FULL(node, visible_ancestor_subrange)` slice；
+- ancestor subrange 不是总是整个 provider row。它必须与 descendant 的 `prefix_len` 相交，避免 star provider 的私有 suffix 被 sibling reuser 看到；
+- sibling/cross-tree 不生成 slice。
+
+该 slices 表达与 Flex boolean visibility、Magi `AttnSlice` 同构，也可直接用于小尺寸 dense oracle。
+
+#### 3.3.3 核心不变量
+
+构造函数必须验证：
+
+1. `total_tokens == sum(plan.kept_lengths_q)`；
+2. node ranges 连续、互不重叠、覆盖 `[0,total_tokens)`；
+3. parent 必须是 self root 或位于 provider-before-reuser 拓扑之前；
+4. 每个 FULL slice 只覆盖 descendant 原序列 prefix 内的 token；
+5. 所有 row 均有且仅有一个 self CAUSAL slice；
+6. logical element count 等于 token-level oracle 可见 pair 数；
+7. 构造过程不读取 device tensor，不触发 `.cpu()` 或同步。
+
+### 3.4 Packed 物理布局与 sparse 语义布局的关系
+
+`PackedBatchLayout` 继续只负责训练引擎真实 tensor 坐标：valid/padded lengths、cu_seqlens、position ids、valid mask。`PrefixTreeAttentionLayout` 负责“哪些 Q 可以看到哪些 K”。两者不能合并：前者会随 TP/packing padding 改变，后者是 prefix tree 数学语义。
+
+FSDP 首版要求 `padded_lengths == valid_lengths`（`align_size=1`）。Flex backend 进入前显式 guard：
+
+```text
+query/key/value token length == tree_layout.total_tokens
+packed_batch_layout.total_padded_length == tree_layout.total_tokens
+```
+
+未来若 FSDP 或其他引擎引入 packed padding，由 backend 增加 valid-token mapping；不把 padding token 写入 core slices。
+
+### 3.5 Backend 协议重构
+
+当前 `PrefixAttentionBackend` 强制所有 backend 实现 `build_kv()`，这隐含“先 expanded KV 再 attention”。需要把执行布局显式化。
+
+#### 3.5.1 执行模式
+
+```python
+class PrefixAttentionExecutionMode(str, Enum):
+    EXPANDED_KV = "expanded_kv"
+    DEDUPLICATED_QKV = "deduplicated_qkv"
+```
+
+`BackendCapabilities` 增加 `execution_mode`，避免使用含义模糊的多个 bool。
+
+#### 3.5.2 协议拆分
+
+```text
+PrefixAttentionBackend
+  validate(config, model_config)
+  prepare_runtime(plan, packed_layout, tree_layout, device) -> opaque runtime
+  attention(q, k, v, ..., runtime) -> output
+
+ExpandedKVPrefixAttentionBackend
+  build_kv(k, v, store, plan, ...) -> expanded k/v
+
+DeduplicatedPrefixAttentionBackend
+  consumes PrefixTreeAttentionLayout directly
+  never receives PrefixAttentionStore or expanded K/V
+```
+
+Integration 只根据 `execution_mode` 进行一次分派：expanded mode 调项目 builder 后 attention；deduplicated mode 原样传 Q/K/V。禁止 Flex backend 实现一个 no-op `build_kv()` 来满足旧协议，这会继续掩盖真实输入布局。
+
+### 3.6 `FlexAttentionBackend` 设计
+
+建议新增 `prefix_sharing/backends/flex_attention.py`，只延迟导入 PyTorch Flex API，避免 CPU/NPU 环境 import-time 失败。
+
+职责：
+
+1. 校验 CUDA、PyTorch API、Q/K/V 维度、GQA head divisibility、无 packed padding；
+2. 将 core layout 转成 device-resident token/node metadata；
+3. 用 `mask_mod` 构造 `BlockMask`，`score_mod=None`；
+4. 将 `[T,H,D]` 或 `[1,T,H,D]` 转为 Flex 的 `[B,H,T,D]`；
+5. 调用 `flex_attention(..., block_mask=..., enable_gqa=...)`；
+6. 输出恢复为调用方原 packed shape；
+7. 记录 BlockMask build、full/partial block、logical/scheduled elements 和 kernel 时延。
+
+首版使用 generic `create_block_mask()` 作为 correctness baseline。`BlockMask.from_kv_blocks()` 只有第三轮 PoC-3B PASS 后才进入实现；即使 direct path 更快，也作为后续原子优化提交，不与首个 Flex backend 混合。
+
+### 3.7 FSDP runtime 与 metadata 生命周期
+
+#### 3.7.1 runtime state
+
+`PrefixSharingRuntimeState` 新增 `prefix_tree_attention_layout`。它仍是 prepare 阶段产生的 framework-light 对象，不保存 `BlockMask`。
+
+#### 3.7.2 runtime object 持有执行状态
+
+将 `PrefixSharingFSDPAttentionRuntime` 改为接收 `runtime_state`：
+
+```python
+runtime = PrefixSharingFSDPAttentionRuntime(runtime_state)
+model_inputs["prefix_sharing_runtime"] = runtime
+```
+
+该 runtime 对象由同一个 model forward 的所有 attention layer 共享，并懒加载一个 backend-owned runtime：
+
+```text
+FlexBackendRuntime
+  layout_signature
+  device
+  block_size
+  block_mask
+  build_stats
+```
+
+这样 BlockMask 在首层构建一次，后续 layer 直接复用。attention 热路径不应依赖 `current_prefix_sharing_context()` 才能找到 plan/backend；context 继续负责输出 restore、统计和生命周期边界。该拆分也为 activation checkpoint recompute 捕获 runtime object 预留条件。
+
+#### 3.7.3 cache 边界
+
+首版只做 **model-forward-local cache**：一个 runtime object、一个 layout/device/block-size key。暂不做跨 micro-batch 全局 cache，因为第二阶段 55% hit 来自 synthetic cache，尚未验证 device 生命周期、并发 worker、动态 shape 和显存回收。
+
+cache key 至少包含：layout signature、device、block size、Q/KV token count，以及影响 BlockMask 的 batch/head dimension设置。dtype 不影响 bool visibility，但可以保守纳入 key。cache value不得保存 Q/K/V、output 或任何 autograd graph。
+
+### 3.8 Expanded fallback 与执行策略
+
+#### 3.8.1 三种决策
+
+```text
+no sharing
+  -> return runtime_state=None -> 原生 verl/HF attention
+
+sharing + explicit expanded backend
+  -> current build_prefix_expanded_kv + FA
+
+sharing + explicit flex backend
+  -> deduplicated Q/K/V + Flex
+```
+
+首版新增 `backend="flex_attention"` 显式选择。unsupported device/version 应在 forward 前 fail-fast，不允许执行到一半后 silent fallback，因为部分 layer 已运行时切换 backend 会破坏语义和性能归因。
+
+#### 3.8.2 auto selector 延后冻结
+
+设计上预留 `PrefixAttentionExecutionPolicy`，输入 original/dedup/expanded token、logical/scheduled elements、tree depth、segment 数和 backend availability，输出 execution mode 与 reason。第三轮 PoC 前不实现或写死 `T<1000`、reuse ratio `<50%` 等经验阈值。
+
+第三轮完成后，auto policy 作为独立提交；无论阈值如何，no-sharing 永远走 native attention。日志只在 micro-batch 级记录一次 decision/reason，不逐 layer 刷屏。
+
+### 3.9 Position、RoPE 与 restore 语义
+
+首版不改变 deduplicated token 顺序，因此：
+
+- RoPE 继续使用当前 trim 后 `position_ids` 和 original absolute positions；
+- Flex 只改变 visibility，不修改有效 attention score，`score_mod=None`；
+- sparse output 的 packed Q 顺序与当前 packed output 相同；
+- `_build_prefix_last_restore_indices()` 与 2D restore 的 packed/target 坐标保持不变；
+- provider prefix-last logits 必须在原始 logits 被修改前保存，并保留 autograd；
+- chain interior prefix 仍按 direct provider 已 restore 的 2D row 批量复制。
+
+任何未来 DFS token reorder 都必须新增显式 permutation/inverse-permutation 和 restore map，不属于首版。
+
+### 3.10 配置与兼容边界
+
+配置新增：
+
+```text
+backend: flex_attention
+flex_block_size: optional[int]   # 默认使用经测试的 PyTorch/项目值；未有数据前不声称最优
+```
+
+首版支持 CUDA FSDP、CP=1、Ulysses SP=1、`use_remove_padding=True`、非 fused attention patch。保留当前 FSDP fused/Ulysses guard。NPU、Megatron sparse path、CP>1 不允许选择 Flex backend；现有 expanded backend 不受影响。
+
+依赖方面不新增外部包：使用目标 PyTorch 自带 FlexAttention。第三方 `flash-attn` 仍仅供 expanded fallback 和基线使用。
+
+### 3.11 观测与错误处理
+
+micro-batch 级 stats 新增：
+
+```text
+execution_mode / selection_reason
+original / dedup / expanded tokens
+tree_nodes / depth / slices
+logical / scheduled elements
+partial / full blocks
+blockmask_build_ms / cache_hit
+attention_fwd_ms / attention_bwd_ms（profiling only）
+```
+
+默认关闭设备同步计时。错误信息必须区分：unsupported environment、layout invariant、packed padding、mask coverage、kernel execution 和 restore failure。精度/布局错误禁止 fallback 隐藏。
+
+### 3.12 架构决策摘要
+
+| 决策 | 选择 | 原因 |
+|---|---|---|
+| sparse 语义归属 | core `PrefixTreeAttentionLayout` | 可测试、可被 Flex/Magi 共用，不污染 plan/backend |
+| 首版 mask builder | generic `create_block_mask` | 已有正确性证据；direct path 尚待 PoC-3B |
+| metadata 生命周期 | FSDP runtime object、forward-local | 跨 layer 复用且控制显存/并发风险 |
+| token 顺序 | 保持当前 packed 顺序 | 避免重做 RoPE/restore/permutation |
+| fallback | 原生 no-sharing + 显式 expanded backend | 不依赖未经验证的性能阈值 |
+| auto selector | 第三轮后独立实现 | 第二轮性能/HBM数据不满足冻结条件 |
+| Magi | backend-neutral slices 预留，不接入首版 | 保持社区 PR 依赖和 review 面最小 |
 
 ## Chapter 4：测试验证
 
-待 PoC 结论回填后补充。将把通过的 PoC 固化为 CPU/unit、GPU optional、FSDP integration 三层自动化测试，避免只依赖一次性 benchmark。
+### 4.1 测试原则与分层
+
+精度一致性是 release gate，性能是选择策略输入。测试按以下层级递进，低层失败时不继续用高层结果掩盖：
+
+```text
+core layout invariants
+  -> dense sparse oracle semantics
+  -> Flex backend output/QKV gradient
+  -> FSDP packed hook + RoPE + restore
+  -> logprob/loss/parameter gradient/update
+  -> production FA/Flex performance and HBM
+  -> verl actor lifecycle smoke
+```
+
+TDD 优先：每个开发阶段先提交能表达目标行为的失败测试，再实现代码。GPU optional 测试允许在无 CUDA 环境 skip，但 core/layout、factory/config、runtime 生命周期和 reference 精度测试必须在 CPU 环境运行。
+
+### 4.2 开发自测
+
+#### 4.2.1 Core layout unit tests
+
+新增 `test_prefix_tree_attention_layout.py`，覆盖：
+
+- no-sharing、single root、star、multi-group branch、chain depth3/6、deep fragmented；
+- node ranges 连续覆盖 dedup packed token；
+- self CAUSAL slice 唯一；
+- ancestor FULL slice 只包含 descendant prefix 内区间；
+- sibling/cross-tree 不可见；
+- logical element count 与 token-level dense oracle 完全一致；
+- signature 对相同语义稳定，对相同 token count 但不同 tree 不同；
+- invalid parent order、range overlap、prefix 越界显式报错；
+- empty suffix、完整序列被复用、multiple providers 等边界。
+
+#### 4.2.2 Backend protocol/config unit tests
+
+- capabilities 明确区分 `EXPANDED_KV` / `DEDUPLICATED_QKV`；
+- Flex backend factory lazy import；CPU/NPU 环境不会因 import 项目而导入 CUDA Flex kernel；
+- `backend="flex_attention"` 配置解析、环境 guard、GQA head guard、packed padding guard；
+- expanded backend 仍调用 `build_kv()`，Flex backend 永不调用 store/build_kv；
+- unknown backend、unsupported FSDP option fail-fast；
+- no-sharing 返回原 batch/runtime None，不构造 tree layout/BlockMask。
+
+#### 4.2.3 Runtime lifecycle unit tests
+
+- `PrefixSharingRuntimeState` 正确携带 plan、packed layout、tree layout 和 backend；
+- FSDP runtime 首层 lazy prepare、后续 layer 复用同一 backend runtime；
+- context 退出时 restore resources 清理；backend runtime 不保存 QKV/autograd tensor；
+- 相同 runtime/device/layout 命中，变更 layout/device/block size 安全 miss；
+- 并发 ContextVar/thread/task 不串 state；
+- activation checkpoint recompute 能访问 runtime state，或在暂不支持时由显式 guard 阻止。
+
+### 4.3 功能验证
+
+功能测试不依赖真实 verl：用 fake attention/model 验证完整数据流。
+
+| 场景 | 验证点 |
+|---|---|
+| star | 多 reuser 只保存一份 prefix K/V，visibility 正确 |
+| branch | sibling suffix 完全不可见 |
+| chain | deepest leaf 可见全部 ancestors，provider-before-reuser 不被 sparse path错误依赖 |
+| multi-group | 不同 prefix tree 之间不可见 |
+| no sharing | 原生 attention，Flex backend 调用次数为 0 |
+| GQA | `H_Q % H_KV == 0` 输出 shape/gradient 正确 |
+| variable suffix | partial/tail block 与 position offset 正确 |
+
+小尺寸功能测试同时运行 dense oracle 与 backend，Flex 输出必须保持 packed Q shape；不得产生 expanded K/V tensor。可以通过 spy/allocator stats 断言 sparse path 没有调用 `PrefixAttentionStore.store/load`。
+
+### 4.4 集成验证
+
+#### 4.4.1 FSDP patch integration
+
+在现有 `test_verl_fsdp_adapter.py`、`test_verl_fsdp_ch4_functional.py` 基础上增加：
+
+- `build_prefix_sharing_micro_batch_fsdp()` 构造 tree layout；
+- NestedTensor/remove-padding 输入的 token order、position ids、layout total 一致；
+- attention patch 收到同一个 `PrefixSharingFSDPAttentionRuntime`；
+- 24 层 fake model 只构造一个 BlockMask；
+- dense fallback 只作 correctness，不作为性能主路径；
+- expanded backend 行为不回归。
+
+#### 4.4.2 Real FSDP world_size=1
+
+CUDA optional：Qwen2.5-0.5B tiny batch，分别运行 PS=OFF、expanded-FA、Flex；覆盖 star 和 chain。验证真实 HF attention patch、RoPE、packed shape、logits save 和 restore。该测试对应 PoC-2E。
+
+#### 4.4.3 verl actor lifecycle
+
+在目标 verl 环境执行 `compute_old_log_prob -> ref log_prob -> update_actor`，验证每个 phase 的 runtime 创建/释放、BlockMask 构建次数、logprob/loss/gradient。该测试对应 PoC-2F，完成前不能向 verl 提交 ready PR。
+
+### 4.5 精度对齐
+
+#### 4.5.1 Attention-level
+
+三方 reference：项目 expanded-KV + TorchRef/FA、dense sparse SDPA、Flex。覆盖 fp32 与 bf16、forward 与 Q/K/V backward、随机 upstream gradient、provider directed gradient。
+
+必须报告：max/mean absolute、relative-L2、cosine、tensor norm、finite。fp32 使用严格阈值；bf16 以 expanded-FA 和 Flex 相对同一 fp32 oracle 的误差比较，不能只看 absolute max。
+
+#### 4.5.2 Model-level
+
+比较：
+
+- attention output；
+- hidden state 与 logits；
+- 有效 token logprob，重点 suffix first token；
+- entropy（启用时）；
+- scalar actor loss；
+- 关键参数梯度 relative-L2/cosine；
+- 一次 optimizer update 后参数 relative-L2。
+
+prefix-last restore 单独建立 star/chain regression：provider logits 必须使用 reuser first suffix label 重新计算，不能直接复制 provider logprob；梯度必须回到 provider prefix graph。
+
+#### 4.5.3 Checkpoint/recompute
+
+activation checkpointing 开/关分别比较 loss/gradient；记录 attention forward 调用次数和 backend runtime availability。若当前 verl checkpoint closure 无法保留 runtime，则首版明确 guard，不允许静默产生无 PrefixSharing 的 recompute。
+
+### 4.6 性能对比
+
+性能测试采用第三轮 PoC-3C 的 production harness，独立于 correctness CI：
+
+- 三路径：PS=OFF FA、expanded-KV FA、dedup Flex；
+- single-layer cold、steady layer、24-layer amortized；
+- forward、backward、module total；
+- QKV、metadata、expanded KV、autograd、peak HBM 快照；
+- no-sharing、star long-prompt、chain、fragmented；
+- 至少两个 GQA model shape 与两个 batch scale；
+- cold compile 与 warm p50/p90 分离。
+
+性能测试不以固定百分比作为单元测试断言，避免硬件噪声；通过结构性断言保护：Flex K/V token==dedup、expanded K/V token==expanded、no-sharing 不调用 Flex、BlockMask 每 forward 构建至多一次、无 dense `[T,T]` 长序列 allocation。具体 selector 阈值由 benchmark 数据生成并记录版本/硬件。
+
+### 4.7 冒烟测试
+
+| 环境 | 冒烟内容 | 预期 |
+|---|---|---|
+| CPU/no torch CUDA | import、config、layout、factory lazy import | PASS |
+| CUDA + torch Flex，无 flash-attn | Flex star forward/backward | PASS；expanded optional skip |
+| CUDA + Flex + flash-attn | 三路径 tiny star/chain | PASS |
+| verl FSDP world_size=1 | one old-logprob + actor update | PASS |
+| unsupported NPU/CP/Ulysses | 选择 Flex backend | 明确 config error |
+
+所有 optional skip 必须打印缺失依赖/设备原因；不能将 runtime error 转成 skip。
+
+### 4.8 回归命令与 CI 矩阵
+
+本地 CPU 标准回归：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefixsharing-attn-pycache \
+python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/unit_test \
+  prefix-sharing/tests/integrated_test \
+  prefix-sharing/tests/system_test
+```
+
+GPU optional：
+
+```bash
+PYTHONPATH=prefix-sharing python3 -m pytest -q -p no:cacheprovider \
+  prefix-sharing/tests/integrated_test/optional/test_gpu_flex_backend.py \
+  prefix-sharing/tests/integrated_test/optional/test_gpu_flash_backend.py \
+  prefix-sharing/tests/integrated_test/optional/test_verl_fsdp_flex_e2e.py
+```
+
+建议 CI：CPU required；CUDA Flex smoke required（verl PR 条件允许时）；flash-attn/FSDP e2e nightly 或设备 CI；NPU/Megatron 回归确保旧 backend 无行为变化。
+
+### 4.9 Release gate
+
+| Gate | 必须满足 |
+|---|---|
+| Core | layout/invariant/oracle 全部 CPU PASS |
+| Backend | Flex forward/backward/GQA/shape PASS，无 expanded KV/store 调用 |
+| Integration | FSDP packed hook、RoPE、restore PASS |
+| Precision | logprob/loss/gradient/update 与 baseline 满足约定误差 |
+| Lifecycle | 每 forward 一个 BlockMask；无跨 context 泄漏；checkpoint 行为明确 |
+| Performance | 第三轮 production benchmark 有效；不使用无效第二轮阈值 |
+| Smoke | 目标 torch/verl/CUDA 环境跑通，unsupported 环境 fail-fast |
 
 ## Chapter 5：开发计划
 
-待 PoC 结论回填后补充。将按可独立 review 的原子阶段拆分，不把 planner/layout、Flex backend、性能策略和 Magi PoC 混在同一开发提交中。
+### 5.1 开发原则与依赖关系
+
+开发不等待第三阶段全部结束后才启动。第三阶段 PoC 与代码开发按以下依赖并行：
+
+- 3A/3B 校正的是 correctness 证据，必须在 sparse layout 和 Flex backend 合入前通过；
+- 3C/3D 决定性能承诺和 auto selector，不阻塞显式 `flex_attention` experimental backend；
+- 2E/2F 依赖 minimal backend，进入集成开发后执行；
+- Magi、direct BlockMask 优化和自动阈值均不进入首个功能 PR。
+
+所有阶段遵循 TDD 优先。每个提交只完成一个可独立 review 的目标，不把 core 数据模型、backend 协议、FSDP patch 和性能策略揉成一个提交。
+
+### 5.2 Phase 0：校正关键 PoC（ClaudeCode，可与 Phase 1 并行）
+
+**任务。** 严格执行 2.3 的 3A/3B；有目标设备时并行执行 3C/3D。
+
+**产物。** 可复现脚本、程序断言、文档回填和准确 commit；不得只提交 JSON 结果或人工判断。
+
+**出口。** 3A 证明项目 expanded builder、dense oracle、Flex 的 output/QKV gradient 闭环；3B 证明 generic BlockMask coverage 正确。未通过时暂停 Phase 3 合入，并根据失败修改 layout/mask 设计。
+
+### 5.3 Phase 1：实现 backend-neutral sparse layout
+
+**先写测试。** 新增 core unit tests，覆盖 star、branch、chain、deep tree、多独立 group、no-sharing、零长度非法输入以及 ancestor slice 截断规则。
+
+**代码。**
+
+- 新增 `prefix_sharing/core/attention_layout.py`；
+- 由 `PrefixSharingPlan` 派生 immutable `PrefixTreeAttentionLayout`；
+- 提供 token-level visibility oracle，仅供测试和小规模 reference；
+- 不引入 torch、Flex、verl 或设备依赖；
+- 暂时保留 plan 中 expanded-KV 字段，保证旧 backend 无行为变化。
+
+**出口。** CPU tests 全部通过；layout 能独立表达任意当前 planner 产出的复用树；不修改既有 backend 输出。
+
+建议原子提交：`[feat] 新增前缀树注意力布局`。
+
+### 5.4 Phase 2：拆分 attention backend 执行协议
+
+**先写测试。** 用 fake expanded/sparse backend 验证 runtime 只调用所选模式的方法；no-sharing 不进入 prefix-sharing backend；unsupported mode fail-fast。
+
+**代码。**
+
+- 引入显式 `PrefixAttentionExecutionMode`；
+- 将通用能力、expanded-KV 执行能力和 sparse 执行能力拆分；
+- 现有 TorchRef/GPU FA/NPU FA 适配 expanded 协议；
+- integration 不再假设所有 backend 都必须先执行 `build_kv()`；
+- 不使用空实现或伪造 K/V 兼容旧接口。
+
+**出口。** 现有 backend 回归全通过；协议可以在不分配 expanded KV 的情况下调用 sparse backend。
+
+建议原子提交：`[refactor] 拆分前缀注意力执行协议`。
+
+### 5.5 Phase 3：实现首版 `FlexAttentionBackend`
+
+**先写测试。** 覆盖 mask visibility、GQA、RoPE 后 Q/K 输入、forward/backward、provider 定向梯度、动态 shape、unsupported dtype/device/version。
+
+**代码。**
+
+- 新增 `prefix_sharing/backends/flex_attention.py`；
+- 从 `PrefixTreeAttentionLayout` 构造 generic `create_block_mask(mask_mod)`；
+- 使用 lazy import，不给 CPU/NPU/旧 torch 环境增加 import-time 依赖；
+- 同一 model forward 内复用 immutable BlockMask；
+- candidate 路径直接消费去重 Q/K/V，禁止调用 `PrefixAttentionStore` 和 expanded builder；
+- 首版不实现 direct `from_kv_blocks` 优化。
+
+**出口。** 3A/3B PASS；backend unit/function tests PASS；profile 证明没有 expanded K/V 分配。
+
+建议原子提交：`[feat] 实现FlexAttention前缀复用后端`。
+
+### 5.6 Phase 4：接入 FSDP packed runtime
+
+**先写测试。** fake model/layer 验证每个 model forward 只创建一个 runtime metadata，各 layer 共用同一 BlockMask；context 退出后不可复用；activation checkpoint 重算行为可观测。
+
+**代码。**
+
+- runtime state 持有 tree layout；
+- 新增/调整 FSDP attention runtime，使 backend runtime metadata 生命周期归属于一次 model forward；
+- `verl_fsdp` integration 按 execution mode 分派 expanded 或 sparse 路径；
+- 首版保持 packed token 顺序，不改 position ids 和 restore indices；
+- 增加 CUDA、remove-padding、CP/SP、torch version 等明确 guard。
+
+**出口。** fake integration、real FSDP world-size=1 和旧 expanded backend 回归通过；BlockMask 无跨 micro-batch 泄漏。
+
+建议原子提交：`[feat] 接入FSDP FlexAttention运行时`。
+
+### 5.7 Phase 5：精度闭环与训练生命周期验收
+
+**任务。** 执行 2E/2F，并完成 Chapter 4 的 precision/integration matrix：
+
+- attention output 与 Q/K/V gradient；
+- model logits、restored logprob、loss、parameter gradient；
+- 一次 optimizer update 后参数；
+- activation checkpoint on/off；
+- compute-old-log-prob、reference log-prob、actor update；
+- star、branch、chain 和 deep tree。
+
+发现偏差时优先定位 mask、position、restore 和 checkpoint 生命周期，不通过放宽阈值掩盖语义错误。
+
+**出口。** 精度红线全部通过，2E/2F 回填完成，旧 FA backend 无回归。
+
+### 5.8 Phase 6：设备性能验收与策略冻结
+
+执行 3C/3D，并至少覆盖两个模型 Q/KV head shape、两个 batch scale、两类共享拓扑。报告 attention module forward/backward、完整 peak HBM、24-layer 摊销和端到端 trainer 指标。
+
+首版优先暴露显式 backend 选择：
+
+- `native`：no-sharing；
+- `expanded_flash_attention`：已有兼容路径；
+- `flex_attention`：KV 零冗余 experimental 路径。
+
+只有实测出现跨 workload 稳定分界，才在单独提交中加入 auto selector。不得直接采用第二轮探索性的 `T<1000` 或压缩率 `<50%`。
+
+建议后续原子提交：`[feat] 新增前缀注意力后端选择策略`。
+
+### 5.9 Phase 7：文档、兼容矩阵与 PR 收口
+
+- 更新 README、架构/概念文档和配置示例；
+- 明确 experimental、fallback、版本与并行策略边界；
+- 记录 Magi、direct BlockMask、CP/Ulysses、NPU 等遗留项；
+- PR body 提供实际测试命令、通过/跳过数量、设备环境、精度和性能摘要；
+- 将 core、协议重构、Flex backend、FSDP integration 按原子提交保留，方便社区逐层 review。
+
+### 5.10 并行安排与 Definition of Done
+
+可并行：ClaudeCode 执行 Phase 0/设备实验；Codex 实现 Phase 1/2。Phase 3 合入前等待 3A/3B；Phase 6 与功能正确性开发可并行，但性能策略必须后置。
+
+首版完成的定义：
+
+1. FSDP packed 路径实际以去重 Q/K/V 执行 FlexAttention，未构造 expanded K/V；
+2. 任意当前支持的前缀树 output/logprob/loss/gradient 与 baseline 对齐；
+3. no-sharing 原生 bypass，旧 expanded backend 完整保留；
+4. runtime metadata 每 forward 构建一次并正确释放；
+5. 开发自测、功能、集成、精度、性能、smoke 六类验证有真实结果；
+6. 未验证环境明确 fail-fast，不静默退化为错误语义。
 
 ## Chapter 6：当前结论
 
-当前主线建议：先实现 backend-neutral 去重布局，以 FlexAttention 完成 verl FSDP 首版；保留 expanded-KV + FA fallback，并把 Magi FFA 作为下一阶段高性能候选。
+### 6.1 技术决策
+
+当前已经具备开展方案设计和开发的条件，不应继续原样重复第二阶段 PoC。主线冻结为：
+
+1. 先建立 backend-neutral `PrefixTreeAttentionLayout`；
+2. 以 FlexAttention 完成 verl FSDP 的首个 Q/K/V 零冗余 backend；
+3. 保留 expanded-KV + FA 作为兼容和精度 reference；
+4. no-sharing 直接 bypass prefix-sharing；
+5. Magi FFA 作为后续高性能/分布式候选，不阻塞首版。
+
+### 6.2 已确认与尚未确认
+
+已确认：Flex 的 mask 表达能力覆盖当前 prefix tree；metadata 可跨 layer 复用；FSDP 接入点存在；方案无需增加第三方 Python package；保持 packed token 顺序可以复用现有 position/restore 语义。
+
+尚未被有效证据确认：项目 production expanded 路径与 Flex 的完整 Q/K/V gradient 对齐、direct BlockMask coverage、production packed FA 对照性能、完整 forward+backward HBM、目标 torch 2.9.1 行为、真实 FSDP/actor 生命周期。第二阶段相关数字只能作为探索性观察。
+
+### 6.3 当前执行建议
+
+立即并行启动 Phase 0 与 Phase 1/2。3A/3B 是 Flex backend 合入 gate；3C/3D 是性能策略和对外性能结论 gate。首版采用显式 backend 配置，不在证据不足时提前实现自动阈值。
 
 ## Chapter 7：遗留问题
 
-当前遗留问题见 1.10。待 PoC 与方案设计完成后，将未解决的硬件、版本、CP、NPU 和专用 kernel 问题统一收敛到本章。
+### 7.1 首版合入前必须关闭
+
+- **项目主路径精度证据。** 第二阶段使用了手写 expanded KV；按 3A 以项目 builder、store、production FA 和完整 backward 重测。
+- **BlockMask coverage。** 修正 partial/full block 统计并验证 direct constructor；首版 generic path 也必须通过 token-level coverage oracle。
+- **训练级 HBM/时延。** 独立进程测量 forward+backward 和 24-layer 摊销，不能沿用第二阶段受 allocator、逐 row FA 和 no-grad 影响的数据。
+- **目标版本。** 在 verl 目标 torch 2.9.1 验证 API、compile、精度和性能；2.6 结果不关闭此项。
+- **真实 FSDP 与 actor 生命周期。** 完成 2E/2F，覆盖 restore、optimizer update 和 activation checkpoint。
+
+### 7.2 首版后优先优化
+
+- **Direct BlockMask builder。** 若 3B 证明正确且 metadata/执行性能稳定优于 generic builder，再作为独立优化合入。
+- **Auto selector。** 根据 3C/真实 trainer 数据按设备、模型 shape、token 数、共享率和拓扑制定；没有稳定分界前保持显式配置。
+- **Runtime cache。** 首版仅在一次 model forward 内跨 layer 复用；跨 micro-batch/global cache 需解决生命周期、动态 shape、显存上限和 compile key 爆炸。
+- **多卡 FSDP。** 补 world-size>1、不同 sharding strategy、gradient accumulation 和 rank-local metadata 一致性验证。
+- **Dropout/确定性。** 训练启用 attention dropout 时验证 RNG 消耗与 baseline 语义，并明确可接受的精度口径。
+
+### 7.3 中长期能力
+
+- **MagiAttention。** 在 H100/H200 和适配软件栈评估 FFA；重点验证任意 prefix tree、反向、分布式通信和集成维护成本。
+- **CP/Ulysses。** sparse logical layout 与 sequence shard/communication layout 的组合尚未设计，不能直接声明支持。
+- **Megatron sparse backend。** 当前首版聚焦 FSDP；Megatron/NPU 继续走 expanded backend，后续需独立确定 hook 和 kernel。
+- **NPU sparse kernel。** FlexAttention 不是 NPU 交付方案，需要评估 MindSpeed/CANN 可表达同类 block-sparse mask 的后端。
+- **Token 重排。** DFS/group reorder 可能提高 block 完整度，但会增加 CPU 成本并影响 position/restore；首版不做。
+- **HybridAttention。** Gated DeltaNet 等状态复用不属于本次 attention KV sparse backend 范围，需要独立 state layout 和执行后端。
