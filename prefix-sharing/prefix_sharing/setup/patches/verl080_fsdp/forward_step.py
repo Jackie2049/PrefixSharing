@@ -32,7 +32,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 and hasattr(self, "prepare_model_outputs")
             ):
                 result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
-                from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_baseline_verl080
+                from prefix_sharing.tools.diagnostic_dump import dump_fsdp_baseline_verl080
 
                 dump_fsdp_baseline_verl080(micro_batch, result, "train")
             else:
@@ -165,7 +165,7 @@ def _forward_step_with_engine_prepare(
 
     import os as _os_diag
     if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_on_metadata_verl080
+        from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
 
@@ -182,7 +182,7 @@ def _forward_step_with_engine_prepare(
         raw_output = self.module(**model_inputs, use_cache=False)
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080
 
             dump_raw_logits_verl080(raw_output)
         _save_prefix_last_logits_from_raw_output(raw_output)
@@ -196,7 +196,7 @@ def _forward_step_with_engine_prepare(
 
         import os as _os_diag2
         if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_model_output_2d_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_fsdp_model_output_2d_verl080
 
             dump_fsdp_model_output_2d_verl080(
                 model_output,
@@ -252,7 +252,7 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         raw_output = self.module(**model_inputs, use_cache=False)
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080
 
             dump_raw_logits_verl080(raw_output)
         model_output = self.prepare_model_outputs(

@@ -29,7 +29,7 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         import os as _os
         _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
         if _diag_on:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_logits_verl080
             dump_logits_verl080(logits)
         # ##### [PS-diag] dump logits end #####
 

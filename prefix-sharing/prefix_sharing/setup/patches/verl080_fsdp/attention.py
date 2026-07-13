@@ -18,7 +18,7 @@ from typing import Any
 
 # per-forward 累积每层 attention 输出，最后一层 flush 成 attn_outputs.pt。
 # layer_number == 1 时清空（新 forward 起点），== num_layers 时存盘。
-# 与 cmp_diag_verl080.cmp_attn_layer 约定一致：dict {layer_1based: tensor[N, hidden]}。
+# 与 cmp_diag.cmp_attn_layer 约定一致：dict {layer_1based: tensor[N, hidden]}。
 _FSDP_ATTN_BUFFER: dict[int, Any] = {}
 
 
