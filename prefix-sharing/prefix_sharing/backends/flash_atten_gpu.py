@@ -131,9 +131,6 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
                 dropout_p=kwargs.get("dropout_p", 0.0),
                 softmax_scale=kwargs.get("softmax_scale", None),  # defaults to 1/sqrt(head_dim)
                 causal=kwargs.get("causal", True),
-                window_size=kwargs.get("window_size", (-1, -1)),
-                softcap=kwargs.get("softcap", 0.0),
-                alibi_slopes=kwargs.get("alibi_slopes", None),
                 deterministic=kwargs.get("deterministic", False),
             )
         except Exception as exc:
