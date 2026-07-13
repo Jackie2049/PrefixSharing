@@ -51,14 +51,19 @@ def _dump_fsdp_attn_output(output: Any, module: Any) -> None:
         _FSDP_ATTN_BUFFER.clear()
     _FSDP_ATTN_BUFFER[layer_number] = out_2d
     if layer_number == num_layers:
-        # 多 rank（DP）下只有 rank 0 存盘，其余 rank 仅累积后丢弃，避免文件 clobber。
-        # 与 _save_tensor 的 _rank0_only() 门控一致：2D/logits dump 已通过 _save_tensor
-        # 自动 rank-0 门控；本函数直接 torch.save，需显式补门控。单卡（rank 0 或
-        # dist 未初始化）_rank0_only() 恒 True，行为不变。
-        from prefix_sharing.tools.diagnostic_dump import _rank0_only
+        # DP-aware dump: when dp_size > 1, each rank writes attn_outputs_dp{r}.pt;
+        # otherwise rank 0 writes attn_outputs.pt (single-card compatible).
+        from prefix_sharing.tools.diagnostic_dump import _get_dp_size, _get_dp_rank
 
-        if _rank0_only():
-            torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, "attn_outputs.pt"))
+        if _get_dp_size() > 1:
+            filename = f"attn_outputs_dp{_get_dp_rank()}.pt"
+        else:
+            from prefix_sharing.tools.diagnostic_dump import _rank0_only
+            if not _rank0_only():
+                _FSDP_ATTN_BUFFER.clear()
+                return
+            filename = "attn_outputs.pt"
+        torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, filename))
         _FSDP_ATTN_BUFFER.clear()
 
 

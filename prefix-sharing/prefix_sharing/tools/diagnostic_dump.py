@@ -66,9 +66,15 @@ _TENSOR_SCOPES: dict[str, str] = {
     "full_kv": "pp_stage",
     "build_kv_input_v": "pp_stage",
     "hidden_states": "pp_stage",
+    # FSDP/DP-sharded files: each DP rank writes its own shard
+    "prefix_lens": "dp_shard",
+    "cu_seqlens_q": "dp_shard",
+    "cu_seqlens_q_logits": "dp_shard",
 }
 
 _PARALLEL_INFO_CACHE: Any = None
+_DP_RANK_CACHE: int | None = None
+_DP_SIZE_CACHE: int | None = None
 _MANIFEST_WRITTEN: set[str] = set()
 
 
@@ -85,6 +91,48 @@ def _cached_parallel_info() -> Any:
     except Exception:
         _PARALLEL_INFO_CACHE = None
     return _PARALLEL_INFO_CACHE
+
+
+def _get_dp_rank() -> int:
+    """Return DP (data parallel) rank for FSDP / pure DP scenarios.
+
+    When Megatron parallel_info is available (TP/PP), rank 0 under each TP group
+    is treated as dp_rank 0 (only one writer per shard). When distributed is
+    initialized but no Megatron info exists (pure FSDP), use torch.distributed rank.
+    """
+    global _DP_RANK_CACHE
+    if _DP_RANK_CACHE is not None:
+        return _DP_RANK_CACHE
+    parallel_info = _cached_parallel_info()
+    if parallel_info is not None and parallel_info.tp_rank == 0:
+        _DP_RANK_CACHE = 0
+    elif torch.distributed.is_initialized():
+        _DP_RANK_CACHE = torch.distributed.get_rank()
+    else:
+        _DP_RANK_CACHE = 0
+    return _DP_RANK_CACHE
+
+
+def _get_dp_size() -> int:
+    """Return DP (data parallel) world size."""
+    global _DP_SIZE_CACHE
+    if _DP_SIZE_CACHE is not None:
+        return _DP_SIZE_CACHE
+    parallel_info = _cached_parallel_info()
+    if parallel_info is not None:
+        _DP_SIZE_CACHE = 1  # Megatron: DP data not shard-visible here
+    elif torch.distributed.is_initialized():
+        _DP_SIZE_CACHE = torch.distributed.get_world_size()
+    else:
+        _DP_SIZE_CACHE = 1
+    return _DP_SIZE_CACHE
+
+
+def _dp_suffix() -> str:
+    """Return ``'_dp{r}'`` when dp_size > 1, else ``''``."""
+    if _get_dp_size() > 1:
+        return f"_dp{_get_dp_rank()}"
+    return ""
 
 
 def _stage_last_layer(num_layers_global: int) -> int:
@@ -115,6 +163,8 @@ def _should_write_for_scope(scope: str) -> bool:
         return _rank0_only()
     if scope == "tp_vocab":
         return True
+    if scope == "dp_shard":
+        return True  # every DP rank writes its own shard
     if scope == "pp_last":
         if parallel_info is not None and not parallel_info.is_pipeline_last_stage:
             return False
@@ -149,6 +199,7 @@ def _ensure_manifest(dump_dir: str, parallel_info: Any) -> None:
         "tp_size": getattr(parallel_info, "tp_size", 1) if parallel_info else 1,
         "pp_size": getattr(parallel_info, "pp_size", 1) if parallel_info else 1,
         "cp_size": getattr(parallel_info, "cp_size", 1) if parallel_info else 1,
+        "dp_size": _get_dp_size(),
         "global_rank_of_dumper": getattr(parallel_info, "global_rank", 0) if parallel_info else 0,
         "scopes": dict(_TENSOR_SCOPES),
     }
@@ -175,8 +226,12 @@ def _save_tensor(name: str, tensor: torch.Tensor, dump_dir: str,
 
     if scope == "tp_vocab" and parallel_info is not None and parallel_info.tp_size > 1:
         filename = _with_suffix(name, f"_tp{parallel_info.tp_rank}")
+    elif scope == "dp_shard" and _get_dp_size() > 1:
+        filename = _with_suffix(name, _dp_suffix())
     else:
         if scope == "tp_vocab":
+            scope = "global"
+        if scope == "dp_shard":
             scope = "global"
         filename = name
     try:
@@ -351,27 +406,45 @@ def _is_nested_tensor(value: Any) -> bool:
 #  Shared dump helpers (tagged 2D outputs, used by both paths)
 # ════════════════════════════════════════════════════════════════
 
-def dump_meta_verl080(prefix_lens: list[int], cu_seqlens: torch.Tensor) -> None:
-    """Save metadata: prefix_lens + cu_seqlens_q + cu_seqlens_q_logits."""
+def dump_meta_verl080(prefix_lens: list[int], cu_seqlens: torch.Tensor,
+                     dp_aware: bool = False) -> None:
+    """Save metadata: prefix_lens + cu_seqlens_q + cu_seqlens_q_logits.
+
+    When ``dp_aware=True``, each DP rank writes its own shard with ``_dp{r}`` suffix.
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor("prefix_lens.pt", torch.tensor(prefix_lens, dtype=torch.int32), dump_dir)
-    _save_tensor("cu_seqlens_q.pt", cu_seqlens, dump_dir)
-    _save_tensor("cu_seqlens_q_logits.pt", cu_seqlens, dump_dir)
+    scope = "dp_shard" if dp_aware and _get_dp_size() > 1 else "global"
+    _save_tensor("prefix_lens.pt", torch.tensor(prefix_lens, dtype=torch.int32), dump_dir, scope=scope)
+    _save_tensor("cu_seqlens_q.pt", cu_seqlens, dump_dir, scope=scope)
+    _save_tensor("cu_seqlens_q_logits.pt", cu_seqlens, dump_dir, scope=scope)
 
 
-def dump_logits_verl080(logits: torch.Tensor) -> None:
-    """Save packed logits, scope=tp_vocab."""
+def dump_logits_verl080(logits: torch.Tensor,
+                       dp_aware: bool = False) -> None:
+    """Save packed logits, scope=tp_vocab.
+
+    When ``dp_aware=True`` and no TP (tp_size==1), uses scope="dp_shard"
+    so each DP rank writes its own ``logits_dp{r}.pt``.
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
+    if dp_aware and _get_dp_size() > 1:
+        parallel_info = _cached_parallel_info()
+        if parallel_info is None or parallel_info.tp_size <= 1:
+            _save_tensor("logits.pt", logits, dump_dir, scope="dp_shard")
+            return
     _save_tensor("logits.pt", logits, dump_dir, scope="tp_vocab")
 
 
 def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str,
                              scope: str = "global") -> None:
-    """Save 2D log_probs ``[B, L_max]``."""
+    """Save 2D log_probs ``[B, L_max]``.
+
+    Pass ``scope="dp_shard"`` for DP-aware dumping (each rank writes with _dp{r} suffix).
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
@@ -380,35 +453,42 @@ def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str,
 
 def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str,
                             scope: str = "global") -> None:
-    """Save 2D entropy ``[B, L_max]``. ``None`` skips."""
+    """Save 2D entropy ``[B, L_max]``. ``None`` skips.
+
+    Pass ``scope="dp_shard"`` for DP-aware dumping (each rank writes with _dp{r} suffix).
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None or ent_2d is None:
         return
     _save_tensor(f"entropy_{tag}.pt", ent_2d, dump_dir, scope=scope)
 
 
-def dump_attention_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
+def dump_attention_mask_verl080(mask_2d: torch.Tensor, tag: str,
+                                dp_aware: bool = False) -> None:
     """Save 2D attention_mask ``[B, L_max]`` (bool)."""
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor(f"attention_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir)
+    scope = "dp_shard" if dp_aware and _get_dp_size() > 1 else "global"
+    _save_tensor(f"attention_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir, scope=scope)
 
 
-def dump_label_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
+def dump_label_mask_verl080(mask_2d: torch.Tensor, tag: str,
+                            dp_aware: bool = False) -> None:
     """Save 2D label_mask ``[B, L_max]`` (bool)."""
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor(f"label_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir)
+    scope = "dp_shard" if dp_aware and _get_dp_size() > 1 else "global"
+    _save_tensor(f"label_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir, scope=scope)
 
 
-def dump_raw_logits_verl080(raw_output: Any) -> None:
+def dump_raw_logits_verl080(raw_output: Any, dp_aware: bool = False) -> None:
     """Extract and dump logits from HF/verl model raw output."""
     if _get_dump_dir() is None:
         return
     logits = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
-    dump_logits_verl080(logits)
+    dump_logits_verl080(logits, dp_aware=dp_aware)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -661,6 +741,7 @@ def dump_fsdp_on_metadata_verl080(micro_batch: Any, prefix_sharing_plan: Any, ta
     if _get_dump_dir() is None:
         return
 
+    dp_aware = _get_dp_size() > 1
     prefix_lens = list(prefix_sharing_plan.prefix_lens)
     original_lengths = list(prefix_sharing_plan.original_lengths)
     kept_lengths = list(prefix_sharing_plan.kept_lengths_q)
@@ -668,10 +749,10 @@ def dump_fsdp_on_metadata_verl080(micro_batch: Any, prefix_sharing_plan: Any, ta
     cu_seqlens = torch.zeros(len(kept_lengths) + 1, dtype=torch.int64)
     for index, length in enumerate(kept_lengths):
         cu_seqlens[index + 1] = cu_seqlens[index] + length
-    dump_meta_verl080(prefix_lens, cu_seqlens)
+    dump_meta_verl080(prefix_lens, cu_seqlens, dp_aware=dp_aware)
 
     max_length = max(original_lengths) if original_lengths else 0
-    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag)
+    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag, dp_aware=dp_aware)
 
     loss_mask = micro_batch.get("loss_mask")
     if loss_mask is not None:
@@ -679,8 +760,9 @@ def dump_fsdp_on_metadata_verl080(micro_batch: Any, prefix_sharing_plan: Any, ta
         dump_label_mask_verl080(
             build_label_mask_2d(response_lengths, original_lengths, max_length),
             tag,
+            dp_aware=dp_aware,
         )
-    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag)
+    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag, dp_aware=dp_aware)
 
 
 def dump_fsdp_model_output_2d_verl080(
@@ -691,6 +773,7 @@ def dump_fsdp_model_output_2d_verl080(
     """Dump restored FSDP log_probs/entropy to unified 2D coordinate system."""
     if _get_dump_dir() is None:
         return
+    scope = "dp_shard" if _get_dp_size() > 1 else "global"
     max_length = max(original_lengths) if original_lengths else 0
     log_probs = model_output.get("log_probs")
     if log_probs is None:
@@ -698,13 +781,13 @@ def dump_fsdp_model_output_2d_verl080(
     log_probs_2d = _maybe_nested_to_2d(log_probs, original_lengths, max_length)
     if log_probs_2d is None or log_probs_2d.dim() != 2:
         return
-    dump_logprobs_2d_verl080(log_probs_2d, tag)
+    dump_logprobs_2d_verl080(log_probs_2d, tag, scope=scope)
 
     entropy = model_output.get("entropy")
     if entropy is not None:
         entropy_2d = _maybe_nested_to_2d(entropy, original_lengths, max_length)
         if entropy_2d is not None and entropy_2d.dim() == 2:
-            dump_entropy_2d_verl080(entropy_2d, tag)
+            dump_entropy_2d_verl080(entropy_2d, tag, scope=scope)
 
 
 def dump_fsdp_baseline_verl080(micro_batch: Any, result: Any, tag: str) -> None:
@@ -719,6 +802,7 @@ def dump_fsdp_baseline_verl080(micro_batch: Any, result: Any, tag: str) -> None:
     if not model_output:
         return
 
+    dp_aware = _get_dp_size() > 1
     original_lengths = _original_lengths_from_input_ids(micro_batch.get("input_ids"))
     if original_lengths is None:
         return
@@ -727,10 +811,10 @@ def dump_fsdp_baseline_verl080(micro_batch: Any, result: Any, tag: str) -> None:
     cu_seqlens = torch.zeros(len(original_lengths) + 1, dtype=torch.int64)
     for index, length in enumerate(original_lengths):
         cu_seqlens[index + 1] = cu_seqlens[index] + length
-    dump_meta_verl080(prefix_lens, cu_seqlens)
+    dump_meta_verl080(prefix_lens, cu_seqlens, dp_aware=dp_aware)
 
     max_length = max(original_lengths) if original_lengths else 0
-    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag)
+    dump_attention_mask_verl080(build_attention_mask_2d(original_lengths, max_length), tag, dp_aware=dp_aware)
 
     loss_mask = micro_batch.get("loss_mask")
     if loss_mask is not None:
@@ -738,8 +822,9 @@ def dump_fsdp_baseline_verl080(micro_batch: Any, result: Any, tag: str) -> None:
         dump_label_mask_verl080(
             build_label_mask_2d(response_lengths, original_lengths, max_length),
             tag,
+            dp_aware=dp_aware,
         )
-    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag)
+    dump_input_ids_2d_verl080(micro_batch, original_lengths, max_length, tag, dp_aware=dp_aware)
     dump_fsdp_model_output_2d_verl080(model_output, original_lengths, tag)
 
 
@@ -748,6 +833,7 @@ def dump_input_ids_2d_verl080(
     original_lengths: list[int],
     max_length: int,
     tag: str,
+    dp_aware: bool = False,
 ) -> None:
     """Dump raw input_ids to 2D [B, L_max] as ON/OFF batch alignment anchor."""
     dump_dir = _get_dump_dir()
@@ -762,7 +848,8 @@ def dump_input_ids_2d_verl080(
         ids_2d = input_ids
     else:
         return
-    _save_tensor(f"input_ids_{tag}.pt", ids_2d.long().cpu(), dump_dir)
+    scope = "dp_shard" if dp_aware and _get_dp_size() > 1 else "global"
+    _save_tensor(f"input_ids_{tag}.pt", ids_2d.long().cpu(), dump_dir, scope=scope)
 
 
 # ── FSDP internal helpers ───────────────────────────────────────

@@ -182,9 +182,9 @@ def _forward_step_with_engine_prepare(
         raw_output = self.module(**model_inputs, use_cache=False)
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
 
-            dump_raw_logits_verl080(raw_output)
+            dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -252,9 +252,9 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         raw_output = self.module(**model_inputs, use_cache=False)
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
 
-            dump_raw_logits_verl080(raw_output)
+            dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
