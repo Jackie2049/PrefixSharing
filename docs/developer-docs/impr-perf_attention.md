@@ -1891,7 +1891,7 @@ PS=ON deduplicated:     generic BlockMask + compiled flex_attention()
 
 | 日期 / commit / 环境 | 3A real-path output/QKV-grad | 3B exact coverage/tail | 3C real backend fwd/bwd/HBM | torch 2.9.1 compile cold/warm | 结论 / 未关闭项 |
 |---|---|---|---|---|---|
-| 2026-07-13 / env-torch291 torch2.9.1+cu128 A100 sm80 | ✅ builder_calls=1, 7/7 fp32 PASS (flex_vs_oracle max < 2.1e-06), provider KV grad > 0 全部通过. bf16 expanded-vs-flex: cos~0.99999 rel_l2~0.004. exp_vs_oracle 未记录因expanded backend输出含repad | 待回填 | 待回填 | torch 2.9.1: BM cold~6.6s warm=2.0ms; compile(flex) fwd+bwd 10x avg=1.2ms (vs 2.8.0 无compile ~35ms) | 3A PASS: 真实expanded路径精度门满足, 可冻结generic BlockMask correctness设计; 3B/3C待补充后更新 |
+| 2026-07-13 / env-torch291 torch2.9.1+cu128 A100 sm80 | ✅ builder_calls=1, 7/7 fp32 PASS (flex_vs_oracle max < 2.1e-06), provider KV grad > 0 全部通过. bf16 expanded-vs-flex: cos~0.99999 rel_l2~0.004. exp_vs_oracle 未记录因expanded backend输出含repad | ✅ 全部PASS: 逐元素`all_visible_covered=True`零遗漏, blocks_match=True (partial+full==reconstructed). bs64/128/256 star+chain+frag全部通过. sched/logical=1.0(精确覆盖). flex_vs_oracle max<2.1e-06. from_kv_blocks可用但direct未验证→API_PRESENT_NOT_VALIDATED | ❌ 未执行 (需独立进程 harness, 当前排队中) | torch 2.9.1: BM cold~6.6s warm=2.0ms; compile(flex) fwd+bwd 10x avg=1.2ms (vs 2.8.0 无compile ~35ms) | 3A PASS + 3B PASS → 可冻结generic BlockMask correctness设计并推进Flex backend; 3C待补充 |
 
 补充测试结束后的决策规则：
 
