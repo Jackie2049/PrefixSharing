@@ -21,14 +21,30 @@ def _dump_attn_output(output: Any, module: Any) -> None:
     """Thin wrapper: extract layer_number / num_layers from *module*, delegate to
     ``diagnostic_dump.dump_fsdp_attn_output`` for accumulation and flush.
     """
+    import sys as _sys
+    _diag_done = getattr(_sys.modules[__name__], "_PS_attn_diag_done", False)
+
     layer_number = int(getattr(module, "layer_idx", 0) or 0) + 1  # 1-based
 
     # Try module.config first; under FSDP wrapping, fall back to the root model config
     num_layers = int(getattr(getattr(module, "config", None), "num_hidden_layers", 0) or 0)
     if num_layers == 0:
-        # FSDP may wrap the HF module — try to reach config via the root model
         root_config = getattr(getattr(module, "model", None), "config", None)
         num_layers = int(getattr(root_config, "num_hidden_layers", 0) or 0)
+
+    if layer_number == 1 and not _diag_done:
+        is_tuple = isinstance(output, tuple)
+        has_dim = hasattr(output[0] if is_tuple else output, "dim")
+        out_dim = (output[0] if is_tuple else output).dim() if has_dim else -1
+        print(
+            f"[PS-diag] _dump_attn_output: module={type(module).__name__}, "
+            f"layer_idx={getattr(module, 'layer_idx', '?')}, "
+            f"num_layers={num_layers}, output_is_tuple={is_tuple}, "
+            f"output_dim={out_dim}, output_shape={getattr(output[0] if is_tuple else output, 'shape', '?')}",
+            flush=True,
+        )
+        setattr(_sys.modules[__name__], "_PS_attn_diag_done", True)
+
     if num_layers == 0:
         return
 
