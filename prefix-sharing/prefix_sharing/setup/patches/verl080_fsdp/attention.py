@@ -30,6 +30,11 @@ def patch_transformers_attention(original_getitem: Any) -> Any:
     因此我们 patch ``__getitem__`` 来拦截所有 attention 接口查找。
     """
 
+    import logging as _ps_diag_log
+    _ps_diag_log.basicConfig(level=_ps_diag_log.INFO,
+                             format='%(asctime)s [PS-diag] %(message)s',
+                             datefmt='%H:%M:%S')
+
     def ps_aware_get_interface(attn_implementation: str, default: Any = None) -> Any:
         original_fn = original_getitem(attn_implementation) if default is None else original_getitem(attn_implementation)
 
@@ -37,15 +42,23 @@ def patch_transformers_attention(original_getitem: Any) -> Any:
                               attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
             from prefix_sharing.integrations.context import current_prefix_sharing_context
 
+            _ps_diag_log.info("patched_attention called module=%s has_layer_idx=%s has_config=%s n_layers=%s",
+                              type(module).__name__,
+                              hasattr(module, "layer_idx"),
+                              hasattr(module, "config"),
+                              getattr(getattr(module, "config", None), "num_hidden_layers", "MISSING"))
+
             ctx = current_prefix_sharing_context()
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.diagnostics import dump_fsdp_attention_inputs
 
+                _ps_diag_log.info("DIAG: calling dump_fsdp_attention_inputs")
                 dump_fsdp_attention_inputs(query, key, value, module)
             if ctx is None:
                 result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
                 # ##### [PS-diag] OFF attn output dump（context 不激活 = baseline） #####
                 if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+                    _ps_diag_log.info("DIAG: calling dump_fsdp_attn_output (OFF)")
                     dump_fsdp_attn_output(result, module)
                 # ##### [PS-diag] end #####
                 return result
