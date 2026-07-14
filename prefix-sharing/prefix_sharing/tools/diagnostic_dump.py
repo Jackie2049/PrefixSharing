@@ -879,6 +879,60 @@ def _response_lengths_from_loss_mask(loss_mask: Any, batch_size: int) -> list[in
 
 
 # ════════════════════════════════════════════════════════════════
+#  FSDP per-layer attention output dump (called from attention patch)
+# ════════════════════════════════════════════════════════════════
+
+_FSDP_ATTN_BUFFER: dict[int, torch.Tensor] = {}
+
+
+def dump_fsdp_attn_output(
+    output: Any,
+    layer_number: int,
+    num_layers: int,
+) -> None:
+    """Accumulate one layer's attention output and flush to attn_outputs.pt.
+
+    Called from the FSDP ``attention.py`` patch for both ON and OFF paths.
+    *output* is ``[B, L, H, D]`` (before o_proj), reshaped to ``[N, H*D]``
+    packed format matching Megatron's ``[N, hidden]`` convention.
+
+    Args:
+        output: Attention output tensor (before o_proj), single tensor or tuple.
+        layer_number: 1-based layer index.
+        num_layers: Total number of layers in the model.
+    """
+    import torch as _torch
+
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if isinstance(output, tuple):
+        output = output[0]
+    if not hasattr(output, "dim") or output.dim() < 3:
+        return
+    if num_layers == 0:
+        return
+
+    hidden_dim = output.shape[-1] * output.shape[-2]
+    output_2d = output.reshape(-1, hidden_dim).detach().cpu().contiguous()
+
+    if layer_number == 1:
+        _FSDP_ATTN_BUFFER.clear()
+    _FSDP_ATTN_BUFFER[layer_number] = output_2d
+
+    if layer_number == num_layers:
+        if _get_dp_size() > 1:
+            filename = f"attn_outputs_dp{_get_dp_rank()}.pt"
+        else:
+            if not _rank0_only():
+                _FSDP_ATTN_BUFFER.clear()
+                return
+            filename = "attn_outputs.pt"
+        _torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, filename))
+        _FSDP_ATTN_BUFFER.clear()
+
+
+# ════════════════════════════════════════════════════════════════
 #  Backward-compatible aliases for Megatron path callers
 # ════════════════════════════════════════════════════════════════
 
