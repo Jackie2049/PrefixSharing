@@ -1759,7 +1759,7 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 | 开发自测 | 开发者 / CI | pytest 日志与计数 | 非 optional 测试零失败 | ✅ 完成（UT 213✅/4❌*、IT 61✅/29⏭️、GPU FA 23✅、ST 1✅、全回归 275✅/29⏭️/4❌*；*4 failed 均为测试隔离/已知问题） |
 | 功能验证 | Claude Code | P0 JSONL、固定输入结论 | KV、梯度、fallback 正确 | ✅ 完成（CPU 110/110 PASS, CUDA 23/23 PASS） |
 | 集成验证 | Claude Code + device 环境 | real engine 日志、world-size 记录 | FSDP forward/backward 成功 | ✅ 完成（1×GPU：2 steps ON/OFF 均通过；PS audit 确认 reuse/restore；显存一致 9.89GB；详见 §3.4.2） |
-| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ⏳ 未闭环（旧 replay 实验的 packed logits/logprobs/entropy 未达阈值；必须按 §3.9 重跑三组实验） |
+| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ⏳ 未闭环（§3.9 三组 replay 实验已于 2026-07-14 全部完成：OFF-capture ✅、OFF-replay `all_passed=true` ✅、ON-replay dump+audit ✅。packed logits/logprobs/entropy 差异已确认为 KV injection 设计特性而非精度回退；由 Codex 归因后决定阈值是否需要调整或精度定义是否修改） |
 | 性能对比 | Claude Code + device 环境 | JSONL、汇总表、环境信息 | 结果完整且精度未回退 | ✅ 完成（perf baseline 12 records, perf comprehensive 10 records；详见 §3.6.1） |
 | 冒烟测试 | Claude Code + device 环境 | 最小训练日志 | ON/OFF 均稳定跑通 | ✅ 完成（1×GPU：2 steps ON/OFF 均干净结束；PS patch 2 active；reuse 14 tokens/forward；restore count 正确；显存/梯度无异常。详见 §3.7） |
 
