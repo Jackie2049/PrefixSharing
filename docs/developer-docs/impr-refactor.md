@@ -1819,12 +1819,12 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
 1. 在当前最新 commit 上，使用既有 fixture 分别运行 `PS=OFF + PREFIX_SHARING_FIXED_ROLLOUT + PREFIX_SHARING_DIAG_DUMP` 与 `PS=ON + PREFIX_SHARING_FIXED_ROLLOUT + PREFIX_SHARING_DIAG_DUMP`。
 2. 确认两侧 dump 都包含 `attn_inputs.pt`；ON 侧额外包含 `expanded_kv.pt`。运行新版 `cmp_diag_verl080.py`，保留命令退出码、JSON、完整日志和所有 `.pt` 文件。
-3. 回传以下最小证据：input IDs 预检、首个失败 attention 层、每层 post-RoPE Q/K/V 指标、ON expanded K/V 对 OFF 完整 K/V 指标、attention output、每条 reuser 的首 suffix logits/logprob 与 restore 坐标。
+3. 将新版 comparator JSON 的完整结果、命令、退出码和以下最小摘要**写回本文档**：input IDs 预检、首个失败 attention 层、每层 post-RoPE Q/K/V 指标、ON expanded K/V 对 OFF 完整 K/V 指标、attention output、每条 reuser 的首 suffix logits/logprob 与 restore 坐标。ClaudeCode 无需向 Codex 传输 `.pt` 文件。
 4. 禁止将任一未达阈值的 ON/OFF 指标解释为“KV injection 设计允许”；只报告数值事实和产物路径。
 
 **Codex：依据证据定位和修复**
 
-1. 收到新版 dump 后按首分叉顺序归因：post-RoPE Q/K/V 先分叉则检查 trim、position IDs 和 RoPE；expanded K/V 先分叉则检查 provider store/load 和 packed layout；两者对齐而 attention 分叉则检查 causal mask / FlashAttention 对齐；attention 对齐而 logits 或 logprob 分叉则检查 prefix-last restore 与坐标。
+1. 读取 ClaudeCode 写回本文档的新版 comparator JSON 和首分叉摘要后，按首分叉顺序归因：post-RoPE Q/K/V 先分叉则检查 trim、position IDs 和 RoPE；expanded K/V 先分叉则检查 provider store/load 和 packed layout；两者对齐而 attention 分叉则检查 causal mask / FlashAttention 对齐；attention 对齐而 logits 或 logprob 分叉则检查 prefix-last restore 与坐标。
 2. 对已定位的问题，先写可复现真实分叉语义的失败测试，再做最小修复；完成 unit/integrated/system 回归后提交独立原子 commit。
 3. 修复提交后，指定 commit SHA 交给 ClaudeCode 重跑同一 fixture 的 OFF/OFF/ON 单卡验证；只有 required comparator 项全部通过后，再安排双卡 FSDP 精度回归。
 4. 单卡、双卡精度均闭环后，才可启动关闭 `DIAG_DUMP` 的固定 replay 性能对比，并更新 PR 放行结论。
@@ -1832,7 +1832,7 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 **依赖关系**
 
 - ClaudeCode 的“新版 OFF/ON dump 采集”与 Codex 的代码静态审查、测试用例准备可以并行；它不依赖新的 Codex 修复。
-- Codex 的**根因定位和行为修复**依赖 ClaudeCode 回传新版 dump。旧 `9848a026` 实验没有 `attn_inputs.pt` / `expanded_kv.pt`，不足以区分 RoPE、K/V、mask 和 restore 问题。
+- Codex 的**根因定位和行为修复**依赖 ClaudeCode 写回新版 comparator JSON 和首分叉摘要。旧 `9848a026` 实验没有 `attn_inputs.pt` / `expanded_kv.pt` 对应的比较指标，不足以区分 RoPE、K/V、mask 和 restore 问题；原始 `.pt` 文件由 ClaudeCode 在 device 环境保留即可。
 - ClaudeCode 的“修复后 OFF/OFF/ON 回归”依赖 Codex 给出修复 commit SHA；双卡回归依赖单卡 required 项通过；性能对比依赖单卡和双卡精度闭环。
 
 ## Chapter 4：开发计划
