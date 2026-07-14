@@ -22,11 +22,16 @@ from prefix_sharing.diagnostics import dump_fsdp_attn_output
 # layer_number == 1 时清空（新 forward 起点），== num_layers 时存盘。
 # 与 cmp_diag_verl080.cmp_attn_layer 约定一致：dict {layer_1based: tensor[N, hidden]}。
 
-def patch_transformers_attention(original_get_interface: Any) -> Any:
-    """创建 ``ALL_ATTENTION_FUNCTIONS.get_interface`` 的 PS-aware wrapper。"""
+def patch_transformers_attention(original_getitem: Any) -> Any:
+    """创建 ``ALL_ATTENTION_FUNCTIONS.get_interface`` 的 PS-aware wrapper。
+
+    ``ALL_ATTENTION_FUNCTIONS`` 是继承 ``MutableMapping`` 的 GeneralInterface 实例，
+    调用 ``.get_interface(attn_implementation)`` 等价于 ``ALL_ATTENTION_FUNCTIONS[attn_implementation]``。
+    因此我们 patch ``__getitem__`` 来拦截所有 attention 接口查找。
+    """
 
     def ps_aware_get_interface(attn_implementation: str, default: Any = None) -> Any:
-        original_fn = original_get_interface(attn_implementation, default)
+        original_fn = original_getitem(attn_implementation) if default is None else original_getitem(attn_implementation)
 
         def patched_attention(module: Any, query: Any, key: Any, value: Any,
                               attention_mask: Any, *args: Any, **kwargs: Any) -> Any:

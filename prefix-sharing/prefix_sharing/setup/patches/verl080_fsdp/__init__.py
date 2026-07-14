@@ -28,16 +28,13 @@ PATCH_SET: list[PatchSpec] = [
         module_name="transformers.modeling_utils",
         target_getter=lambda mod: (
             mod.ALL_ATTENTION_FUNCTIONS,
-            "get_interface",
+            "__getitem__",
         ),
         patch_factory=patch_transformers_attention,
         description=(
             "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
-        # transformers 在 Ray worker 启动早期就已加载；eager=True 后 importlib
-        # import_module 触发 @property 初始化 AttentionInterface 实例，然后
-        # target_getter 通过 getattr(AttentionInterface, "get_interface") 定位。
         eager=True,
     ),
 ]
