@@ -2499,11 +2499,26 @@ PYTHONPATH=prefix-sharing python3 -m pytest -q -p no:cacheprovider \
 5. 开发自测、功能、集成、精度、性能、smoke 六类验证有真实结果；
 6. 未验证环境明确 fail-fast，不静默退化为错误语义。
 
+### 5.11 实现进度（2026-07-14）
+
+首个 Flex backend 实现已按原子阶段提交到 `open-source_attention`：
+
+| 阶段 | commit | 已完成内容 | 已完成验证 | 尚未关闭的 gate |
+|---|---|---|---|---|
+| Phase 1 | `a7fdfc03` | immutable `PrefixTreeAttentionLayout`、star/chain/no-sharing 语义和 token-level visibility oracle | CPU unit tests；chain ancestor slice 不泄漏 provider 私有 suffix | CUDA mask/output 对齐 |
+| Phase 2 | `d9a13ada` | `EXPANDED_KV` / `DEDUPLICATED_QKV` 执行协议与 capability 分派 | existing backend regression | real backend dispatch |
+| Phase 3 | `fd224edf` | `FlexAttentionBackend`、lazy import、generic BlockMask、显式 `backend=flex_attention` 与调试环境变量 | CPU metadata/config/factory tests；无 `build_kv()` | CUDA kernel、GQA、compile 行为 |
+| Phase 4 | `83d8d7da` | FSDP runtime tree layout 透传、每 forward 跨 layer runtime 复用、expanded/deduplicated 分派 | fake deduplicated backend integration；expanded 回归 | real FSDP/verl/restore/actor 生命周期 |
+
+本机标准回归结果：`270 passed, 29 skipped`。skip 来自缺少 CUDA/flash-attn、verl 或 NPU/MindSpeed，不能视作设备验证通过。
+
+下一步由设备环境执行 Chapter 4.4 至 4.7 与 2.3.8 的 real-path matrix；在这些结果回填前，`flex_attention` 仅是 FSDP CUDA experimental backend，不实现 auto selector，也不作为业务高性能默认路径。
+
 ## Chapter 6：当前结论
 
 ### 6.1 技术决策
 
-当前已经具备开展方案设计和开发的条件，不应继续原样重复第二阶段 PoC。主线冻结为：
+当前已经具备开展方案设计和开发的条件，且 core/backend/FSDP dispatch 的首个实现已完成。主线冻结为：
 
 1. 先建立 backend-neutral `PrefixTreeAttentionLayout`；
 2. 以 FlexAttention 完成 verl FSDP 的首个 Q/K/V 零冗余 backend；
@@ -2515,11 +2530,11 @@ PYTHONPATH=prefix-sharing python3 -m pytest -q -p no:cacheprovider \
 
 已确认：Flex 的 mask 表达能力覆盖当前 prefix tree；metadata 可跨 layer 复用；FSDP 接入点存在；方案无需增加第三方 Python package；保持 packed token 顺序可以复用现有 position/restore 语义。
 
-尚未被有效证据确认：项目 production expanded 路径与 Flex 的完整 Q/K/V gradient 对齐、direct BlockMask coverage、production packed FA 对照性能、完整 forward+backward HBM、目标 torch 2.9.1 行为、真实 FSDP/actor 生命周期。第二阶段相关数字只能作为探索性观察。
+尚未由代码交付后的真实集成验证确认：CUDA production expanded 路径与 Flex 的完整 Q/K/V gradient 对齐、direct BlockMask coverage、production packed FA 对照性能、完整 forward+backward HBM、activation checkpoint、目标 torch 2.9.1 real FSDP/actor 生命周期。第二阶段相关数字只能作为探索性观察。
 
 ### 6.3 当前执行建议
 
-立即并行启动 Phase 0 与 Phase 1/2。3A/3B 是 Flex backend 合入 gate；3C/3D 是性能策略和对外性能结论 gate。首版采用显式 backend 配置，不在证据不足时提前实现自动阈值。
+当前进入设备验证阶段。首版采用显式 backend 配置，不在证据不足时提前实现自动阈值；3A/3B/3C 的 real-path 结果决定 Flex 是否可进入 ready PR 与是否值得进一步设计性能策略。
 
 ## Chapter 7：遗留问题
 
