@@ -113,7 +113,9 @@ def forward_prefix_sharing_fsdp_micro_batch(
         model_output = _call_fsdp_model(
             model,
             trimmed_micro_batch,
-            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(),
+            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(
+                num_layers=model.config.num_hidden_layers if hasattr(model, "config") else 0,
+            ),
             enable_prefix_sharing=runtime_state is not None,
         )
         logits = _extract_logits(model_output) / float(temperature)
