@@ -168,8 +168,14 @@ def _forward_step_with_engine_prepare(
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
 
+    # 获取模型层数以支持 per-layer diagnostic dump
+    _diag_num_layers = int(getattr(
+        getattr(getattr(self, "module", None), "config", None),
+        "num_hidden_layers", 0)) or 0
+
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
+    model_inputs["prefix_sharing_runtime"].num_layers = _diag_num_layers
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     device_name = _read_device_name()
     autocast_ctx = (
