@@ -21,11 +21,30 @@ The JSON format expected:
 }
 """
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Any, Optional
 
 import torch
+
+
+def read_rollout_replay_paths() -> tuple[str | None, str | None]:
+    """Read capture/replay env vars and reject an ambiguous trainer setup.
+
+    The two modes wrap the same ``generate_sequences`` boundary.  Installing
+    both wrappers makes the effective behavior depend on wrapper order, so a
+    run must choose exactly one mode.
+    """
+    capture_path = os.environ.get("PREFIX_SHARING_CAPTURE_ROLLOUT", "").strip() or None
+    fixed_path = os.environ.get("PREFIX_SHARING_FIXED_ROLLOUT", "").strip() or None
+    if capture_path and fixed_path:
+        raise ValueError(
+            "PREFIX_SHARING_CAPTURE_ROLLOUT and PREFIX_SHARING_FIXED_ROLLOUT "
+            "are mutually exclusive"
+        )
+    return capture_path, fixed_path
 
 
 def _load_json_to_dataproto(json_path: str):

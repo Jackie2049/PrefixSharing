@@ -94,11 +94,19 @@ def test_fixed_rollout_skips_validation_and_replays_training_output(monkeypatch)
     assert len(rollout_manager.calls) == 1
 
 
-def test_rollout_patch_rejects_capture_and_fixed_modes_together(monkeypatch):
-    from prefix_sharing.setup.patches.verl080_fsdp.rollout_patch import _apply_rollout_env
+def test_replay_env_rejects_capture_and_fixed_modes_together(monkeypatch):
+    from prefix_sharing.tools.inject_fixed_rollout import read_rollout_replay_paths
 
     monkeypatch.setenv("PREFIX_SHARING_CAPTURE_ROLLOUT", "/tmp/capture.json")
     monkeypatch.setenv("PREFIX_SHARING_FIXED_ROLLOUT", "/tmp/fixed.json")
 
     with pytest.raises(ValueError, match="mutually exclusive"):
-        _apply_rollout_env(_FakeRolloutManager())
+        read_rollout_replay_paths()
+
+
+def test_replay_env_reads_one_enabled_mode(monkeypatch):
+    from prefix_sharing.tools.inject_fixed_rollout import read_rollout_replay_paths
+
+    monkeypatch.setenv("PREFIX_SHARING_FIXED_ROLLOUT", " /tmp/fixed.json ")
+
+    assert read_rollout_replay_paths() == (None, "/tmp/fixed.json")
