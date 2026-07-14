@@ -11,6 +11,7 @@ from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
 from .attention import patch_transformers_attention
+from .rollout_patch import patch_ray_trainer_fit
 
 
 PATCH_SET: list[PatchSpec] = [
@@ -36,5 +37,12 @@ PATCH_SET: list[PatchSpec] = [
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
         # transformers 在 worker 启动早期就加载，无需 eager；context 不激活时透传。
+    ),
+    PatchSpec(
+        module_name="verl.trainer.ppo.ray_trainer",
+        target_getter=lambda mod: (mod.RayPPOTrainer, "fit"),
+        patch_factory=patch_ray_trainer_fit,
+        description="RayPPOTrainer.fit -> fixed rollout capture/replay",
+        eager=True,
     ),
 ]

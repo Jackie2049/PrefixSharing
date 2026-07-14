@@ -1,9 +1,9 @@
-"""Inject fixed rollout data from a JSON file, replacing generate_sequences output.
+"""Capture or inject fixed rollout data at a trainer rollout boundary.
 
-Usage in ray_trainer.py's fit() method, right before the training loop:
+The patch receives the concrete rollout object used by the trainer:
 
     from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
-    patch_fixed_rollout(self, json_path="/path/to/your_data.json")
+    patch_fixed_rollout(self.async_rollout_manager, json_path="/path/to/your_data.json")
 
 The JSON format expected:
 {
@@ -22,6 +22,8 @@ The JSON format expected:
 """
 
 import json
+import os
+from typing import Any, Optional
 
 import torch
 
@@ -116,39 +118,86 @@ def _load_json_to_dataproto(json_path: str):
     return data
 
 
-def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
-    """Monkey-patch generate_sequences to return fixed data.
+def _save_dataproto_to_json(data: Any, json_path: str) -> None:
+    """Save replay-relevant rollout tensors as a JSON fixture."""
+    outputs = {}
+    for key in (
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "responses",
+        "prompts",
+        "response_mask",
+        "token_level_rewards",
+        "rm_scores",
+        "rollout_log_probs",
+    ):
+        if key not in data.batch:
+            continue
+        tensor = data.batch[key]
+        outputs[key] = tensor.float().cpu().tolist() if tensor.dtype == torch.float32 else tensor.long().cpu().tolist()
 
-    Patches both actor_rollout_wg.generate_sequences and
-    async_rollout_manager.generate_sequences (if present), since the
-    trainer runs with async_rollout_mode=True by default.
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as file:
+        json.dump({"outputs": outputs}, file)
+    print(f"[FixedRollout] Captured rollout with {len(data)} samples -> {json_path}")
+
+
+def _is_validation_rollout(batch: Any) -> bool:
+    return bool(getattr(batch, "meta_info", {}).get("validate", False))
+
+
+def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
+    """Capture the first training rollout while leaving validation untouched.
+
+    A normal PS=OFF run both creates the baseline dump and captures rollout
+    output. Replaying it in the PS=ON run avoids a third PS=OFF replay run.
+    """
+    original_generate_sequences = rollout_obj.generate_sequences
+    captured = False
+
+    def capture_training_rollout(batch: Any, **kwargs: Any) -> Any:
+        nonlocal captured
+        result = original_generate_sequences(batch, **kwargs)
+        if not captured and not _is_validation_rollout(batch):
+            _save_dataproto_to_json(result, json_path)
+            captured = True
+            rollout_obj.generate_sequences = original_generate_sequences
+            print("[FixedRollout] Capture complete; restored generate_sequences.")
+        return result
+
+    rollout_obj.generate_sequences = capture_training_rollout
+    print(f"[FixedRollout] Capture enabled -> {json_path}")
+
+
+def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: Optional[int] = None) -> None:
+    """Inject fixed rollout data for training calls and preserve validation calls.
 
     Args:
-        trainer: The RayPPOTrainer / RayMegatronTrainer instance (self in fit()).
+        rollout_obj: Object exposing ``generate_sequences``.
         json_path: Absolute path to the JSON file.
-        num_workers: Number of agent loop workers (default 8, matching verl's
-            ``actor_rollout_ref.rollout.agent.num_workers``). The fixed data
-            will be auto-padded to a multiple of this value to avoid
-            DataProto.chunk() equal-division assertion errors.
+        num_workers: Optional legacy padding divisor for manually prepared JSON.
+            Captured fixtures should leave this unset because their original
+            batch size is already valid for the rollout path that produced it.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    # Pad to make divisible by num_workers (prevent chunk() AssertionError)
-    n = len(fixed_data)
-    remainder = n % num_workers
-    if remainder != 0:
-        pad_size = num_workers - remainder
-        fixed_data.padding(pad_size, "last")
-        print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
+    if num_workers is not None:
+        n = len(fixed_data)
+        remainder = n % num_workers
+        if remainder != 0:
+            pad_size = num_workers - remainder
+            fixed_data.padding(pad_size, "last")
+            print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
 
-    def _patched(batch, **kwargs):
+    original_generate_sequences = rollout_obj.generate_sequences
+
+    def replay_training_rollout(batch: Any, **kwargs: Any) -> Any:
+        if _is_validation_rollout(batch):
+            return original_generate_sequences(batch, **kwargs)
         print("[FixedRollout] Returning fixed rollout data, skipping generation.")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
-    trainer.actor_rollout_wg.generate_sequences = _patched
-    print("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
-
-    if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
-        trainer.async_rollout_manager.generate_sequences = _patched
-        print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+    rollout_obj.generate_sequences = replay_training_rollout
+    print(f"[FixedRollout] Replay enabled <- {json_path}")

@@ -1341,7 +1341,13 @@ class RayPPOTrainer:
         json_path = os.environ.get("USE_FIXED_ROLLOUT", None)
         if json_path:
             from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
-            patch_fixed_rollout(self, json_path=json_path)
+
+            rollout_obj = self.async_rollout_manager or self.actor_rollout_wg
+            patch_fixed_rollout(
+                rollout_obj,
+                json_path=json_path,
+                num_workers=self.config.actor_rollout_ref.rollout.agent.num_workers,
+            )
 
         # Inject synthetic prefix data when USE_SYNTHETIC_PREFIX env is set
         synthetic_json = os.environ.get("USE_SYNTHETIC_PREFIX", None)
