@@ -42,7 +42,7 @@ PATCH_SET: list[PatchSpec] = [
         module_name="verl.trainer.ppo.ray_trainer",
         target_getter=lambda mod: (mod.RayPPOTrainer, "fit"),
         patch_factory=patch_ray_trainer_fit,
-        description="RayPPOTrainer.fit -> fixed rollout capture/replay",
+        description="RayPPOTrainer.fit -> fixed rollout capture/replay (legacy stub, injected directly)",
         eager=True,
     ),
 ]

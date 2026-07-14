@@ -1349,6 +1349,26 @@ class RayPPOTrainer:
                 num_workers=self.config.actor_rollout_ref.rollout.agent.num_workers,
             )
 
+        # Capture the first training rollout when PREFIX_SHARING_CAPTURE_ROLLOUT is set
+        capture_path = os.environ.get("PREFIX_SHARING_CAPTURE_ROLLOUT", "").strip()
+        if capture_path:
+            from prefix_sharing.tools.inject_fixed_rollout import patch_capture_rollout
+
+            rollout_obj = self.async_rollout_manager or self.actor_rollout_wg
+            patch_capture_rollout(rollout_obj, json_path=capture_path)
+
+        # Inject fixed rollout data when PREFIX_SHARING_FIXED_ROLLOUT is set
+        fixed_path = os.environ.get("PREFIX_SHARING_FIXED_ROLLOUT", "").strip()
+        if fixed_path:
+            from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
+
+            rollout_obj = self.async_rollout_manager or self.actor_rollout_wg
+            patch_fixed_rollout(
+                rollout_obj,
+                json_path=fixed_path,
+                num_workers=self.config.actor_rollout_ref.rollout.agent.num_workers,
+            )
+
         # Inject synthetic prefix data when USE_SYNTHETIC_PREFIX env is set
         synthetic_json = os.environ.get("USE_SYNTHETIC_PREFIX", None)
         if synthetic_json:
