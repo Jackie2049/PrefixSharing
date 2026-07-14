@@ -35,6 +35,6 @@ PATCH_SET: list[PatchSpec] = [
             "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
-        # transformers 在 worker 启动早期就加载，无需 eager；context 不激活时透传。
+        eager=True,  # transformers 在 worker 启动早期就加载；eager=True 确保注意力诊断 dump 可用
     ),
 ]
