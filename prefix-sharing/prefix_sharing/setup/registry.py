@@ -69,6 +69,13 @@ class PatchRegistry:
 
         for spec in specs:
             module = sys.modules.get(spec.module_name)
+            if module is not None and spec.eager:
+                # 模块存在但可能还未触发 @property 等动态属性（如
+                # transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS）。
+                # 不一定需要 import_module，但 try-patch 可能因 target 尚
+                # 不存在而进入 pending，依赖 import hook 后续激活。
+                # import hook 对已 loaded 模块有效（属性注册后立即重试）。
+                pass  # 直接走 try-patch -> AttributeError -> pending -> hook
             if module is None and spec.eager:
                 # Lazy-load 目标模块（如 verl FSDP engine），立即 patch，避免依赖
                 # import hook 在万级 import 中等不到目标。
