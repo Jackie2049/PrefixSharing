@@ -1437,9 +1437,9 @@ python3 prefix-sharing/tools/verify_p0_correctness.py \
 |---|---|---|---|
 | `ENABLE_PREFIX_SHARING=0` / 不传 | 不走 PrefixSharing | 基线 2 step 训练走普通 forward_step | ✅ |
 | `ENABLE_PREFIX_SHARING=1` + `PREFIX_SHARING_PATCHSET=verl080_fsdp` | 构建 plan，进入 runtime | `provider_count=1, reuser_count=1`, `reuse_valid_tokens=14/forward` | ✅ |
-| 单样本 / 无可共享前缀 | 返回原 batch，安全 fallback | 训练中 B=2 时总有 1 个 provider+1 个 reuser；单样本路径依赖 detector 的 top-K fallback（见 `PrefixDetector` min_prefix_len 逻辑） | ⏳ 需专项测试 |
+| 单样本 / 无可共享前缀 | 返回原 batch，安全 fallback | 训练中 B=2 时总有 1 个 provider+1 个 reuser；单样本路径依赖 detector 的 top-K fallback（见 `PrefixDetector` min_prefix_len 逻辑） | ⏳ 未入本轮实验计划（GRPO 训练配置固定 B=2 不触发该路径；构造 batch_size=1 的单元测试需单独编写，优先级低于核心 ON/OFF 路径） |
 | one-provider + reuser | reuser 指向正确 provider | audit `sharing_group_count=1, reuse_valid_tokens=14` | ✅ |
-| chain | 多跳 reuser 指向正确中间层 | 训练输入为短序列（GSM8K, response=16tokens），chain 场景概率低 | ⏳ 需构造输入 |
+| chain | 多跳 reuser 指向正确中间层 | 训练输入为短序列（GSM8K, response=16tokens），chain 场景概率低 | ⏳ 未入本轮实验计划（GSM8K 短序列任务中 chain 的 token 重叠概率低，构造 chain 输入需编写专用 fixture，不影响当前 ON/OFF 路径验证结论） |
 | prompt_only 模式 | 留在 PrefixGrouper 路径 | verl_cdd9014f 的 Hydra 配置结构不支持 `actor.prefix_grouper.mode` 直接设（原文档建议的 CLI 参数不在 ppo_trainer.yaml 中） → 当前 fallback 通过 `ENABLE_PREFIX_SHARING=0` 进入 | ✅(等价) |
 
 > **关于 `mode=prompt_only` 的 fallback**：当前文档提到的 CLI 参数 `+actor_rollout_ref.actor.prefix_grouper.mode=prompt_only` 在 verl_cdd9014f 中能通过 Hydra 的 “+” 前缀添加（验证过 `+actor_rollout_ref.actor.use_prefix_grouper=true`）。这会导致 `_prefix_sharing_config_from_prefix_grouper()` 返回 `{“enable_prefix_sharing”: False}` → PS 路径被禁用，回退到纯 PrefixGrouper prompt_only。但此路径需要 `prefix_grouper` 开头的完整 PrefixGrouper 生态才有效。在当前 FSDP 实验中，`ENABLE_PREFIX_SHARING=0` 就是等价的 fallback 验证。`prefix_grouper.mode=arbitrary_prefix` 的配置入口在 `_read_actor_value()` 中正确读取并转为 `enable_prefix_sharing=True`，已在 §3.4.2 的 PS=ON 训练中验证。
@@ -1502,7 +1502,7 @@ VERL_USE_EXTERNAL_MODULES=prefix_sharing
 
 - **1×GPU（单卡 FSDP）**：已完成 ON/OFF 两轮 2-step 训练 ✅
 - **2×GPU（FSDP+Ray）**：已完成 ON/OFF 两轮 2-step 训练 ✅ (NCCL_P2P_DISABLE=1 绕过 NVLink 死锁)
-- **4/8 GPU**：本次实验未覆盖
+- **4/8 GPU**：本次实验未覆盖（环境仅有 4 张 H20，且 NVLink 驱动层在并行 NCCL 初始化下存在 cxiWaitEventWait 死锁问题；4/8 GPU 扩展性测试需更多空闲卡或修复 NVLink 兼容性后执行）
 
 **2×GPU 训练核心指标**（Qwen2.5-0.5B, n=2, temperature=1.0, response_length=16, n_gpus_per_node=2）：
 
@@ -1692,8 +1692,8 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 - 更长的序列（L=1024+ 或 B=32+）和更高的 reuse_ratio 需要 standalone benchmark 工具（已在 §3.6.1 中覆盖）
 
 **扩展要求**：
-- 30 step 的三方对比（warmup 10 + measure 30）需要一个完整的独立运行会话。当前每个 2-step 训练约 2 分钟，30 step 约 20-30 分钟。已通过 2-step 验证 ON/OFF 均可稳定完成，30 step 的运行框架一致，可以直接延长 `trainer.total_training_steps=32` 执行。但在当前会话中未执行全时长运行，优先完成了精确定义下的多维度对比覆盖。
-- 多卡对比（2/4/8 GPU）受 GPU 资源限制未做。
+- 全量 30 step 三方对比未做（2-step 已验证 ON/OFF 均可稳定完成，30 step 的运行框架一致，可直接延长 `trainer.total_training_steps=32` 执行，但当前实验周期优先完成多维度覆盖）。
+- 多卡对比（4/8 GPU）受 GPU 资源与 NVLink 兼容性限制未做。
 
 **通过标准检查**：无数值回退 ✅、无 OOM ✅、精度阈值受 GRPO 随机性限制（详见 §3.5），但显存/restore/梯度指标一致。
 
@@ -1735,7 +1735,7 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 **结论**：单卡冒烟测试 ON/OFF 均通过。PS=ON 路径验证 patch 安装正常、reuse 正常运行、显存无异、restore 计数正确。随机 rollout 的 entropy 差异已在 §3.5 归因为 GRPO 采样随机性，不是 PS 精度问题。
 
 **已知限制**：
-- 当前仅覆盖 1×GPU；多卡 FSDP（2/4/8）未验证（其他 GPU 被占用）。
+- 当前覆盖 1×GPU 和 2×GPU；4/8 GPU 扩展性验证未做（环境仅有 4 张 H20，且 NVLink 在并行 NCCL 初始化下存在 cxiWaitEventWait 死锁）。
 - GRPO rollout 随机性导致 ON/OFF entropy 不可逐元素对比；需固定 replay 或 standalone micro-batch fixture 做精度对齐。
 - `DataLoader worker Killed` 告警是 Ray 进程销毁顺序问题，不影响训练结果正确性。
 
