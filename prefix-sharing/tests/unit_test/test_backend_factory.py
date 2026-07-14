@@ -34,6 +34,20 @@ def test_factory_flash_atten_npu():
     assert backend.capabilities.name == "flash_atten_npu"
 
 
+def test_factory_flex_attention_is_lazy_and_declares_deduplicated_execution() -> None:
+    from prefix_sharing.backends.base import PrefixAttentionExecutionMode
+    from prefix_sharing.backends.flex_attention import FlexAttentionBackend
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flex_attention")
+    backend = get_backend_instance(config)
+
+    assert isinstance(backend, FlexAttentionBackend)
+    assert backend.capabilities.execution_mode is PrefixAttentionExecutionMode.DEDUPLICATED_QKV
+    assert backend.block_size == 128
+    assert backend.compile_attention is True
+    assert not hasattr(backend, "build_kv")
+
+
 def test_factory_unknown_backend() -> None:
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="unknown")
     with pytest.raises(ValueError, match="Unknown backend"):
@@ -63,9 +77,9 @@ def test_config_validates_backends() -> None:
 
 
 def test_config_accepts_supported_backends():
-    for name in ("torch_ref", "flash_atten_gpu", "flash_atten_npu"):
+    for name in ("torch_ref", "flash_atten_gpu", "flash_atten_npu", "flex_attention"):
         cfg = PrefixSharingConfig(enable_prefix_sharing=True, backend=name)
-        cfg.validate()  # should not raise
+        cfg.validate(integrate_mode="verl_fsdp" if name == "flex_attention" else None)  # should not raise
 
 
 def test_backend_public_api_is_attention_only():

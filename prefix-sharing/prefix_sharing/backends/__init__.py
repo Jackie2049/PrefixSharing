@@ -13,6 +13,7 @@ from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.flash_atten_base import FlashAttentionMixin, FlashBackendValidationError
 from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
 from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
+from prefix_sharing.backends.flex_attention import FlexAttentionBackend, FlexAttentionRuntime
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 
 __all__ = [
@@ -21,6 +22,8 @@ __all__ = [
     "ExpandedKVPrefixAttentionBackend",
     "FlashAttentionMixin",
     "FlashBackendValidationError",
+    "FlexAttentionBackend",
+    "FlexAttentionRuntime",
     "GpuFlashAttentionBackend",
     "NpuFlashAttentionBackend",
     "PrefixAttentionBackend",

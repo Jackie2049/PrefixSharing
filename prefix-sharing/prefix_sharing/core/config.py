@@ -64,6 +64,8 @@ class PrefixSharingConfig:
     enable_prefix_sharing: bool = False
     detector: str = "trie"
     backend: str = "torch_ref"
+    flex_attention_block_size: int = 128
+    flex_attention_compile: bool = True
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
@@ -114,7 +116,7 @@ class PrefixSharingConfig:
             return
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
-        supported_backends = {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}
+        supported_backends = {"torch_ref", "flash_atten_gpu", "flash_atten_npu", "flex_attention"}
         if self.backend not in supported_backends:
             raise PrefixSharingConfigError(
                 f"backend='{self.backend}' is not supported. "
@@ -130,6 +132,13 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_prefix_len must be >= 1")
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
+        if self.backend == "flex_attention":
+            if self.flex_attention_block_size not in {64, 128, 256}:
+                raise PrefixSharingConfigError(
+                    "flex_attention_block_size must be one of 64, 128, or 256"
+                )
+            if not isinstance(self.flex_attention_compile, bool):
+                raise PrefixSharingConfigError("flex_attention_compile must be a bool")
 
         active_mode = integrate_mode or self.integrate_mode
         supported_integrate_modes = {"verl_megatron_actor", "verl_fsdp"}
@@ -137,6 +146,10 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError(
                 "phase 1 supports only integrate_mode in "
                 f"{sorted(supported_integrate_modes)}"
+            )
+        if self.backend == "flex_attention" and active_mode != "verl_fsdp":
+            raise PrefixSharingConfigError(
+                "backend='flex_attention' currently supports only integrate_mode='verl_fsdp'"
             )
 
         model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")

@@ -17,6 +17,7 @@ def get_backend_instance(
     * ``"torch_ref"``      -> :class:`~prefix_sharing.backends.torch_ref.TorchReferenceBackend`
     * ``"flash_atten_gpu"`` -> :class:`~prefix_sharing.backends.flash_atten_gpu.GpuFlashAttentionBackend`
     * ``"flash_atten_npu"`` -> :class:`~prefix_sharing.backends.flash_atten_npu.NpuFlashAttentionBackend`
+    * ``"flex_attention"`` -> :class:`~prefix_sharing.backends.flex_attention.FlexAttentionBackend`
     """
     if backend is not None:
         return backend
@@ -32,8 +33,15 @@ def get_backend_instance(
     if config.backend == "flash_atten_npu":
         from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
         return NpuFlashAttentionBackend()
+
+    if config.backend == "flex_attention":
+        from prefix_sharing.backends.flex_attention import FlexAttentionBackend
+        return FlexAttentionBackend(
+            block_size=config.flex_attention_block_size,
+            compile_attention=config.flex_attention_compile,
+        )
     
     raise ValueError(
         f"Unknown backend '{config.backend}'. "
-        f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"
+        f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu, flex_attention"
     )

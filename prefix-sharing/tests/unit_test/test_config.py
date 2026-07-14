@@ -87,6 +87,36 @@ def test_env_var_rejects_invalid_prefix_sharing_value(monkeypatch):
         PrefixSharingConfig.from_raw(None)
 
 
+def test_env_backend_enables_flex_debug_path_when_backend_is_default(monkeypatch):
+    monkeypatch.setenv("PREFIX_SHARING_BACKEND", "flex_attention")
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+
+    assert config.backend == "flex_attention"
+
+
+@pytest.mark.parametrize("block_size", [64, 128, 256])
+def test_flex_attention_config_accepts_supported_block_sizes(block_size):
+    config = PrefixSharingConfig(
+        enable_prefix_sharing=True,
+        backend="flex_attention",
+        flex_attention_block_size=block_size,
+    )
+
+    config.validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
+def test_flex_attention_config_rejects_invalid_block_size():
+    config = PrefixSharingConfig(
+        enable_prefix_sharing=True,
+        backend="flex_attention",
+        flex_attention_block_size=96,
+    )
+
+    with pytest.raises(PrefixSharingConfigError, match="flex_attention_block_size"):
+        config.validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     [
