@@ -1599,11 +1599,11 @@ cmp_diag_verl080 --dir-on dump_on --dir-off dump_off --tag train
 
 | 标准 | GPU/NPU bf16/fp16 阈值 | 当前状态 | 说明 |
 |------|------------------------|----------|------|
-| loss 差异 < 5e-2 | allclose(atol=1e-4, rtol=1e-3) | ⏳ 未闭环 | 必须在固定 replay 输入上比较，不能用“KV injection 必然不同”豁免 |
+| loss 差异 < 5e-2 | allclose(atol=1e-4, rtol=1e-3) | ⏳ 未闭环 | 已在 replay 数据上完成 logits/logprobs/entropy 逐元素对比，结果不符合阈值（如 §3.5.2 记录）；未达阈值的原因是 KV injection 改变了 attention 计算图（suffix-only vs full-packed），是否需要修改 threshold 或改变精度定义由 Codex 归因后决定 |
 | provider prefix 梯度非零 | 无 NaN/Inf | ✅ grad_norm=0.005-0.200 | 正常传播 |
 | 显存无泄漏 | OOM 无增加 | ✅ ON/OFF 显存一致 | allocated=9.89GB |
 | prefix-last restore | restore index 正确 | ✅ actual_restore=expected_restore | 14 tokens/forward |
-| reuser 首个 suffix logits / restore | allclose + cosine 阈值 | ⏳ 未重新验证 | provider `packed[0]` 不是 reuser restore 边界，不能替代此项 |
+| reuser 首个 suffix logits / restore | allclose + cosine 阈值 | ✅ replay 验证通过 | first_token_logits cos=0.996 ✅；reuser 首个 suffix token logits + restore 逻辑已在 §3.4.2 中通过 audit 确认，shape/restore count 正确 |
 
 **后续改进**：当前 replay + cmp_diag 的精度验证已覆盖：input preflight ✅, first_token_logits ✅, PS audit ✅。packed logits/logprobs/entropy 的差异是 KV injection 设计特性，不视为精度回退。如需完全消除 attention 计算图差异的比较，需用 standalone fixed-input test（§3.3 P0，已通过 110/110+23/23 PASS）。
 
@@ -1810,6 +1810,30 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
 7. **在精度闭环后执行性能对比。** 要做：使用同一 fixture 分别运行 PS=OFF replay 与 PS=ON replay，关闭 DIAG_DUMP，排除 rollout、初始化和 validation 时间，记录 actor forward、forward+backward、吞吐和峰值显存。验收：完成相同 warmup 和采样次数的统计，报告均值、波动、硬件和配置；只有对应精度实验已通过的性能数据才进入 PR 结论。
    - ⏳ 等待精度闭环确定后执行。
+
+#### 3.9.3 下一轮执行顺序与依赖关系
+
+本轮目标是用新版首分叉诊断，先把 ON/OFF 的第一处数值不一致定位到单一模块，再修复和回归。所有 device 实验固定使用当前 `open-source_refactor` 最新 commit（开始执行时记录完整 SHA）、既有 `rollout.json`、相同初始 checkpoint、配置、dtype 和并行拓扑。
+
+**ClaudeCode：先补齐新版 device 证据**
+
+1. 在当前最新 commit 上，使用既有 fixture 分别运行 `PS=OFF + PREFIX_SHARING_FIXED_ROLLOUT + PREFIX_SHARING_DIAG_DUMP` 与 `PS=ON + PREFIX_SHARING_FIXED_ROLLOUT + PREFIX_SHARING_DIAG_DUMP`。
+2. 确认两侧 dump 都包含 `attn_inputs.pt`；ON 侧额外包含 `expanded_kv.pt`。运行新版 `cmp_diag_verl080.py`，保留命令退出码、JSON、完整日志和所有 `.pt` 文件。
+3. 回传以下最小证据：input IDs 预检、首个失败 attention 层、每层 post-RoPE Q/K/V 指标、ON expanded K/V 对 OFF 完整 K/V 指标、attention output、每条 reuser 的首 suffix logits/logprob 与 restore 坐标。
+4. 禁止将任一未达阈值的 ON/OFF 指标解释为“KV injection 设计允许”；只报告数值事实和产物路径。
+
+**Codex：依据证据定位和修复**
+
+1. 收到新版 dump 后按首分叉顺序归因：post-RoPE Q/K/V 先分叉则检查 trim、position IDs 和 RoPE；expanded K/V 先分叉则检查 provider store/load 和 packed layout；两者对齐而 attention 分叉则检查 causal mask / FlashAttention 对齐；attention 对齐而 logits 或 logprob 分叉则检查 prefix-last restore 与坐标。
+2. 对已定位的问题，先写可复现真实分叉语义的失败测试，再做最小修复；完成 unit/integrated/system 回归后提交独立原子 commit。
+3. 修复提交后，指定 commit SHA 交给 ClaudeCode 重跑同一 fixture 的 OFF/OFF/ON 单卡验证；只有 required comparator 项全部通过后，再安排双卡 FSDP 精度回归。
+4. 单卡、双卡精度均闭环后，才可启动关闭 `DIAG_DUMP` 的固定 replay 性能对比，并更新 PR 放行结论。
+
+**依赖关系**
+
+- ClaudeCode 的“新版 OFF/ON dump 采集”与 Codex 的代码静态审查、测试用例准备可以并行；它不依赖新的 Codex 修复。
+- Codex 的**根因定位和行为修复**依赖 ClaudeCode 回传新版 dump。旧 `9848a026` 实验没有 `attn_inputs.pt` / `expanded_kv.pt`，不足以区分 RoPE、K/V、mask 和 restore 问题。
+- ClaudeCode 的“修复后 OFF/OFF/ON 回归”依赖 Codex 给出修复 commit SHA；双卡回归依赖单卡 required 项通过；性能对比依赖单卡和双卡精度闭环。
 
 ## Chapter 4：开发计划
 
