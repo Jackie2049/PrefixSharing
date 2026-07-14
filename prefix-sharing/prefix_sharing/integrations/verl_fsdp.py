@@ -12,7 +12,9 @@ from contextlib import nullcontext
 from typing import Any
 
 from prefix_sharing.backends.factory import get_backend_instance
+from prefix_sharing.backends.base import requires_expanded_kv
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.core.attention_layout import build_prefix_tree_attention_layout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -220,6 +222,7 @@ def build_prefix_sharing_micro_batch_fsdp(
         packed_batch_layout=packed_batch_layout,
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
+        prefix_tree_attention_layout=build_prefix_tree_attention_layout(prefix_sharing_plan),
     )
     return trimmed_micro_batch, runtime_state
 
@@ -324,7 +327,31 @@ def _run_packed_attention_runtime(
     layer_id: int,
 ) -> Any:
     plan = ctx.prefix_sharing_plan
-    expanded_key, expanded_value = ctx.attention_backend.build_kv(
+    backend = ctx.attention_backend
+    if not requires_expanded_kv(backend):
+        tree_layout = ctx.prefix_tree_attention_layout
+        if tree_layout is None:
+            raise RuntimeError("deduplicated prefix attention requires PrefixTreeAttentionLayout")
+        if ctx.attention_backend_runtime is None:
+            prepare_runtime = getattr(backend, "prepare_runtime", None)
+            if prepare_runtime is None:
+                raise RuntimeError("deduplicated prefix attention backend must implement prepare_runtime()")
+            ctx.attention_backend_runtime = prepare_runtime(
+                prefix_tree_attention_layout=tree_layout,
+                packed_batch_layout=ctx.packed_batch_layout,
+                device=packed_query.device,
+            )
+        return backend.attention(
+            packed_query,
+            packed_key,
+            packed_value,
+            plan,
+            packed_batch_layout=ctx.packed_batch_layout,
+            prefix_tree_attention_layout=tree_layout,
+            runtime=ctx.attention_backend_runtime,
+        )
+
+    expanded_key, expanded_value = backend.build_kv(
         packed_key,
         packed_value,
         ctx.store,
@@ -334,7 +361,7 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
-    return ctx.attention_backend.attention(
+    return backend.attention(
         packed_query,
         expanded_key,
         expanded_value,

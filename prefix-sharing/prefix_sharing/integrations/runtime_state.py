@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.core.attention_layout import PrefixTreeAttentionLayout
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 
@@ -17,3 +18,4 @@ class PrefixSharingRuntimeState:
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
+    prefix_tree_attention_layout: PrefixTreeAttentionLayout | None = None

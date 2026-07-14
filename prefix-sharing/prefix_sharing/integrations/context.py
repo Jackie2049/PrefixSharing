@@ -38,6 +38,8 @@ class PrefixSharingRuntimeContext:
     parallel_info: MegatronParallelInfo
     store: PrefixAttentionStore
     attention_backend: Any | None = None
+    prefix_tree_attention_layout: Any | None = None
+    attention_backend_runtime: Any | None = None
     kept_position_ids: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
@@ -59,6 +61,10 @@ class PrefixSharingRuntimeContext:
         self.parallel_info = runtime_state.parallel_info
         self.store = store
         self.attention_backend = runtime_state.attention_backend
+        self.prefix_tree_attention_layout = getattr(runtime_state, "prefix_tree_attention_layout", None)
+        # Backend execution metadata belongs to this one forward context.  It
+        # may hold a BlockMask, but never Q/K/V or another autograd tensor.
+        self.attention_backend_runtime = None
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
         self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
             runtime_state.prefix_sharing_plan,
