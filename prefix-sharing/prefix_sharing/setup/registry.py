@@ -104,6 +104,24 @@ class PatchRegistry:
                 except (AttributeError, KeyError):
                     # 模块已加载但目标不存在——
                     # 可能是模块正在 import 中，类定义尚未完成。
+                    # 也可能是 @property / 内部 class 尚未被访问过（如
+                    # transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS）。
+                    # 对 eager spec 尝试重新导入模块以触发 @property 初始化：
+                    if spec.eager:
+                        try:
+                            import importlib
+                            module = importlib.import_module(spec.module_name)
+                            target_obj, attr_name = spec.target_getter(module)
+                            original = getattr(target_obj, attr_name)
+                            patched = spec.patch_factory(original)
+                            mgr.patch_attr(target_obj, attr_name, patched)
+                            print(
+                                f"[PS] Eager-retry patched {spec.description} "
+                                f"(re-import to trigger @property)"
+                            )
+                            continue
+                        except (AttributeError, KeyError, Exception):
+                            pass
                     # 加入 pending，等模块完全加载后再 patch。
                     pending.append(spec)
                     print(
