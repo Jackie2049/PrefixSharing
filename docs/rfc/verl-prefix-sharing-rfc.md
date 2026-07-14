@@ -72,42 +72,29 @@ Inference prefix caches do not solve this training-side problem. Actor updates a
 
 ```mermaid
 flowchart TD
-    subgraph VERL["verl"]
-        direction TD
-        A["verl actor/ref micro-batch"]
-        B["Shared-prefix mode dispatch"]
-        K["Standard verl training outputs"]
-        L["verl log-probability, loss, and backward"]
-    end
-
-    subgraph PREFIX_SHARING["PrefixSharing"]
-        direction TD
-        D["PrefixSharing planner"]
-        E["Trim reuser inputs and create runtime context"]
-        F{"Training backend"}
-        I["KV injection and attention"]
-        J["Restore token layout and prefix-last outputs"]
-    end
-
-    A --> B
+    A["verl actor/ref micro-batch"] --> B["Shared-prefix mode dispatch"]
     B -->|"prompt_only"| C["PrefixGrouper"]
-    B -->|"arbitrary_prefix"| D
-    D --> E
-    E --> F
+    B -->|"arbitrary_prefix"| D["PrefixSharing planner"]
+    D --> E["Trim reuser inputs and create runtime context"]
+    E --> F{"Training backend"}
     F --> G["FSDP / Transformers attention"]
     F --> H["Megatron attention"]
-    G --> I
+    G --> I["KV injection and attention"]
     H --> I
-    I --> J
-    C --> K
+    I --> J["Restore token layout and prefix-last outputs"]
+    C --> K["Standard verl training outputs"]
     J --> K
-    K --> L
+    K --> L["verl log-probability, loss, and backward"]
 
-    style VERL fill:none,stroke:#2563eb,stroke-width:2px,stroke-dasharray:6 4
-    style PREFIX_SHARING fill:none,stroke:#16a34a,stroke-width:2px,stroke-dasharray:6 4
+    classDef verl fill:#dbeafe,stroke:#2563eb,color:#111827,stroke-width:2px
+    classDef prefixSharing fill:#dcfce7,stroke:#16a34a,color:#111827,stroke-width:2px
+    classDef existing fill:#f3f4f6,stroke:#6b7280,color:#111827,stroke-width:1px
+    class A,B,K,L verl
+    class D,E,F,I,J prefixSharing
+    class C,G,H existing
 ```
 
-The dashed boxes only indicate repository ownership: blue marks verl integration touchpoints, green marks the self-contained PrefixSharing module, and unboxed nodes are existing components reused by the integration.
+Node colors indicate code ownership: blue marks verl integration touchpoints, green marks the self-contained PrefixSharing module, and gray marks existing components reused by the integration.
 
 The proposed verl integration follows five steps:
 
