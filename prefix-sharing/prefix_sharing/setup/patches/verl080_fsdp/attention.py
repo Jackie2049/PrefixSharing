@@ -21,9 +21,6 @@ def _dump_attn_output(output: Any, module: Any) -> None:
     """Thin wrapper: extract layer_number / num_layers from *module*, delegate to
     ``diagnostic_dump.dump_fsdp_attn_output`` for accumulation and flush.
     """
-    import sys as _sys
-    _diag_done = getattr(_sys.modules[__name__], "_PS_attn_diag_done", False)
-
     layer_number = int(getattr(module, "layer_idx", 0) or 0) + 1  # 1-based
 
     # Try module.config first; under FSDP wrapping, fall back to the root model config
@@ -31,20 +28,6 @@ def _dump_attn_output(output: Any, module: Any) -> None:
     if num_layers == 0:
         root_config = getattr(getattr(module, "model", None), "config", None)
         num_layers = int(getattr(root_config, "num_hidden_layers", 0) or 0)
-
-    if layer_number == 1 and not _diag_done:
-        is_tuple = isinstance(output, tuple)
-        has_dim = hasattr(output[0] if is_tuple else output, "dim")
-        out_dim = (output[0] if is_tuple else output).dim() if has_dim else -1
-        print(
-            f"[PS-diag] _dump_attn_output: module={type(module).__name__}, "
-            f"layer_idx={getattr(module, 'layer_idx', '?')}, "
-            f"num_layers={num_layers}, output_is_tuple={is_tuple}, "
-            f"output_dim={out_dim}, output_shape={getattr(output[0] if is_tuple else output, 'shape', '?')}",
-            flush=True,
-        )
-        setattr(_sys.modules[__name__], "_PS_attn_diag_done", True)
-
     if num_layers == 0:
         return
 
@@ -66,15 +49,6 @@ def patch_transformers_attention(original_get_interface: Any) -> Any:
             if ctx is None:
                 result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
                 # ##### [PS-diag] OFF attn output dump（context 不激活 = baseline） #####
-                import sys as _sys_off
-                _diag_done_off = getattr(_sys_off.modules[__name__], "_PS_diag_env_done_off", False)
-                if not _diag_done_off:
-                    print(
-                        f"[PS-diag] OFF attention: DIAG_DUMP={os.environ.get('PREFIX_SHARING_DIAG_DUMP', 'NOT_SET')}, "
-                        f"output_type={type(result).__name__}, module_type={type(module).__name__}",
-                        flush=True,
-                    )
-                    setattr(_sys_off.modules[__name__], "_PS_diag_env_done_off", True)
                 if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                     _dump_attn_output(result, module)
                 # ##### [PS-diag] end #####
@@ -89,15 +63,6 @@ def patch_transformers_attention(original_get_interface: Any) -> Any:
             value_ld = value.transpose(1, 2)
             output_ld = runtime.forward(None, query_ld, key_ld, value_ld)
             # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
-            import sys as _sys_on
-            _diag_done_on = getattr(_sys_on.modules[__name__], "_PS_diag_env_done_on", False)
-            if not _diag_done_on:
-                print(
-                    f"[PS-diag] ON attention: DIAG_DUMP={os.environ.get('PREFIX_SHARING_DIAG_DUMP', 'NOT_SET')}, "
-                    f"output_type={type(output_ld).__name__}, module_type={type(module).__name__}",
-                    flush=True,
-                )
-                setattr(_sys_on.modules[__name__], "_PS_diag_env_done_on", True)
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 _dump_attn_output(output_ld, module)
             # ##### [PS-diag] end #####
