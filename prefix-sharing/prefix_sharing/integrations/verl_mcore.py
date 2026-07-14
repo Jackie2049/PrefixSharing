@@ -532,7 +532,7 @@ def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
     import torch
 
     rows = [tensor_2d[seq_idx, :original_lengths[seq_idx]] for seq_idx in range(len(original_lengths))]
-    return torch.nested.nested_tensor(rows, layout=torch.jagged)
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
 def _clone_batch(batch: Any) -> Any:
@@ -728,13 +728,13 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
 
     # 裁剪 input_ids NestedTensor
     trimmed_ids_seqs = _slice_nested_sequences(input_ids, plan)
-    new_input_ids = torch.nested.nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
+    new_input_ids = torch.nested.as_nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
     trimmed_batch["input_ids"] = new_input_ids
 
     # 裁剪 position_ids NestedTensor
     if _is_nested_tensor(position_ids):
         trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     else:
         # position_ids 是 2D tensor → 需要用 attention_mask 的
         # valid_indices 切片（keep_range 是序列偏移，不是列索引）
@@ -754,14 +754,14 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
         trimmed_pos_seqs = _slice_2d_position_rows(
             position_ids, plan, attention_mask_bool,
         )
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     trimmed_batch["position_ids"] = new_position_ids
 
     # loss_mask 也需要裁剪（如果存在）
     loss_mask = batch.get("loss_mask")
     if loss_mask is not None and _is_nested_tensor(loss_mask):
         trimmed_loss_seqs = _slice_nested_sequences(loss_mask, plan)
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+        trimmed_batch["loss_mask"] = torch.nested.as_nested_tensor(
             trimmed_loss_seqs, layout=torch.jagged
         )
 
@@ -815,8 +815,8 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
     # 用裁剪后的序列构建 NestedTensor（jagged layout）
     # 这样 preprocess_thd_engine 会从 offsets 正确计算 cu_seqlens
     trimmed_batch = _clone_batch(batch)
-    trimmed_batch["input_ids"] = torch.nested.nested_tensor(kept_id_rows, layout=torch.jagged)
-    trimmed_batch["position_ids"] = torch.nested.nested_tensor(kept_pos_rows, layout=torch.jagged)
+    trimmed_batch["input_ids"] = torch.nested.as_nested_tensor(kept_id_rows, layout=torch.jagged)
+    trimmed_batch["position_ids"] = torch.nested.as_nested_tensor(kept_pos_rows, layout=torch.jagged)
 
     # loss_mask
     loss_mask = batch.get("loss_mask")
@@ -827,7 +827,7 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
             keep_start, keep_end = plan.input_keep_ranges[row]
             kept_indices = indices[keep_start:keep_end]
             kept_loss_rows.append(loss_mask[row, kept_indices])
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+        trimmed_batch["loss_mask"] = torch.nested.as_nested_tensor(
             kept_loss_rows, layout=torch.jagged
         )
 
