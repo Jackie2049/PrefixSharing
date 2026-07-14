@@ -269,6 +269,14 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
+        import os as _os_diag_off_out
+        if _os_diag_off_out.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_baseline_verl080
+            dump_fsdp_baseline_verl080(
+                micro_batch,
+                (loss, {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}),
+                "train",
+            )
         return loss, {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
 
 
