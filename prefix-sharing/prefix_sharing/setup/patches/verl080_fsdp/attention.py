@@ -14,8 +14,9 @@ HF 调用 attention_interface 时 Q/K/V 形态为 [B,H,L,D]，这里转置为 [B
 from __future__ import annotations
 
 import os
-from prefix_sharing.diagnostics import diagnostic_dump_enabled
 from typing import Any
+
+from prefix_sharing.diagnostics import dump_fsdp_attn_output
 
 # per-forward 累积每层 attention 输出，最后一层 flush 成 attn_outputs.pt。
 # layer_number == 1 时清空（新 forward 起点），== num_layers 时存盘。
@@ -32,18 +33,26 @@ def patch_transformers_attention(original_get_interface: Any) -> Any:
             from prefix_sharing.integrations.context import current_prefix_sharing_context
 
             ctx = current_prefix_sharing_context()
+            if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+                from prefix_sharing.diagnostics import dump_fsdp_attention_inputs
+
+                dump_fsdp_attention_inputs(query, key, value, module)
             if ctx is None:
                 result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
                 # ##### [PS-diag] OFF attn output dump（context 不激活 = baseline） #####
                 if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                    _dump_fsdp_attn_output(result, module)
+                    dump_fsdp_attn_output(result, module)
                 # ##### [PS-diag] end #####
                 return result
 
             from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
 
             layer_id = int(getattr(module, "layer_idx", 0) or 0)
-            runtime = PrefixSharingFSDPAttentionRuntime(layer_id=layer_id)
+            num_layers = int(getattr(getattr(module, "config", None), "num_hidden_layers", 0) or 0)
+            runtime = PrefixSharingFSDPAttentionRuntime(
+                layer_id=layer_id,
+                num_layers=num_layers,
+            )
             query_ld = query.transpose(1, 2)
             key_ld = key.transpose(1, 2)
             value_ld = value.transpose(1, 2)
@@ -53,7 +62,7 @@ def patch_transformers_attention(original_get_interface: Any) -> Any:
             # runtime 在 [B,L,H,D] 空间工作，输出已是 [B,L,H,D]，无需再 transpose。
             # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                _dump_fsdp_attn_output(output_ld, module)
+                dump_fsdp_attn_output(output_ld, module)
             # ##### [PS-diag] end #####
             return output_ld, None
 

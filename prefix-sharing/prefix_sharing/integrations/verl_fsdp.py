@@ -34,8 +34,9 @@ class PrefixSharingFSDPAttentionRuntime:
     positions are restored later by the output/logprob restore step.
     """
 
-    def __init__(self, *, layer_id: int = 0) -> None:
+    def __init__(self, *, layer_id: int = 0, num_layers: int = 0) -> None:
         self.layer_id = layer_id
+        self.num_layers = num_layers
 
     def forward(self, attn_func: Any, query: Any, key: Any, value: Any, *args: Any, **kwargs: Any) -> Any:
         del attn_func, args, kwargs
@@ -54,6 +55,7 @@ class PrefixSharingFSDPAttentionRuntime:
                 packed_key,
                 packed_value,
                 layer_id=self.layer_id,
+                num_layers=self.num_layers,
             )
             return packed_output.unsqueeze(0)
         if query.shape[:2] != key.shape[:2] or query.shape[:2] != value.shape[:2]:
@@ -69,6 +71,7 @@ class PrefixSharingFSDPAttentionRuntime:
             packed_key,
             packed_value,
             layer_id=self.layer_id,
+            num_layers=self.num_layers,
         )
         return _scatter_packed_output_to_dense(packed_output, query, plan)
 
@@ -322,6 +325,7 @@ def _run_packed_attention_runtime(
     packed_value: Any,
     *,
     layer_id: int,
+    num_layers: int = 0,
 ) -> Any:
     plan = ctx.prefix_sharing_plan
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
@@ -334,6 +338,15 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
+    if num_layers:
+        from prefix_sharing.diagnostics import dump_fsdp_expanded_kv
+
+        dump_fsdp_expanded_kv(
+            expanded_key,
+            expanded_value,
+            layer_id=layer_id,
+            num_layers=num_layers,
+        )
     return ctx.attention_backend.attention(
         packed_query,
         expanded_key,

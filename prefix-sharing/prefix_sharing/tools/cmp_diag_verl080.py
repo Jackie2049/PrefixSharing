@@ -396,6 +396,79 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
                        metrics={"layers": results})
 
 
+def _token_major(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize HF [B,H,L,D] or packed [T,H,D] tensors to [T,H,D]."""
+    if tensor.dim() == 4:
+        return tensor.transpose(1, 2).reshape(-1, tensor.shape[1], tensor.shape[-1])
+    return tensor
+
+
+def _load_tensor_dict(dir_path: str, filename: str) -> dict | None:
+    fp = os.path.join(dir_path, filename)
+    if not os.path.exists(fp):
+        return None
+    result = torch.load(fp, weights_only=True)
+    return result if isinstance(result, dict) else None
+
+
+def cmp_attention_inputs(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare post-RoPE Q/K/V inputs and report the first diverging layer."""
+    on_dict = _load_tensor_dict(dir_on, "attn_inputs.pt")
+    off_dict = _load_tensor_dict(dir_off, "attn_inputs.pt")
+    if on_dict is None or off_dict is None:
+        return None
+    if set(on_dict) != set(off_dict):
+        return CheckResult(name="attn_inputs", passed=False,
+                           metrics={"error": "layer set mismatch"})
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+    layers: dict[int, dict] = {}
+    for layer in sorted(on_dict):
+        layer_metrics = {}
+        for name in ("query", "key", "value"):
+            on_tensor = _token_major(on_dict[layer][name])
+            off_tensor = _token_major(off_dict[layer][name])
+            try:
+                metrics = _cos_for_layer(on_tensor, off_tensor, align_mask)
+            except ValueError as error:
+                return CheckResult(name="attn_inputs", passed=False,
+                                   metrics={"error": f"L{layer} {name}: {error}"})
+            layer_metrics[name] = metrics
+        layers[layer] = layer_metrics
+    passed = all(
+        metric["cos_avg"] > _COS_AVG_PASS and metric["cos_min"] > _COS_MIN_PASS
+        for values in layers.values() for metric in values.values()
+    )
+    return CheckResult(name="attn_inputs", passed=passed, metrics={"layers": layers})
+
+
+def cmp_expanded_kv(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare ON store/load-expanded KV with OFF's full baseline KV."""
+    expanded = _load_tensor_dict(dir_on, "expanded_kv.pt")
+    baseline = _load_tensor_dict(dir_off, "attn_inputs.pt")
+    if expanded is None or baseline is None:
+        return None
+    if set(expanded) != set(baseline):
+        return CheckResult(name="expanded_kv", passed=False,
+                           metrics={"error": "layer set mismatch"})
+    layers: dict[int, dict] = {}
+    for layer in sorted(expanded):
+        layer_metrics = {}
+        for name in ("key", "value"):
+            on_tensor = _token_major(expanded[layer][name])
+            off_tensor = _token_major(baseline[layer][name])
+            try:
+                layer_metrics[name] = _cos_for_layer(on_tensor, off_tensor)
+            except ValueError as error:
+                return CheckResult(name="expanded_kv", passed=False,
+                                   metrics={"error": f"L{layer} {name}: {error}"})
+        layers[layer] = layer_metrics
+    passed = all(
+        metric["cos_avg"] > _COS_AVG_PASS and metric["cos_min"] > _COS_MIN_PASS
+        for values in layers.values() for metric in values.values()
+    )
+    return CheckResult(name="expanded_kv", passed=passed, metrics={"layers": layers})
+
+
 def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
     """packed[0] 对比：最后一层 attn[0] + logits[0]。
 
@@ -1018,6 +1091,12 @@ def main():
     if r:
         all_results.append(r)
         _print_rope_freqs(r)
+
+    for compare in (cmp_attention_inputs, cmp_expanded_kv):
+        r = compare(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_per_layer(r)
 
     # ── packed: attention_output per-layer cos ──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
