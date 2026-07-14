@@ -25,9 +25,9 @@ PATCH_SET: list[PatchSpec] = [
         eager=True,  # verl FSDP engine 仅在 actor 实例化时 lazy-load，必须 eager 触发
     ),
     PatchSpec(
-        module_name="transformers",
+        module_name="transformers.modeling_utils",
         target_getter=lambda mod: (
-            getattr(getattr(mod, "modeling_utils", None), "ALL_ATTENTION_FUNCTIONS", {}),
+            mod.ALL_ATTENTION_FUNCTIONS,
             "get_interface",
         ),
         patch_factory=patch_transformers_attention,
@@ -35,9 +35,9 @@ PATCH_SET: list[PatchSpec] = [
             "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
-        # transformers 在 Ray worker 启动早期就已加载，不设 eager 时 import hook 到 200 轮过期
-        # 都等不到目标（worker 侧不发 stdlib import 事件）。改用 eager+import_module
-        # 主动导入，确保注意力诊断 dump（attn_inputs/attn_outputs/expanded_kv）可用。
+        # transformers 在 Ray worker 启动早期就已加载；eager=True 后 importlib
+        # import_module 触发 @property 初始化 AttentionInterface 实例，然后
+        # target_getter 通过 getattr(AttentionInterface, "get_interface") 定位。
         eager=True,
     ),
 ]
