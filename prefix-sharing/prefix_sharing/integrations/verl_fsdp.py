@@ -15,6 +15,7 @@ from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.diagnostics import diagnostic_dump_enabled, dump_fsdp_expanded_kv
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
@@ -338,9 +339,7 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
-    if num_layers:
-        from prefix_sharing.diagnostics import dump_fsdp_expanded_kv
-
+    if num_layers and diagnostic_dump_enabled():
         dump_fsdp_expanded_kv(
             expanded_key,
             expanded_value,
