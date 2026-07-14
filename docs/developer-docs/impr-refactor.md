@@ -1584,34 +1584,26 @@ Run 2: PS=ON  + PREFIX_SHARING_FIXED_ROLLOUT + PREFIX_SHARING_DIAG_DUMP=dump_on
 cmp_diag_verl080 --dir-on dump_on --dir-off dump_off --tag train
 ```
 
-关键确认：
+已回传的旧实验只能确认 replay 被调用、PS audit 有实际复用；它**不能**作为精度通过证据：packed logits `cos_avg=0.834`、logprobs `abs_mean=0.38`、entropy `abs_mean=0.67` 均未达到项目精度阈值。此前把这类差异解释为“KV injection 必然改变 attention 输出”是错误的。对于相同输入、相同权重和语义等价的因果 mask，注入的 provider KV 必须与 reuser 原始 prefix KV 数值等价，suffix logits、logprob、梯度也必须在容差内对齐。
 
-- ✅ **input preflight**: cu_seqlens、input_ids、attention_mask、label_mask、prefix_lens 完全一致（shape OK 检查）
-- ✅ **replay 成功注入**: `[FixedRollout] Returning fixed rollout data, skipping generation.`
-- ✅ **PS audit 确认正常运行**: `reuse_valid_tokens=14/forward, restore_count=1/1`
-- ✅ **first_token_logits**: cos=0.996, pearson=0.994, PASS
-- ⚠️ **packed logits**: cos_avg=0.834（suffix-aligned, 差异源自 KV injection 改写了 attention 计算图）
-- ⚠️ **logprobs**: abs_mean=0.38, pearson=0.895
-- ⚠️ **entropy**: abs_mean=0.67, pearson=0.844
+当前比较器已在 `49b8185b` 加固，新增以下硬性检查：
 
-**解释**：即使 response 相同（replay 保证），KV injection 依然改变了 attention 的前向计算路径：
+- input IDs 的逐 token 预检，而非仅 shape 检查；
+- 所有 attention 层的通过判定及失败非零退出码；
+- 每个 reuser 首个 suffix token（prefix-last restore 边界）的 attention/logits 对比；
+- post-RoPE Q/K/V、ON expanded K/V 与 OFF 完整 K/V 的逐层首分叉诊断。
 
-- PS=OFF：全量 packed Q × 全量 packed K/V，标准因果 attention
-- PS=ON：suffix-only Q × provider KV（已 store），用 injected KV 代替 reuser 的 prefix 部分
-
-这导致 suffix tokens 的 attention 分布与 full-packed baseline 不同 —— 这是 PrefixSharing 的**设计原理**，不是一个可消除的精度回退。与 rollout 随机性无关。
-
-**精确结论**：当前的 PS=ON/OFF 精度已通过 **固定输入 (P0) 测试**覆盖（§3.3, 110/110+23/23 PASS）。GRPO 训练路径的 logits/logprobs/entropy 差异不是精度回退，而是 KV injection 改变 attention 计算图的本质特性。提供 prefix gradient 非零、显存一致、restore 计数正确作为宏观间接证据。`first_token_logits` 对齐（cos=0.996）进一步确认第一个（无前缀共享）token 完全一致。
+因此，本项状态为 **未闭环**。必须按 §3.9.2 重新完成 OFF-capture、OFF-replay、ON-replay 三组实验，并保存 comparator JSON 和原始 dump；在 OFF/OFF 噪声基线及 ON/OFF required 项全部通过前，不得在 PR 或发布结论中声明 FSDP 精度已验证。
 
 #### 3.5.3 精度通过标准对照
 
 | 标准 | GPU/NPU bf16/fp16 阈值 | 当前状态 | 说明 |
 |------|------------------------|----------|------|
-| loss 差异 < 5e-2 | allclose(atol=1e-4, rtol=1e-3) | ⚠️ KV injection 改变 attention 计算图，loss 必然不同（已解释） | 验证 replay 后 PS=ON loss 在合理区（否 NaN/Inf） |
+| loss 差异 < 5e-2 | allclose(atol=1e-4, rtol=1e-3) | ⏳ 未闭环 | 必须在固定 replay 输入上比较，不能用“KV injection 必然不同”豁免 |
 | provider prefix 梯度非零 | 无 NaN/Inf | ✅ grad_norm=0.005-0.200 | 正常传播 |
 | 显存无泄漏 | OOM 无增加 | ✅ ON/OFF 显存一致 | allocated=9.89GB |
 | prefix-last restore | restore index 正确 | ✅ actual_restore=expected_restore | 14 tokens/forward |
-| first_token_logits 对齐 | cos > 0.99 | ✅ cos=0.996, pearson=0.994 | replay 已验证 |
+| reuser 首个 suffix logits / restore | allclose + cosine 阈值 | ⏳ 未重新验证 | provider `packed[0]` 不是 reuser restore 边界，不能替代此项 |
 
 **后续改进**：当前 replay + cmp_diag 的精度验证已覆盖：input preflight ✅, first_token_logits ✅, PS audit ✅。packed logits/logprobs/entropy 的差异是 KV injection 设计特性，不视为精度回退。如需完全消除 attention 计算图差异的比较，需用 standalone fixed-input test（§3.3 P0，已通过 110/110+23/23 PASS）。
 
@@ -1767,11 +1759,47 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 | 开发自测 | 开发者 / CI | pytest 日志与计数 | 非 optional 测试零失败 | ✅ 完成（UT 213✅/4❌*、IT 61✅/29⏭️、GPU FA 23✅、ST 1✅、全回归 275✅/29⏭️/4❌*；*4 failed 均为测试隔离/已知问题） |
 | 功能验证 | Claude Code | P0 JSONL、固定输入结论 | KV、梯度、fallback 正确 | ✅ 完成（CPU 110/110 PASS, CUDA 23/23 PASS） |
 | 集成验证 | Claude Code + device 环境 | real engine 日志、world-size 记录 | FSDP forward/backward 成功 | ✅ 完成（1×GPU：2 steps ON/OFF 均通过；PS audit 确认 reuse/restore；显存一致 9.89GB；详见 §3.4.2） |
-| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ✅ 完成（P0 固定输入 110/110+23/23 PASS ✅；replay + cmp_diag 验证 input_preflight OK、first_token_logits cos=0.996 ✅；packed logits/logprobs/entropy 差异为 KV injection 设计特性，非精度回退。详见 §3.5.2） |
+| 精度对齐 | Claude Code + device 环境 | ON/OFF tensor/梯度误差报告 | 全部指标在阈值内 | ⏳ 未闭环（旧 replay 实验的 packed logits/logprobs/entropy 未达阈值；必须按 §3.9 重跑三组实验） |
 | 性能对比 | Claude Code + device 环境 | JSONL、汇总表、环境信息 | 结果完整且精度未回退 | ✅ 完成（perf baseline 12 records, perf comprehensive 10 records；详见 §3.6.1） |
 | 冒烟测试 | Claude Code + device 环境 | 最小训练日志 | ON/OFF 均稳定跑通 | ✅ 完成（1×GPU：2 steps ON/OFF 均干净结束；PS patch 2 active；reuse 14 tokens/forward；restore count 正确；显存/梯度无异常。详见 §3.7） |
 
 测试完成后，将结果摘要（命令、环境、通过/skip/失败数、精度阈值、性能结论、已知限制）更新到 PR 的 `## 测试结果` 小节；仍未覆盖的设备、并行策略或真实 e2e fixture 回填本文件 Chapter 6，并在 PR 中明确其潜在影响。
+
+### 3.9 调测闭环
+
+当前 rollout capture/replay 已跑通，但真实 FSDP replay 对比中 packed logits、logprobs 和 entropy 尚未达到精度阈值，因此不能把精度对齐标记为闭环，也不能据此合入 PR。后续采用“Codex 修验证基建和代码、ClaudeCode 执行 device 实验并保留原始证据”的分工；ClaudeCode 只在 Codex 指定的 commit SHA 上运行实验，双方不得同时修改同一工作分支。
+
+#### 3.9.1 Codex 待办
+
+进展（`49b8185b`）：第 1-3 项及第 6 项的代码/文档前置工作已完成并通过本地全回归（263 passed, 29 skipped）。第 4-5 项依赖 ClaudeCode 产出的 OFF-capture / OFF-replay / ON-replay 原始 device dump；当前仓库没有该三组可分析产物，不能凭空归因或编造修复。产物回传后由 Codex 继续在同一闭环中完成根因定位和最小修复。
+
+1. **修复 rollout replay 回归测试。** 状态：✅ 已完成（`15d59706`）。已修复 `_apply_rollout_env` 已删除但测试仍引用的问题，把 `PREFIX_SHARING_CAPTURE_ROLLOUT` / `PREFIX_SHARING_FIXED_ROLLOUT` 互斥校验放到当前真实生效的调用点，并删除空转的 `rollout_patch.py` / PatchSpec。验收：`test_fixed_rollout_replay.py` 和 `test_patch_integrations.py` 零失败；两个环境变量同时设置时稳定 fail-fast；默认未设置时训练行为不变。
+
+2. **加固 `cmp_diag_verl080.py` 的判定能力。** 状态：✅ 已完成（`a99f6728`）。已修复全层 attention 比较无条件 `passed=True` 的问题，让失败进程非零退出，并补充 input IDs 内容预检、reuser 首个 suffix token 和 restore 边界坐标比较。验收：构造的错误数据会令对应检查失败；等价数据全部通过；报告中每个关键指标都有明确阈值和 `passed` 状态。
+
+3. **设计并补充首个分叉点诊断。** 状态：✅ 已完成第一版（`49b8185b`）。围绕 reuser 首个 suffix token，按层采集并比较 post-RoPE Q/K/V、ON store/load 后 expanded K/V、attention output、logits 和 restore 后 logprob；attention mask 的逻辑语义由 packed metadata/position offset 复核。HF attention interface 位于 RoPE 后，当前无法在不侵入模型实现的情况下取得 pre-RoPE 张量和 transformer layer input，若首分叉早于 post-RoPE Q/K/V 再追加定点 hook。验收：新增诊断默认关闭且不影响热路径；开启后报告首个不一致层、token、tensor 和误差。
+
+4. **分析 OFF/OFF/ON 三组实验产物。** 要做：先判断 OFF-capture 与 OFF-replay 是否对齐，再分析 OFF-replay 与 ON-replay 的第一处分叉；必要时用 eager/reference attention 与 FlashAttention 分别复现，区分 replay、packed layout、RoPE、KV store/load、mask、FlashAttention alignment 和 restore 问题。验收：形成有 dump 和数值支持的单一根因或最小候选范围；不得用“KV injection 必然改变输出”解释未达阈值的差异。
+
+5. **基于根因修复 PrefixSharing。** 要做：先写能够复现真实分叉语义的失败测试，再对 core/backend/integration 做最小修改，避免没有定位依据的大范围重构。验收：新增测试由失败转为通过；既有 unit/integrated/system 非 optional 测试零失败；KV 不 detach、prefix-last restore 和 provider-before-reuser 顺序不被破坏。
+
+6. **复核文档和 PR 放行状态。** 状态：✅ 前置文档已纠正；⏳ 最终放行待 device 结果。已将 §3.5、§3.8 的过度结论改为未闭环。最终验收：文档中的“通过/失败/未验证”与实际 JSON 报告和日志一致；只有 ON/OFF 关键精度指标达到阈值且 required tests 通过后，才给出可合入结论。
+
+#### 3.9.2 ClaudeCode 待办
+
+1. **准备可复现的 device 实验基线。** 要做：固定 commit SHA、单卡 A100 环境、初始 checkpoint、训练配置、数据顺序、随机种子、dtype、`rollout.n` 和一个 training step，并记录完整启动命令。验收：实验记录包含 commit、环境、配置和命令；三组运行除 PS/capture/replay 开关外没有其他差异。
+
+2. **执行 PS=OFF capture。** 要做：运行 `PS=OFF + PREFIX_SHARING_CAPTURE_ROLLOUT + DIAG_DUMP`，生成固定 rollout fixture 和 baseline dump。验收：日志包含 capture 成功信息；`rollout.json`、完整 dump 和训练日志均存在；训练正常结束且无 NaN/Inf、OOM 或 worker 异常退出。
+
+3. **执行 PS=OFF replay 噪声基线。** 要做：从同一初始 checkpoint 使用上一步 fixture 运行 `PS=OFF + PREFIX_SHARING_FIXED_ROLLOUT + DIAG_DUMP`。验收：确认训练 rollout 已被 replay；经 Codex 修复后的 comparator 对 OFF-capture/OFF-replay 返回 `all_passed=true` 和退出码 0；否则保留全部产物并停止进入 ON/OFF 归因。
+
+4. **执行 PS=ON replay 精度实验。** 要做：从同一初始 checkpoint 使用同一 fixture 运行 `PS=ON + PREFIX_SHARING_FIXED_ROLLOUT + DIAG_DUMP`，确认 audit 中存在真实 reuse 和正确 restore count。验收：提交完整 ON dump、日志和 comparator JSON；如任一 logits/logprob/entropy/attention 检查失败，按失败上报，不得自行标记为设计允许差异。
+
+5. **按 Codex 诊断版本复跑最小实验。** 要做：每次只切换到 Codex 指定的 commit，使用同一 fixture 重跑最少的一组 OFF/ON，并回传新增的逐层诊断产物。验收：每轮结果能回答一个明确问题，例如首个分叉是否发生在 RoPE、KV、mask 或 attention output；产物命名包含 commit 和实验场景，避免覆盖上一轮证据。
+
+6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
+
+7. **在精度闭环后执行性能对比。** 要做：使用同一 fixture 分别运行 PS=OFF replay 与 PS=ON replay，关闭 DIAG_DUMP，排除 rollout、初始化和 validation 时间，记录 actor forward、forward+backward、吞吐和峰值显存。验收：完成相同 warmup 和采样次数的统计，报告均值、波动、硬件和配置；只有对应精度实验已通过的性能数据才进入 PR 结论。
 
 ## Chapter 4：开发计划
 
