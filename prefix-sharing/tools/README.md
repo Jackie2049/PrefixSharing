@@ -6,6 +6,7 @@ stdout.
 
 ## Kept tools
 
+- `tools-rollout-replay.md`: capture/replay rollout 轨迹的训练精度与性能验证指南。
 - `verify_p0_correctness.py`: correctness guard for prefilter and `build_kv`
   semantics, including gradient preservation.
 - `perf_baseline_benchmark.py`: focused performance baseline for detector,

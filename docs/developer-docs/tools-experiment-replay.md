@@ -23,6 +23,8 @@ cmp_diag_verl080(dump_on, dump_off)
 ```bash
 # Run 1：正常生成 response，保存其 rollout 输出，同时产生 baseline dump。
 ENABLE_PREFIX_SHARING=0 \
+PREFIX_SHARING_PATCHSET=verl080_fsdp \
+VERL_USE_EXTERNAL_MODULES=prefix_sharing \
 PREFIX_SHARING_CAPTURE_ROLLOUT=/path/replay/rollout.json \
 PREFIX_SHARING_DIAG_DUMP=/path/replay/dump_off \
 python3 -m verl.trainer.main_ppo ...
