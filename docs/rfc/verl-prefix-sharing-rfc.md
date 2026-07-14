@@ -72,27 +72,53 @@ Inference prefix caches do not solve this training-side problem. Actor updates a
 
 ```mermaid
 flowchart TD
-    A["verl actor/ref micro-batch"] --> B["Shared-prefix mode dispatch"]
-    B -->|"prompt_only"| C["PrefixGrouper"]
-    B -->|"arbitrary_prefix"| D["PrefixSharing planner"]
-    D --> E["Trim reuser inputs and create runtime context"]
-    E --> F{"Training backend"}
-    F --> G["FSDP / Transformers attention"]
-    F --> H["Megatron attention"]
-    G --> I["KV injection and attention"]
-    H --> I
-    I --> J["Restore token layout and prefix-last outputs"]
-    C --> K["Standard verl training outputs"]
+    subgraph VERL["verl mainline - minimal integration touchpoints"]
+        direction TD
+        A["Actor/ref micro-batch"] --> B["Shared-prefix mode dispatch"]
+        K["Standard training outputs"] --> L["Log-probability, loss, and backward"]
+    end
+
+    subgraph PREFIX_SHARING["PrefixSharing - self-contained module"]
+        direction TD
+        D["Detect prefixes and build sharing plan"] --> E["Trim reuser inputs and create runtime context"]
+        E --> F{"Select PrefixSharing backend adapter"}
+        F --> I["Attention hook: KV store/load and injection"]
+        J["Restore token layout and prefix-last outputs"]
+    end
+
+    subgraph EXISTING["Existing components - reused without ownership transfer"]
+        direction LR
+        C["PrefixGrouper prompt-only path"]
+        G["FSDP / Transformers attention"]
+        H["Megatron attention"]
+    end
+
+    B -->|"prompt_only"| C
+    B -->|"arbitrary_prefix"| D
+    C --> K
+    I --> G
+    I --> H
+    G --> J
+    H --> J
     J --> K
-    K --> L["verl log-probability, loss, and backward"]
+
+    style VERL fill:none,stroke:#2563eb,stroke-width:2px,stroke-dasharray:6 4
+    style PREFIX_SHARING fill:none,stroke:#16a34a,stroke-width:2px,stroke-dasharray:6 4
+    style EXISTING fill:none,stroke:#6b7280,stroke-width:1px,stroke-dasharray:3 3
 ```
+
+The dashed boundaries make the integration impact explicit:
+
+- **verl mainline:** owns the normal actor/ref micro-batch and downstream training outputs. PrefixSharing only needs minimal mode-dispatch and forward/output integration touchpoints, implemented either as small upstream changes or monkey patches in the standalone prototype.
+- **PrefixSharing:** owns detection, planning, input trimming, runtime state, KV store/load and injection, and prefix-last restoration. These remain self-contained and do not become core verl algorithm logic.
+- **Existing components:** PrefixGrouper remains the prompt-only option, while the original FSDP/Transformers and Megatron attention implementations continue to execute the actual attention kernels.
 
 The proposed verl integration follows five steps:
 
 1. **Prepare the verl micro-batch.** The actor or reference-policy path provides token sequences and masks using the normal verl batch contract.
 2. **Select the sharing algorithm.** `prompt_only` keeps the existing PrefixGrouper path; `arbitrary_prefix` invokes PrefixSharing. The feature remains opt-in and the baseline path is unchanged when disabled.
 3. **Build the logical plan.** PrefixSharing detects shared token ranges, selects providers and reusers, trims duplicated reuser inputs, and records the output positions that must be restored.
-4. **Execute through the model backend.** A per-forward runtime context carries the plan into supported FSDP/Transformers or Megatron attention modules. The attention path stores provider KV and injects it when computing each reuser suffix, without detaching the autograd graph.
+4. **Execute through the model backend.** A PrefixSharing hook reads the per-forward runtime context, stores provider KV, injects it for each reuser suffix without detaching the autograd graph, and then calls the existing FSDP/Transformers or Megatron attention implementation.
 5. **Return the standard verl outputs.** PrefixSharing reconstructs the token layout and prefix-last boundary outputs before verl computes log-probabilities, loss, and backward. Downstream verl training logic continues to consume its existing output contract.
 
 The plan describes logical sharing semantics, while each backend owns its physical tensor layout and attention implementation. This keeps the verl-facing interface stable and leaves room for future sparse/tree-attention or cross-micro-batch execution strategies.
