@@ -1802,7 +1802,12 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    - `cmp_diag_verl080` ON vs OFF 结果：first_token_logits PASS ✅ (cos=0.996)；logits/logprobs/entropy FAIL ✗。
    - 差异纯来自 KV injection：PS=OFF 走 full-packed attention (Q全×KV全)，PS=ON 走 suffix-only Q × provider KV（已完成 store）。这是 PrefixSharing 的设计原理，不是精度回退。P0 fixed-input test 已从 math 等价层面验证（§3.3, 110/110+23/23 PASS）。
 
-5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ Codex 已修复 attention patch（`28160452`，target_getter 改为 `type(mod.ALL_ATTENTION_FUNCTIONS)`）。已验证：`type(AttentionInterface).__getitem__ = ps_aware_getitem` ✅；`fn_name=patched_attention` ✅；`forward → attn_inputs.pt` ✅。需要在最新代码上重跑 OFF/ON replay，收集新版 `attn_inputs.pt`/`attn_outputs.pt`/`expanded_kv.pt`。
+5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ 第 1 步已执行（commit `21890ac3`，含 Codex fix `28160452`）。
+   - ✅ 新版 diag dump 已收集：`attn_inputs.pt`、`attn_outputs.pt`（ON/OFF 两侧）、`expanded_kv.pt`（ON 侧独有，24 层完整）
+   - ✅ OFF-capture vs OFF-replay：`all_passed=true`（replay 噪声基线为零）
+   - ✅ ON-replay 日志确认 `reuse_valid_tokens=14/forward, restore_count=1/1`，`[FixedRollout] Returning fixed rollout data` 生效
+   - ⏳ ON 侧 exit=1 待确认（dump 完整但退出码非 0）
+   - 产物路径：`/tmp/replay/dump_off_replay/`（11 .pt）、`/tmp/replay/dump_on_replay/`（12 .pt，含 `expanded_kv.pt`）、`/tmp/replay/new_off_compare.json`（`all_passed=true`）、`/tmp/replay/new_on_off.json`（`all_passed=false`）。新版 diag 数据可供 Codex 开始首分叉定位分析。
 
 6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
    - ⏳ 等待 Codex 根因修复和指定 commit。
