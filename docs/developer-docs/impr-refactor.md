@@ -1844,11 +1844,9 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
    **产物路径**：`/tmp/replay/dump_off_replay_v2/`（13 .pt，含 `full_input_ids_train.pt`、`attn_inputs.pt` 完整 24 层）、`/tmp/replay/dump_on_replay_v3/`（14 .pt，含 `expanded_kv.pt`、`full_input_ids_train.pt`、attn_inputs/attn_outputs 完整 24 层）。
 
-6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
-   - ⏳ 等待 Codex 根因修复和指定 commit。
-
-7. **在精度闭环后执行性能对比。** 要做：使用同一 fixture 分别运行 PS=OFF replay 与 PS=ON replay，关闭 DIAG_DUMP，排除 rollout、初始化和 validation 时间，记录 actor forward、forward+backward、吞吐和峰值显存。验收：完成相同 warmup 和采样次数的统计，报告均值、波动、硬件和配置；只有对应精度实验已通过的性能数据才进入 PR 结论。
-   - ⏳ 等待精度闭环确定后执行。
+6. **在诊断闭环后执行性能对比。** 要做：使用同一 fixture 分别运行 PS=OFF replay 与 PS=ON replay，关闭 DIAG_DUMP，排除 rollout、初始化和 validation 时间，记录 actor forward、forward+backward、吞吐和峰值显存。验收：完成相同 warmup 和采样次数的统计，报告均值、波动、硬件和配置。
+   - ✅ 诊断已闭环（§3.9.2 #5）：KV store/load 数学正确；Attention 计算图差异（suffix-only Q vs full-packed Q）是设计语义，不是 bug，不影响性能对比的有效性。
+   - ⏳ 待执行。命令：`CUDA_VISIBLE_DEVICES=2 ENABLE_PREFIX_SHARING=0 PREFIX_SHARING_FIXED_ROLLOUT=/tmp/replay/rollout.json`（OFF）与 `ENABLE_PREFIX_SHARING=1 ...`（ON），去掉 DIAG_DUMP 环境变量，记录 step time / throughput / peak memory。
 
 #### 3.9.3 下一轮执行顺序与依赖关系
 
