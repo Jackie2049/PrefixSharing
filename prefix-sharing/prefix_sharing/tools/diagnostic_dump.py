@@ -921,6 +921,10 @@ def dump_fsdp_attn_output(
     _FSDP_ATTN_BUFFER[layer_number] = output_2d
 
     if layer_number == num_layers:
+        # 防止训练结束后的残余 forward 只用最后 1 层覆盖正确文件
+        if len(_FSDP_ATTN_BUFFER) < num_layers:
+            _FSDP_ATTN_BUFFER.clear()
+            return
         if _get_dp_size() > 1:
             filename = f"attn_outputs_dp{_get_dp_rank()}.pt"
         else:
