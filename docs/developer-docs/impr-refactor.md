@@ -1779,7 +1779,7 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
 3. **设计并补充首个分叉点诊断。** 状态：✅ 已完成第一版（`49b8185b`）。围绕 reuser 首个 suffix token，按层采集并比较 post-RoPE Q/K/V、ON store/load 后 expanded K/V、attention output、logits 和 restore 后 logprob；attention mask 的逻辑语义由 packed metadata/position offset 复核。HF attention interface 位于 RoPE 后，当前无法在不侵入模型实现的情况下取得 pre-RoPE 张量和 transformer layer input，若首分叉早于 post-RoPE Q/K/V 再追加定点 hook。验收：新增诊断默认关闭且不影响热路径；开启后报告首个不一致层、token、tensor 和误差。
 
-4. **分析 OFF/OFF/ON 三组实验产物。** 要做：先判断 OFF-capture 与 OFF-replay 是否对齐，再分析 OFF-replay 与 ON-replay 的第一处分叉；必要时用 eager/reference attention 与 FlashAttention 分别复现，区分 replay、packed layout、RoPE、KV store/load、mask、FlashAttention alignment 和 restore 问题。验收：形成有 dump 和数值支持的单一根因或最小候选范围；不得用”KV injection 必然改变输出”解释未达阈值的差异。状态：⚠️ OFF-capture vs OFF-replay 已确认 `all_passed=true`（cos=1.000, pearson=1.000），噪声基线为零。ON vs OFF 差异已确认全量（first_token_logits PASS, packed logits/logprobs/entropy FAIL），差异为 KV injection 设计特性。产物路径：`/tmp/replay/dump_off`（capture baseline）、`/tmp/replay/dump_off_replay`（OFF-replay）、`/tmp/replay/dump_on_replay`（ON-replay）。对比报告：`/tmp/replay/off_vs_off.json`（all_passed=true）、`/tmp/replay/on_vs_off.json`。
+4. **分析 OFF/OFF/ON 三组实验产物。** 状态：已定位首要接入缺陷，待 device 复验。OFF-capture vs OFF-replay 已确认 `all_passed=true`（cos=1.000, pearson=1.000），噪声基线为零。旧 ON/OFF 实验没有 per-layer dump；根因是把 `ALL_ATTENTION_FUNCTIONS.__getitem__` patch 在实例上，Python 的 `mapping[key]` 特殊方法查找不会读取实例属性，导致实际 Qwen2 attention 未进入 PrefixSharing runtime。`28160452` 已改为 patch `type(ALL_ATTENTION_FUNCTIONS).__getitem__`，并以真实 `mapping[key]` 调用测试保护。验收：ClaudeCode 在该 commit 上重跑 OFF-replay / ON-replay；两侧必须生成 `attn_inputs.pt`，ON 侧必须生成 `expanded_kv.pt`，随后按逐层 JSON 判断是否仍有数值分叉。
 
 5. **基于根因修复 PrefixSharing。** 要做：先写能够复现真实分叉语义的失败测试，再对 core/backend/integration 做最小修改，避免没有定位依据的大范围重构。验收：新增测试由失败转为通过；既有 unit/integrated/system 非 optional 测试零失败；KV 不 detach、prefix-last restore 和 provider-before-reuser 顺序不被破坏。
 
@@ -1802,9 +1802,7 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    - `cmp_diag_verl080` ON vs OFF 结果：first_token_logits PASS ✅ (cos=0.996)；logits/logprobs/entropy FAIL ✗。
    - 差异纯来自 KV injection：PS=OFF 走 full-packed attention (Q全×KV全)，PS=ON 走 suffix-only Q × provider KV（已完成 store）。这是 PrefixSharing 的设计原理，不是精度回退。P0 fixed-input test 已从 math 等价层面验证（§3.3, 110/110+23/23 PASS）。
 
-5. **按 Codex 诊断版本复跑最小实验。** 要做：每次只切换到 Codex 指定的 commit，使用同一 fixture 重跑最少的一组 OFF/ON，并回传新增的逐层诊断产物。验收：每轮结果能回答一个明确问题，例如首个分叉是否发生在 RoPE、KV、mask 或 attention output；产物命名包含 commit 和实验场景，避免覆盖上一轮证据。
-   - ⏳ 等待 Codex 指定诊断 commit SHA。当前已产出三组可复现的 device 产物（rollout.json + dump_off + dump_off_replay + dump_on_replay），已确认 OFF-capture/OFF-replay 等价（`all_passed=true`），ON vs OFF 差异可稳定复现。最新 comparator JSON 在 `/tmp/replay/on_vs_off_v3.json`。
-   - ⚠️ **已知限制**：`expanded_kv.pt` / `attn_inputs.pt` / `attn_outputs.pt` 等 per-layer 诊断 dump 在当前架构下无法通过 `ALL_ATTENTION_FUNCTIONS.__getitem__` patch 产生。根因：transformers 4.57 中 `Qwen2Attention.forward()` 在模型初始化时通过 `ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]` 解析并缓存 attention 函数，缓存时间早于 patch 生效。`__getitem__` patch 虽正确应用（日志确认 "Immediately patched"），但只影响后续对 dict 的索引操作，已缓存的函数不经过 patched 路由。提供 per-layer 诊断需修改 `ALL_ATTENTION_FUNCTIONS.register()` 或直接在 `Qwen2Attention.forward` 中加 hook。当前 **9 个基础 dump 文件** 已包含全部可用信息。
+5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ Codex 已修复 attention patch（`28160452`，target_getter 改为 `type(mod.ALL_ATTENTION_FUNCTIONS)`）。已验证：`type(AttentionInterface).__getitem__ = ps_aware_getitem` ✅；`fn_name=patched_attention` ✅；`forward → attn_inputs.pt` ✅。需要在最新代码上重跑 OFF/ON replay，收集新版 `attn_inputs.pt`/`attn_outputs.pt`/`expanded_kv.pt`。
 
 6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
    - ⏳ 等待 Codex 根因修复和指定 commit。

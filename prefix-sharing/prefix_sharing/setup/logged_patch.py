@@ -50,12 +50,14 @@ class PatchRecord:
     attr_name: str
     original: Any
     replacement: Any
+    item_key: Any | None = None
 
     def describe(self) -> str:
         """一行人类可读描述：目标.属性: 原始 → 替换。"""
         orig = getattr(self.original, "__qualname__", repr(self.original))
         new = getattr(self.replacement, "__qualname__", repr(self.replacement))
-        return f"{_target_name(self.target)}.{self.attr_name}: {orig} → {new}"
+        target = f"{_target_name(self.target)}[{self.item_key!r}]" if self.item_key is not None else f"{_target_name(self.target)}.{self.attr_name}"
+        return f"{target}: {orig} → {new}"
 
 
 class PatchHandle:
@@ -97,7 +99,10 @@ class PatchHandle:
         if not self._active:
             return
         for record in reversed(self._records):
-            setattr(record.target, record.attr_name, record.original)
+            if record.item_key is None:
+                setattr(record.target, record.attr_name, record.original)
+            else:
+                record.target[record.item_key] = record.original
             print(
                 f"[PS] Restored {_target_name(record.target)}.{record.attr_name} → "
                 f"{getattr(record.original, '__qualname__', 'original')}"
@@ -195,6 +200,23 @@ class LoggedPatchManager:
             f"{getattr(original, '__qualname__', 'original')} → "
             f"{getattr(replacement, '__qualname__', 'replacement')}"
         )
+
+    def patch_item(self, mapping: Any, key: Any, replacement: Any) -> None:
+        """Replace one mapping entry and retain enough state to restore it."""
+        original = mapping[key]
+        if original is replacement:
+            return
+        mapping[key] = replacement
+        self._records.append(
+            PatchRecord(
+                target=mapping,
+                attr_name="item",
+                item_key=key,
+                original=original,
+                replacement=replacement,
+            )
+        )
+        print(f"[PS] Patched attention registry entry {key!r}")
 
     def handle(self) -> PatchHandle:
         """返回 PatchHandle，共享内部记录列表（不复制/不清空）。"""

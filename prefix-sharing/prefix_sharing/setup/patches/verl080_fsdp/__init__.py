@@ -10,7 +10,7 @@ Patch 目标：
 from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
-from .attention import patch_transformers_attention
+from .attention import install_prefix_sharing_attention_wrappers
 
 
 PATCH_SET: list[PatchSpec] = [
@@ -26,13 +26,12 @@ PATCH_SET: list[PatchSpec] = [
     ),
     PatchSpec(
         module_name="transformers.modeling_utils",
-        target_getter=lambda mod: (
-            type(mod.ALL_ATTENTION_FUNCTIONS),
-            "__getitem__",
+        installer=lambda mod, manager: install_prefix_sharing_attention_wrappers(
+            mod.ALL_ATTENTION_FUNCTIONS,
+            manager,
         ),
-        patch_factory=patch_transformers_attention,
         description=(
-            "ALL_ATTENTION_FUNCTIONS type.__getitem__ → PrefixSharing-aware "
+            "ALL_ATTENTION_FUNCTIONS entries → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
         eager=True,

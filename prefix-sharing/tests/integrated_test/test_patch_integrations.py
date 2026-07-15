@@ -37,6 +37,17 @@ def test_logged_patch_manager_context_manager_restores_original():
     assert target.method() == "original"
 
 
+def test_logged_patch_manager_restores_mapping_item():
+    manager = LoggedPatchManager()
+    mapping = {"flash_attention_2": "original"}
+
+    manager.patch_item(mapping, "flash_attention_2", "patched")
+
+    assert mapping["flash_attention_2"] == "patched"
+    manager.handle().disable()
+    assert mapping["flash_attention_2"] == "original"
+
+
 def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     from prefix_sharing.setup import _load_patch_set
 

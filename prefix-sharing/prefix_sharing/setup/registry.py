@@ -23,8 +23,9 @@ class PatchSpec:
     """一个待安装的 patch 规格。"""
 
     module_name: str          # 目标模块全限定名
-    target_getter: Callable   # (module) → (target_obj, attr_name)
-    patch_factory: Callable   # (original) → patched
+    target_getter: Callable | None = None  # (module) → (target_obj, attr_name)
+    patch_factory: Callable | None = None   # (original) → patched
+    installer: Callable | None = None       # (module, LoggedPatchManager) → None
     description: str = ""     # 人类可读描述
     eager: bool = False       # 为 True 时，install 阶段直接 importlib.import_module
                               # 强制加载目标模块并立即 patch，不走 import hook。
@@ -94,10 +95,7 @@ class PatchRegistry:
                     module = None
             if module is not None:
                 try:
-                    target_obj, attr_name = spec.target_getter(module)
-                    original = getattr(target_obj, attr_name)
-                    patched = spec.patch_factory(original)
-                    mgr.patch_attr(target_obj, attr_name, patched)
+                    _apply_spec(spec, module, mgr)
                     print(
                         f"[PS] Immediately patched {spec.description} (module already loaded)"
                     )
@@ -111,10 +109,7 @@ class PatchRegistry:
                         try:
                             import importlib
                             module = importlib.import_module(spec.module_name)
-                            target_obj, attr_name = spec.target_getter(module)
-                            original = getattr(target_obj, attr_name)
-                            patched = spec.patch_factory(original)
-                            mgr.patch_attr(target_obj, attr_name, patched)
+                            _apply_spec(spec, module, mgr)
                             print(
                                 f"[PS] Eager-retry patched {spec.description} "
                                 f"(re-import to trigger @property)"
@@ -141,6 +136,17 @@ class PatchRegistry:
 
 def _spec_key(spec: PatchSpec) -> tuple[str, str]:
     return spec.module_name, spec.description
+
+
+def _apply_spec(spec: PatchSpec, module: object, manager: LoggedPatchManager) -> None:
+    if spec.installer is not None:
+        spec.installer(module, manager)
+        return
+    if spec.target_getter is None or spec.patch_factory is None:
+        raise AttributeError(f"PatchSpec {spec.description!r} has no installer or attribute patch")
+    target_obj, attr_name = spec.target_getter(module)
+    original = getattr(target_obj, attr_name)
+    manager.patch_attr(target_obj, attr_name, spec.patch_factory(original))
 
 
 def _dedupe_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
@@ -210,18 +216,7 @@ def _activate_import_hook(
             actual_module = sys.modules[name]
 
             try:
-                target_obj, attr_name = spec.target_getter(actual_module)
-                original = getattr(target_obj, attr_name)
-                patched = spec.patch_factory(original)
-                setattr(target_obj, attr_name, patched)
-                shared_records.append(
-                    PatchRecord(
-                        target=target_obj,
-                        attr_name=attr_name,
-                        original=original,
-                        replacement=patched,
-                    )
-                )
+                _apply_spec(spec, actual_module, LoggedPatchManager(shared_records))
                 print(
                     f"[PS] Auto-patched {spec.description} on import of {name}"
                 )

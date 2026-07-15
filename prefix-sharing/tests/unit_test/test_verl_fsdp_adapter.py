@@ -459,7 +459,10 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
 
 
 def test_verl080_fsdp_attention_patch_falls_through_without_context():
-    from prefix_sharing.setup.patches.verl080_fsdp.attention import patch_transformers_attention
+    from prefix_sharing.setup.logged_patch import LoggedPatchManager
+    from prefix_sharing.setup.patches.verl080_fsdp.attention import (
+        install_prefix_sharing_attention_wrappers,
+    )
 
     class AttentionFunctions(dict):
         pass
@@ -467,9 +470,10 @@ def test_verl080_fsdp_attention_patch_falls_through_without_context():
     def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
         return ("original", module, query, key, value, attention_mask, args, kwargs)
 
-    patched_getitem = patch_transformers_attention(AttentionFunctions.__getitem__)
-    AttentionFunctions.__getitem__ = patched_getitem
-    patched_attention = AttentionFunctions({"eager": original_attention})["eager"]
+    attention_functions = AttentionFunctions({"eager": original_attention})
+    manager = LoggedPatchManager()
+    install_prefix_sharing_attention_wrappers(attention_functions, manager)
+    patched_attention = attention_functions["eager"]
     result = patched_attention("module", "query", "key", "value", "mask", "arg", kw="value")
 
     assert result == (
@@ -482,6 +486,8 @@ def test_verl080_fsdp_attention_patch_falls_through_without_context():
         ("arg",),
         {"kw": "value"},
     )
+    manager.handle().disable()
+    assert attention_functions["eager"] is original_attention
 
 
 def test_verl080_fsdp_forward_step_patch_runs_prefix_sharing_path():
@@ -571,9 +577,14 @@ def test_transformers_attention_patch_passthrough_and_runtime_layout(monkeypatch
     class AttentionFunctions(dict):
         pass
 
-    patched_getitem = patch_transformers_attention(AttentionFunctions.__getitem__)
-    monkeypatch.setattr(AttentionFunctions, "__getitem__", patched_getitem)
-    patched_attention = AttentionFunctions({"eager": original_attention})["eager"]
+    from prefix_sharing.setup.logged_patch import LoggedPatchManager
+    from prefix_sharing.setup.patches.verl080_fsdp.attention import (
+        install_prefix_sharing_attention_wrappers,
+    )
+
+    attention_functions = AttentionFunctions({"eager": original_attention})
+    install_prefix_sharing_attention_wrappers(attention_functions, LoggedPatchManager())
+    patched_attention = attention_functions["eager"]
 
     query = torch.randn(2, 4, 3, 5)
     key = torch.randn(2, 2, 3, 5)
