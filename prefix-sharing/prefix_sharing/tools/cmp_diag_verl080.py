@@ -1165,7 +1165,43 @@ def _shape_of(dir_path: str, filename: str) -> str:
 
 
 
-def _print_shapes(dir_on: str, dir_off: str, tag: str):
+def _logits_shape(dir_path: str, manifest: dict | None) -> str:
+    """Shape string for logits, manifest-aware: tp>1 → show shard shape tagged.
+
+    Under TP the file is sharded (``logits_tp{r}.pt``); report one shard's shape
+    prefixed with ``tp{N}×`` so the shapes table still flags mismatches without
+    pretending a plain ``logits.pt`` exists.
+    """
+    tp_size = (manifest or {}).get("tp_size", 1)
+    if tp_size <= 1:
+        return _shape_of(dir_path, "logits.pt")
+    s0 = _shape_of(dir_path, "logits_tp0.pt")
+    if s0 in ("(missing)", "(error)"):
+        return s0
+    return f"tp{tp_size}×{s0}"
+
+
+def _print_topology(manifest_on: dict | None, manifest_off: dict | None) -> None:
+    """Print ON/OFF parallel topology from manifests; warn on mismatch."""
+    def _topo(m):
+        if not m:
+            return "single-card (no manifest)"
+        return f"tp={m.get('tp_size', 1)} pp={m.get('pp_size', 1)} cp={m.get('cp_size', 1)}"
+    print(_SEP_SINGLE + "\n  [topology]  ON vs OFF parallel config")
+    print(_SEP_SINGLE)
+    print(f"  ON : {_topo(manifest_on)}")
+    print(f"  OFF: {_topo(manifest_off)}")
+    if manifest_on and manifest_off:
+        for key in ("tp_size", "pp_size", "cp_size"):
+            if manifest_on.get(key) != manifest_off.get(key):
+                print(f"  {_CROSS} MISMATCH on {key}: ON={manifest_on.get(key)} "
+                      f"OFF={manifest_off.get(key)} — comparison may be invalid")
+    print()
+
+
+def _print_shapes(dir_on: str, dir_off: str, tag: str,
+                  manifest_on: dict | None = None,
+                  manifest_off: dict | None = None):
     """打印 ON/OFF 各 .pt 文件 shape —— 定位 shape mismatch 根因的第一手信息。"""
     print(_SEP_SINGLE + "\n  [shapes]  ON vs OFF dump shapes")
     print(_SEP_SINGLE)
@@ -1189,7 +1225,11 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
     print(f"  {'FILE':<28s} {'ON':<16s} {'OFF':<16s} {'STATUS'}")
     print(f"  {'─' * 28} {'─' * 16} {'─' * 16} {'─' * 10}")
     for fname in files:
-        s_on, s_off = _shape_of(dir_on, fname), _shape_of(dir_off, fname)
+        if fname == "logits.pt":
+            s_on = _logits_shape(dir_on, manifest_on)
+            s_off = _logits_shape(dir_off, manifest_off)
+        else:
+            s_on, s_off = _shape_of(dir_on, fname), _shape_of(dir_off, fname)
         if s_on == "(missing)" or s_off == "(missing)":
             status = "—"
         elif s_on == s_off:
@@ -1511,8 +1551,14 @@ def main():
     _print_header(args.dir_on, args.dir_off, args.dir_off2,
                   args.tag, args.mask, args.layer)
 
+    # ── topology diagnostics ──
+    manifest_on = _load_manifest(args.dir_on)
+    manifest_off = _load_manifest(args.dir_off)
+    _print_topology(manifest_on, manifest_off)
+
     # ── shape diagnostics ──
-    _print_shapes(args.dir_on, args.dir_off, args.tag)
+    _print_shapes(args.dir_on, args.dir_off, args.tag,
+                  manifest_on=manifest_on, manifest_off=manifest_off)
 
     # ── resolve 2D mask ──
     ref = _load_tensor(args.dir_off, f"logprobs_{args.tag}.pt")

@@ -40,3 +40,9 @@ log/
 
 # Local tool dirs
 .codebuddy/
+
+# coverage artifacts
+*,cover
+coverage.xml
+htmlcov/
+.coverage.*

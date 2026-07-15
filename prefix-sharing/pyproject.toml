@@ -2,3 +2,36 @@
 testpaths = ["tests/unit_test", "tests/integrated_test", "tests/system_test"]
 pythonpath = ["."]
 addopts = "-ra"
+
+# ── ruff: gate on real bugs only (pyflakes F + syntax E9). ──
+# Conservative on first introduction (codebase has never been linted; full rule
+# set shows ~2700 findings). Broaden the selection as cleanup lands.
+# Run: `ruff check prefix_sharing`  /  `ruff check --select F,E9 prefix_sharing`
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+src = ["prefix_sharing"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+
+[tool.coverage.run]
+source = ["prefix_sharing"]
+omit = [
+  # CLI / diagnostic scripts — executed as standalone tools, not imported by tests.
+  "prefix_sharing/tools/*",
+  # verl080 monkey-patches — only activate under a real verl 0.8.0 + mcore runtime.
+  "prefix_sharing/setup/patches/*",
+  # vendor reference backends without a CPU implementation.
+  "prefix_sharing/backends/cann_ref.py",
+  "prefix_sharing/backends/cuda_ref.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]

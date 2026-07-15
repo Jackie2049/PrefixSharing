@@ -183,15 +183,15 @@ class PrefixSharingConfig:
             )
         if not self.supported_rope_fusion and rope_fusion:
             raise PrefixSharingConfigError(
-                f"[Config Error] apply_rope_fusion=True 不支持当前阶段。"
-                f"Phase 1 要求关闭 rope fusion (apply_rope_fusion=False)，"
-                f"请修改配置或禁用 prefix sharing。"
+                "[Config Error] apply_rope_fusion=True 不支持当前阶段。"
+                "Phase 1 要求关闭 rope fusion (apply_rope_fusion=False)，"
+                "请修改配置或禁用 prefix sharing。"
             )
         if not self.supported_fused_qkv_rope and fused_qkv_rope:
             raise PrefixSharingConfigError(
-                f"[Config Error] fused_single_qkv_rope=True 不支持当前阶段。"
-                f"Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
-                f"请修改配置或禁用 prefix sharing。"
+                "[Config Error] fused_single_qkv_rope=True 不支持当前阶段。"
+                "Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
+                "请修改配置或禁用 prefix sharing。"
             )
         if self.model_type == "text_only_causal_lm" and model_type != "text_only_causal_lm":
             raise PrefixSharingConfigError(

@@ -1,0 +1,12 @@
+# Local pre-commit hooks. Install with: `pre-commit install`
+#
+# Kept minimal on first introduction: only the CI gate rules auto-fix on commit
+# (unused imports, undefined names, syntax errors). `ruff format` is intentionally
+# NOT hooked yet — the codebase has never been auto-formatted, so enabling it
+# would produce a noisy first-run diff. Enable once a format pass lands.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--select, F,E9, --fix]

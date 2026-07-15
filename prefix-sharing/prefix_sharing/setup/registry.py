@@ -12,7 +12,7 @@ from __future__ import annotations
 import builtins
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from prefix_sharing.setup.logged_patch import LoggedPatchManager, PatchHandle, PatchRecord
 

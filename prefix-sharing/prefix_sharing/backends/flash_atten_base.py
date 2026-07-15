@@ -14,7 +14,6 @@ import torch
 
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
-from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
 

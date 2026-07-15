@@ -59,7 +59,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal
+from typing import Iterator, Literal
 
 
 # ---------------------------------------------------------------------------

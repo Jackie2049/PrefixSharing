@@ -70,7 +70,6 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
@@ -840,7 +839,7 @@ def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
 
 def _print_header(dir_on, dir_off, dir_off2, tag, mask_file, layer):
     print(_SEP_DOUBLE)
-    print(f"  Prefix-Sharing Diag Report")
+    print("  Prefix-Sharing Diag Report")
     print(f"  ON :  {dir_on}\n  OFF:  {dir_off}")
     if dir_off2:
         print(f"  OFF2: {dir_off2}")
