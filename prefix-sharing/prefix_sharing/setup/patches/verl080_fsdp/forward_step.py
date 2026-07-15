@@ -42,7 +42,8 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
                 from prefix_sharing.tools.diagnostic_dump import dump_fsdp_baseline_verl080
 
-                dump_fsdp_baseline_verl080(micro_batch, result, "train")
+                _os_diag_tag = "train" if self.module.training else "old"
+                dump_fsdp_baseline_verl080(micro_batch, result, _os_diag_tag)
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
 
@@ -194,7 +195,8 @@ def _forward_step_with_engine_prepare(
     if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
 
-        dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
+        _diag_tag = "train" if self.module.training else "old"
+        dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, _diag_tag)
 
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
@@ -237,7 +239,7 @@ def _forward_step_with_engine_prepare(
             dump_fsdp_model_output_2d_verl080(
                 model_output,
                 list(ps_state.prefix_sharing_plan.original_lengths),
-                "train",
+                _diag_tag,
             )
 
         if loss_function is not None:
