@@ -1858,10 +1858,10 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    ```
    - 命令：`CUDA_VISIBLE_DEVICES=2 ENABLE_PREFIX_SHARING=0 NCCL_P2P_DISABLE=1 NCCL_NET=Socket PREFIX_SHARING_FIXED_ROLLOUT=/tmp/replay/rollout.json`
 
-   **PS=ON replay（无 DIAG_DUMP）—— ❌ CheckpointError 阻塞**
-   - **失败原因**：`torch.utils.checkpoint.CheckpointError`（forward 存 49 个张量，recompute 仅 41 个）。PrefixSharing patched attention 新增 Q/K/V store/load 节点，改变了计算图结构，recompute 时张量计数不匹配。
-   - **修复方向**：设置 `actor_rollout_ref.actor.activation_checkpointing_recompute_num_layers=0` 关闭 checkpoint 重算，或 patch checkpoint 跳过 `check_recomputed_tensors_match`。
-   - **注意**：此问题不影响精度诊断结果（DIAG_DUMP 模式下 dump 完整可用）。如需干净的 ON 性能数据，需先修复 checkpoint recompute 张量计数。
+   **PS=ON replay（无 DIAG_DUMP）—— ❌ checkpoint 张量计数不匹配**
+   - **失败原因**：PrefixSharing patched attention 在 forward 时通过 HK attention interface 添加了 Q/K/V store/load 节点，使 saved tensor 数从 41 变为 49，recompute 时 `_CheckpointFrame` 的 `check_recomputed_tensors_match` 和 `unpack_hook` 检测到不匹配并 crash。尝试 patch `_internal_assert` 和 `check_recomputed_tensors_match` 后，`holder.handles[gid]` 的 `KeyError` 仍然阻断 backward。
+   - **修复方向**：需要彻底绕过 checkpoint 重算机制（例如设置 `use_reentrant=True`），或在 PrefixSharing 的 attention forward wrapper 中保证 store/load 节点在 checkpoint 上下文外执行。
+   - **注意**：此问题不影响精度诊断结果（DIAG_DUMP 模式下 dump 完整可用）。如需 ON 侧 clean 性能数据，需要额外 checkpoint 兼容性修复。
 
 #### 3.9.3 下一轮执行顺序与依赖关系
 
