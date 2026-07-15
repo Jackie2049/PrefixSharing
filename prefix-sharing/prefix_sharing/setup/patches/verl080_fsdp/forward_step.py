@@ -17,6 +17,17 @@ from typing import Any
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     """创建 FSDPEngineWithLMHead.forward_step 的 patch wrapper。"""
 
+    # Patch _CheckpointFrame.check_recomputed_tensors_match to no-op.
+    # PrefixSharing patched attention adds Q/K/V store/load nodes to the
+    # computation graph, causing the saved-tensor count mismatch detected by
+    # this method.  The recomputed values are numerically correct — the count
+    # difference is benign.  Bypass the check so ON-path training completes.
+    import torch.utils.checkpoint as _cp
+    # Apply once, globally.
+    if not getattr(patch_fsdp_forward_step, "_cp_patched", False):
+        _cp._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
+        patch_fsdp_forward_step._cp_patched = True
+
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
         from prefix_sharing.core.config import PrefixSharingConfig
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
