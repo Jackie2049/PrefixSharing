@@ -33,7 +33,6 @@ from prefix_sharing.tools.diagnostic_dump import (
     _save_tensor,
     _stage_last_layer,
     _pp_suffix,
-    _cached_parallel_info,
 )
 
 

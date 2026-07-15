@@ -12,8 +12,6 @@ Usage::
     # Multi-copy:   stack=3  → 12 sequences (4 shuffled × 3 stacked)
 """
 
-import json
-import os
 import random
 
 import torch

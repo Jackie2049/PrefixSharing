@@ -160,6 +160,22 @@ def _load_logits(dir_path: str) -> torch.Tensor | None:
     return _load_tensor(dir_path, "logits.pt")
 
 
+def _load_manifest(dir_path: str) -> dict | None:
+    """Load ``parallel_info.json`` written by the dump layer (topology + scopes).
+
+    Returns None when absent (single-card or pre-manifest dumps) -> callers fall
+    back to tp_size==1 behavior (plain filenames, single-card compatible).
+    """
+    fp = os.path.join(dir_path, "parallel_info.json")
+    if not os.path.exists(fp):
+        return None
+    try:
+        with open(fp, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _load_packed_meta(dir_path: str,
                       cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
     """加载 cu_seqlens + prefix_lens（suffix 对齐所需）。"""
@@ -1343,7 +1359,7 @@ def _print_rope_postqk_per_layer(r: CheckResult):
                 bad.append(layer_idx)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
-        print(f"  （Q/K max_diff 与 build_kv_input_v 的 V max_diff 同口径，可直接对比）")
+        print("  （Q/K max_diff 与 build_kv_input_v 的 V max_diff 同口径，可直接对比）")
     elif "Q_cos_avg" in r.metrics:
         d = r.metrics
         ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
