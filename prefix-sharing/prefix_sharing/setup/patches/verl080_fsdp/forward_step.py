@@ -410,12 +410,18 @@ def _dump_full_input_ids_only(micro_batch: Any, tag: str) -> None:
     ``micro_batch`` input_ids so that ``cmp_diag_verl080`` can compare the
     full input against the OFF baseline, rather than reporting 186+ differing
     tokens as a false positive.
+
+    Multiple forwards (e.g. PPO micro-batches) all call this.  Only the FIRST
+    dump is preserved; subsequent calls (recompute / later micro-batches) are
+    skipped to avoid overwriting with trimmed or partial data.
     """
     import os
     import torch
 
     from prefix_sharing.tools.diagnostic_dump import _get_dump_dir, _rank0_only
 
+    if getattr(_dump_full_input_ids_only, "_saved", False):
+        return
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
@@ -427,5 +433,6 @@ def _dump_full_input_ids_only(micro_batch: Any, tag: str) -> None:
         fname = f"full_input_ids_{tag}.pt"
         if _rank0_only():
             torch.save(ids, os.path.join(dump_dir, fname))
+        _dump_full_input_ids_only._saved = True
     except Exception:
         pass
