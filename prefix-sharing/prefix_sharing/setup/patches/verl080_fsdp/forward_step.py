@@ -168,6 +168,12 @@ def _forward_step_with_engine_prepare(
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
 
+    # DIAG_DUMP: ON path dump原始full input_ids（trimmed_micro_batch 是裁剪后的，
+    # 用 micro_batch 保存完整的原始 input_ids 供 cmp_diag 对齐 baseline）
+    import os as _ps_diag_fwd_ids2
+    if _ps_diag_fwd_ids2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        _dump_full_input_ids_only(micro_batch, "train")
+
     # 获取模型层数以支持 per-layer diagnostic dump
     _diag_num_layers = int(getattr(
         getattr(getattr(self, "module", None), "config", None),
@@ -245,6 +251,13 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         except Exception:
             pass
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+
+    # DIAG_DUMP: ON path dump原始full input_ids（suffix-only dump会缺失prefix tokens）
+    import os as _ps_diag_fwd_ids
+    if _ps_diag_fwd_ids.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        _dump_full_input_ids_only(micro_batch, "train")
+
+    autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     device_name = _read_device_name()
     autocast_ctx = (
@@ -386,3 +399,32 @@ def _read_temperature(micro_batch: Any) -> float:
         return float(value)
     except Exception:
         return 1.0
+
+
+def _dump_full_input_ids_only(micro_batch: Any, tag: str) -> None:
+    """Dump the original (full) input_ids before prefix sharing trimming.
+
+    The ON path dumps ``input_ids_train.pt`` from the ``trimmed_micro_batch``,
+    which has shared prefix tokens removed.  This helper saves the **original**
+    ``micro_batch`` input_ids so that ``cmp_diag_verl080`` can compare the
+    full input against the OFF baseline, rather than reporting 186+ differing
+    tokens as a false positive.
+    """
+    import os
+    import torch
+
+    from prefix_sharing.tools.diagnostic_dump import _get_dump_dir, _rank0_only
+
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    try:
+        raw = micro_batch["input_ids"]
+        if hasattr(raw, "values"):
+            raw = raw.values()
+        ids = raw.detach().cpu().long()
+        fname = f"full_input_ids_{tag}.pt"
+        if _rank0_only():
+            torch.save(ids, os.path.join(dump_dir, fname))
+    except Exception:
+        pass
