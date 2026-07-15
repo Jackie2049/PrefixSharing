@@ -12,8 +12,11 @@ from typing import Any
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FSDP_ATTN_BUFFER: dict[int, Any] = {}
+_FSDP_ATTN_BUFFER_SAVED = False
 _FSDP_ATTN_INPUT_BUFFER: dict[int, dict[str, Any]] = {}
+_FSDP_ATTN_INPUT_BUFFER_SAVED = False
 _FSDP_EXPANDED_KV_BUFFER: dict[int, dict[str, Any]] = {}
+_FSDP_EXPANDED_KV_BUFFER_SAVED = False
 
 
 def env_truthy(name: str) -> bool:
@@ -71,10 +74,11 @@ def dump_fsdp_attn_output(output: Any, module: Any) -> None:
         # Save ONLY on the FIRST full forward; recompute / repeated forwards
         # skip saving so that the initial diagnostic data is not overwritten.
         # Use a module-level flag tracked by the global buffer status:
-        if not getattr(_FSDP_ATTN_BUFFER, "_saved_once", False):
+        global _FSDP_ATTN_BUFFER_SAVED
+        if not _FSDP_ATTN_BUFFER_SAVED:
             if _rank0_only():
                 torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, "attn_outputs.pt"))
-            _FSDP_ATTN_BUFFER._saved_once = True
+            _FSDP_ATTN_BUFFER_SAVED = True
         _FSDP_ATTN_BUFFER.clear()
 
 
@@ -113,10 +117,11 @@ def dump_fsdp_attention_inputs(query: Any, key: Any, value: Any, module: Any) ->
         "value": value.detach().cpu().contiguous(),
     }
     if layer_number == num_layers:
-        if not getattr(_FSDP_ATTN_INPUT_BUFFER, "_saved_once", False):
+        global _FSDP_ATTN_INPUT_BUFFER_SAVED
+        if not _FSDP_ATTN_INPUT_BUFFER_SAVED:
             if _rank0_only():
                 torch.save(_FSDP_ATTN_INPUT_BUFFER, os.path.join(dump_dir, "attn_inputs.pt"))
-            _FSDP_ATTN_INPUT_BUFFER._saved_once = True
+            _FSDP_ATTN_INPUT_BUFFER_SAVED = True
         _FSDP_ATTN_INPUT_BUFFER.clear()
 
 
@@ -146,8 +151,9 @@ def dump_fsdp_expanded_kv(
         "value": value.detach().cpu().contiguous(),
     }
     if layer_number == num_layers:
-        if not getattr(_FSDP_EXPANDED_KV_BUFFER, "_saved_once", False):
+        global _FSDP_EXPANDED_KV_BUFFER_SAVED
+        if not _FSDP_EXPANDED_KV_BUFFER_SAVED:
             if _rank0_only():
                 torch.save(_FSDP_EXPANDED_KV_BUFFER, os.path.join(dump_dir, "expanded_kv.pt"))
-            _FSDP_EXPANDED_KV_BUFFER._saved_once = True
+            _FSDP_EXPANDED_KV_BUFFER_SAVED = True
         _FSDP_EXPANDED_KV_BUFFER.clear()
