@@ -27,12 +27,12 @@ PATCH_SET: list[PatchSpec] = [
     PatchSpec(
         module_name="transformers.modeling_utils",
         target_getter=lambda mod: (
-            mod.ALL_ATTENTION_FUNCTIONS,
+            type(mod.ALL_ATTENTION_FUNCTIONS),
             "__getitem__",
         ),
         patch_factory=patch_transformers_attention,
         description=(
-            "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
+            "ALL_ATTENTION_FUNCTIONS type.__getitem__ → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
         eager=True,

@@ -461,16 +461,15 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
 def test_verl080_fsdp_attention_patch_falls_through_without_context():
     from prefix_sharing.setup.patches.verl080_fsdp.attention import patch_transformers_attention
 
-    def original_get_interface(attn_implementation, default=None):
-        del attn_implementation, default
+    class AttentionFunctions(dict):
+        pass
 
-        def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
-            return ("original", module, query, key, value, attention_mask, args, kwargs)
+    def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
+        return ("original", module, query, key, value, attention_mask, args, kwargs)
 
-        return original_attention
-
-    patched_get_interface = patch_transformers_attention(original_get_interface)
-    patched_attention = patched_get_interface("eager")
+    patched_getitem = patch_transformers_attention(AttentionFunctions.__getitem__)
+    AttentionFunctions.__getitem__ = patched_getitem
+    patched_attention = AttentionFunctions({"eager": original_attention})["eager"]
     result = patched_attention("module", "query", "key", "value", "mask", "arg", kw="value")
 
     assert result == (
@@ -569,12 +568,12 @@ def test_transformers_attention_patch_passthrough_and_runtime_layout(monkeypatch
         calls.append(("original", query.shape, key.shape, value.shape, attention_mask))
         return query.transpose(1, 2), "weights"
 
-    def original_get_interface(attn_implementation, default=None):
-        del attn_implementation, default
-        return original_attention
+    class AttentionFunctions(dict):
+        pass
 
-    patched_get_interface = patch_transformers_attention(original_get_interface)
-    patched_attention = patched_get_interface("eager")
+    patched_getitem = patch_transformers_attention(AttentionFunctions.__getitem__)
+    monkeypatch.setattr(AttentionFunctions, "__getitem__", patched_getitem)
+    patched_attention = AttentionFunctions({"eager": original_attention})["eager"]
 
     query = torch.randn(2, 4, 3, 5)
     key = torch.randn(2, 2, 3, 5)

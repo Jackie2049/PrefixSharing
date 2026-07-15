@@ -1,4 +1,4 @@
-"""Patch: transformers ``ALL_ATTENTION_FUNCTIONS.get_interface`` — HF attention 拦截。
+"""Patch: transformers ``AttentionInterface.__getitem__`` — HF attention 拦截。
 
 当 PrefixSharing runtime context 激活时，把 HF attention 的 Q/K/V 路由到
 ``PrefixSharingFSDPAttentionRuntime``（执行 KV store/load + expanded KV + attention）。
@@ -23,42 +23,30 @@ from prefix_sharing.diagnostics import dump_fsdp_attn_output
 # 与 cmp_diag_verl080.cmp_attn_layer 约定一致：dict {layer_1based: tensor[N, hidden]}。
 
 def patch_transformers_attention(original_getitem: Any) -> Any:
-    """创建 ``ALL_ATTENTION_FUNCTIONS.get_interface`` 的 PS-aware wrapper。
+    """Create a PrefixSharing-aware ``AttentionInterface.__getitem__`` wrapper.
 
-    ``ALL_ATTENTION_FUNCTIONS`` 是继承 ``MutableMapping`` 的 GeneralInterface 实例，
-    调用 ``.get_interface(attn_implementation)`` 等价于 ``ALL_ATTENTION_FUNCTIONS[attn_implementation]``。
-    因此我们 patch ``__getitem__`` 来拦截所有 attention 接口查找。
+    Qwen2 resolves its attention implementation through
+    ``ALL_ATTENTION_FUNCTIONS[implementation]`` in every forward.  Python
+    resolves special methods such as ``__getitem__`` on the *type*, not on an
+    instance, so the patch target must be ``type(ALL_ATTENTION_FUNCTIONS)``.
     """
 
-    import logging as _ps_diag_log
-    _ps_diag_log.basicConfig(level=_ps_diag_log.INFO,
-                             format='%(asctime)s [PS-diag] %(message)s',
-                             datefmt='%H:%M:%S')
-
-    def ps_aware_get_interface(attn_implementation: str, default: Any = None) -> Any:
-        original_fn = original_getitem(attn_implementation) if default is None else original_getitem(attn_implementation)
+    def ps_aware_getitem(attention_functions: Any, attn_implementation: str) -> Any:
+        original_fn = original_getitem(attention_functions, attn_implementation)
 
         def patched_attention(module: Any, query: Any, key: Any, value: Any,
                               attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
             from prefix_sharing.integrations.context import current_prefix_sharing_context
 
-            _ps_diag_log.info("patched_attention called module=%s has_layer_idx=%s has_config=%s n_layers=%s",
-                              type(module).__name__,
-                              hasattr(module, "layer_idx"),
-                              hasattr(module, "config"),
-                              getattr(getattr(module, "config", None), "num_hidden_layers", "MISSING"))
-
             ctx = current_prefix_sharing_context()
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.diagnostics import dump_fsdp_attention_inputs
 
-                _ps_diag_log.info("DIAG: calling dump_fsdp_attention_inputs")
                 dump_fsdp_attention_inputs(query, key, value, module)
             if ctx is None:
                 result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
                 # ##### [PS-diag] OFF attn output dump（context 不激活 = baseline） #####
                 if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                    _ps_diag_log.info("DIAG: calling dump_fsdp_attn_output (OFF)")
                     dump_fsdp_attn_output(result, module)
                 # ##### [PS-diag] end #####
                 return result
@@ -86,4 +74,4 @@ def patch_transformers_attention(original_getitem: Any) -> Any:
 
         return patched_attention
 
-    return ps_aware_get_interface
+    return ps_aware_getitem
