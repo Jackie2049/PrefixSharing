@@ -26,19 +26,22 @@ PATCH_SET: list[PatchSpec] = [
         description="FSDPEngineWithLMHead.forward_step → PrefixSharing dense FSDP helper",
         eager=True,  # verl FSDP engine 仅在 actor 实例化时 lazy-load，必须 eager 触发
     ),
-    PatchSpec(
-        module_name="transformers.modeling_utils",
-        target_getter=lambda mod: (
-            mod.ALL_ATTENTION_FUNCTIONS,
-            "get_interface",
-        ),
-        patch_factory=patch_transformers_attention,
-        description=(
-            "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
-            "(HF attention KV store/load on Q-path kept tokens)"
-        ),
-        eager=True,  # transformers 在 worker 启动早期就加载，必须 eager 立即 patch
-    ),
+    # Attention patch is applied directly to ALL_ATTENTION_FUNCTIONS dict below;
+    # PatchSpec-based approach does not work because get_interface is not a dict key
+    # in this transformers version (AttentionInterface has __getitem__ not __getattr__).
+    # PatchSpec(
+    #     module_name="transformers.modeling_utils",
+    #     target_getter=lambda mod: (
+    #         mod.ALL_ATTENTION_FUNCTIONS,
+    #         "get_interface",
+    #     ),
+    #     patch_factory=patch_transformers_attention,
+    #     description=(
+    #         "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
+    #         "(HF attention KV store/load on Q-path kept tokens)"
+    #     ),
+    #     eager=True,  # transformers 在 worker 启动早期就加载，必须 eager 立即 patch
+    # ),
     PatchSpec(
         module_name="verl.trainer.ppo.ray_trainer",
         target_getter=lambda mod: (mod.RayPPOTrainer, "fit"),
@@ -50,3 +53,24 @@ PATCH_SET: list[PatchSpec] = [
         eager=True,  # ray_trainer is imported by main_ppo at startup; eager ensures patch is in place
     ),
 ]
+
+# Attention patch: directly modify ALL_ATTENTION_FUNCTIONS dict (same approach as verl's PrefixGrouper).
+# Cannot use PatchSpec because get_interface is not an attribute/key of AttentionInterface.
+try:
+    from prefix_sharing.integrations.verl_fsdp import (
+        _SUPPORTED_TRANSFORMERS_ATTENTIONS,
+        _create_prefix_sharing_attention_wrapper,
+    )
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    patched = []
+    for name in list(ALL_ATTENTION_FUNCTIONS.keys()):
+        if name in _SUPPORTED_TRANSFORMERS_ATTENTIONS:
+            ALL_ATTENTION_FUNCTIONS[name] = _create_prefix_sharing_attention_wrapper(
+                ALL_ATTENTION_FUNCTIONS[name]
+            )
+            patched.append(name)
+    if patched:
+        print(f"[PS] Attention patch installed on: {patched}")
+except Exception:
+    pass  # transformers not available on this process (e.g. trainer side)

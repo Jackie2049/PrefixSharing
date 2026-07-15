@@ -33,7 +33,7 @@ _SUPPORTED_TRANSFORMERS_ATTENTIONS = {
     "flash_attention_3",
     "sdpa",
     "flex_attention",
-    "eager",
+    # "eager",  # replaced by eager_paged in this transformers version
 }
 
 
