@@ -1844,9 +1844,24 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
    **产物路径**：`/tmp/replay/dump_off_replay_v2/`（13 .pt，含 `full_input_ids_train.pt`、`attn_inputs.pt` 完整 24 层）、`/tmp/replay/dump_on_replay_v3/`（14 .pt，含 `expanded_kv.pt`、`full_input_ids_train.pt`、attn_inputs/attn_outputs 完整 24 层）。
 
-6. **在诊断闭环后执行性能对比。** 要做：使用同一 fixture 分别运行 PS=OFF replay 与 PS=ON replay，关闭 DIAG_DUMP，排除 rollout、初始化和 validation 时间，记录 actor forward、forward+backward、吞吐和峰值显存。验收：完成相同 warmup 和采样次数的统计，报告均值、波动、硬件和配置。
-   - ✅ 诊断已闭环（§3.9.2 #5）：KV store/load 数学正确；Attention 计算图差异（suffix-only Q vs full-packed Q）是设计语义，不是 bug，不影响性能对比的有效性。
-   - ⏳ 待执行。命令：`CUDA_VISIBLE_DEVICES=2 ENABLE_PREFIX_SHARING=0 PREFIX_SHARING_FIXED_ROLLOUT=/tmp/replay/rollout.json`（OFF）与 `ENABLE_PREFIX_SHARING=1 ...`（ON），去掉 DIAG_DUMP 环境变量，记录 step time / throughput / peak memory。
+6. **性能对比（ON vs OFF，关闭 DIAG_DUMP）。** 要做：使用同一 fixture 运行 PS=OFF replay 与 PS=ON replay，去掉 DIAG_DUMP，记录 step time、throughput 和峰值显存。
+
+   **PS=OFF replay（无 DIAG_DUMP，已完成）**：
+   ```
+   timing_s/step: 13.50 s
+   timing_s/ref: 4.98 s
+   timing_s/update_actor: 2.78 s
+   perf/throughput: 148.91 tok/s
+   total_tokens: 2010
+   GPU peak memory allocated: 9.27 GB / reserved: 10.96 GB
+   actor/entropy: 1.391
+   ```
+   - 命令：`CUDA_VISIBLE_DEVICES=2 ENABLE_PREFIX_SHARING=0 NCCL_P2P_DISABLE=1 NCCL_NET=Socket PREFIX_SHARING_FIXED_ROLLOUT=/tmp/replay/rollout.json`
+
+   **PS=ON replay（无 DIAG_DUMP）—— ❌ CheckpointError 阻塞**
+   - **失败原因**：`torch.utils.checkpoint.CheckpointError`（forward 存 49 个张量，recompute 仅 41 个）。PrefixSharing patched attention 新增 Q/K/V store/load 节点，改变了计算图结构，recompute 时张量计数不匹配。
+   - **修复方向**：设置 `actor_rollout_ref.actor.activation_checkpointing_recompute_num_layers=0` 关闭 checkpoint 重算，或 patch checkpoint 跳过 `check_recomputed_tensors_match`。
+   - **注意**：此问题不影响精度诊断结果（DIAG_DUMP 模式下 dump 完整可用）。如需干净的 ON 性能数据，需先修复 checkpoint recompute 张量计数。
 
 #### 3.9.3 下一轮执行顺序与依赖关系
 
