@@ -12,9 +12,6 @@ from prefix_sharing.integrations.verl_mcore import (
     prefix_sharing_enabled,
     read_ps_config_from_engine_config,
 )
-from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
-
-
 class Target:
     def method(self):
         return "original"
@@ -99,24 +96,6 @@ def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
         integration.install(model_config={})
 
 
-def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "verl":
-            raise ModuleNotFoundError("No module named 'verl'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = VerlFSDPIntegration(config=config)
-    with pytest.raises(IntegrationUnavailable, match="verl"):
-        integration.install(model_config={})
-
-
 def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     from prefix_sharing.setup import _load_patch_set
 
@@ -125,8 +104,8 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     assert len(patch_set) == 2
     assert patch_set[0].module_name == "verl.workers.engine.fsdp.transformer_impl"
     assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
-    assert patch_set[1].module_name == "transformers.modeling_utils"
-    assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
+    assert patch_set[1].module_name == "verl.trainer.ppo.ray_trainer"
+    assert "RayPPOTrainer.fit" in patch_set[1].description
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():

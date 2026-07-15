@@ -22,6 +22,8 @@ The JSON format expected:
 """
 
 import json
+import os
+from typing import Any
 
 import torch
 
@@ -116,24 +118,70 @@ def _load_json_to_dataproto(json_path: str):
     return data
 
 
-def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
-    """Monkey-patch generate_sequences to return fixed data.
+def _save_dataproto_to_json(data, json_path: str) -> None:
+    """Save a DataProto's batch tensors as a JSON file for replay."""
+    import numpy as np
 
-    Patches both actor_rollout_wg.generate_sequences and
-    async_rollout_manager.generate_sequences (if present), since the
-    trainer runs with async_rollout_mode=True by default.
+    batch = data.batch
+    outputs = {}
+    for key in ("input_ids", "attention_mask", "position_ids",
+                "responses", "prompts", "response_mask",
+                "token_level_rewards", "rm_scores", "rollout_log_probs"):
+        if key in batch:
+            tensor = batch[key]
+            if tensor.dtype == torch.float32:
+                outputs[key] = tensor.float().cpu().tolist()
+            else:
+                outputs[key] = tensor.long().cpu().tolist()
+
+    record = {"outputs": outputs}
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    print(f"[FixedRollout] Captured rollout with {len(data)} samples → {json_path}")
+
+
+def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
+    """Intercept ``generate_sequences`` on *rollout_obj*, capture first call output as JSON.
+
+    After the first capture, the original ``generate_sequences`` is restored so
+    subsequent calls proceed normally.  Use ``PREFIX_SHARING_CAPTURE_ROLLOUT`` env
+    var to trigger this automatically.
 
     Args:
-        trainer: The RayPPOTrainer / RayMegatronTrainer instance (self in fit()).
+        rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
+                      (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
+        json_path: Where to save the captured rollout JSON.
+    """
+    original_fn = rollout_obj.generate_sequences
+    captured = [False]
+
+    def _capturing_patch(batch, **kwargs):
+        result = original_fn(batch, **kwargs)
+        if not captured[0]:
+            _save_dataproto_to_json(result, json_path)
+            captured[0] = True
+            # Restore original so subsequent calls are not patched
+            rollout_obj.generate_sequences = original_fn
+            print("[FixedRollout] Capture complete — generate_sequences restored.")
+        return result
+
+    rollout_obj.generate_sequences = _capturing_patch
+    print(f"[FixedRollout] Patched generate_sequences for capture → {json_path}")
+
+
+def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
+    """Monkey-patch ``generate_sequences`` on *rollout_obj* to return fixed data.
+
+    Args:
+        rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
+                      (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
         json_path: Absolute path to the JSON file.
-        num_workers: Number of agent loop workers (default 8, matching verl's
-            ``actor_rollout_ref.rollout.agent.num_workers``). The fixed data
-            will be auto-padded to a multiple of this value to avoid
-            DataProto.chunk() equal-division assertion errors.
+        num_workers: Number of agent loop workers (default 8). The fixed data
+            will be auto-padded to a multiple of this value.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    # Pad to make divisible by num_workers (prevent chunk() AssertionError)
     n = len(fixed_data)
     remainder = n % num_workers
     if remainder != 0:
@@ -146,9 +194,5 @@ def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
-    trainer.actor_rollout_wg.generate_sequences = _patched
-    print("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
-
-    if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
-        trainer.async_rollout_manager.generate_sequences = _patched
-        print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+    rollout_obj.generate_sequences = _patched
+    print("[FixedRollout] Patched generate_sequences.")

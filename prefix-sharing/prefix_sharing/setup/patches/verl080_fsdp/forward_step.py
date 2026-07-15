@@ -18,11 +18,19 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
         from prefix_sharing.core.config import PrefixSharingConfig
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
+        from prefix_sharing.tools.perf_profiler import PerfProfiler
+
+        perf_profiler = PerfProfiler.create_if_enabled()
 
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
             import os as _os_diag_off
+
+            # ── Perf profiling for OFF baseline ──
+            if perf_profiler is not None:
+                perf_profiler.start_memory()
+                perf_profiler.start_phase(PerfProfiler.PHASE_FORWARD)
 
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
@@ -32,11 +40,19 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 and hasattr(self, "prepare_model_outputs")
             ):
                 result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
-                from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_baseline_verl080
+                from prefix_sharing.tools.diagnostic_dump import dump_fsdp_baseline_verl080
 
                 dump_fsdp_baseline_verl080(micro_batch, result, "train")
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
+
+            if perf_profiler is not None:
+                perf_profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
+                perf_profiler.stop_memory()
+                import os as _os_perf_off
+                _perf_dir = _os_perf_off.environ.get("PREFIX_SHARING_PERF_DIR")
+                if _perf_dir is not None:
+                    perf_profiler.save(_perf_dir)
             return result
 
         if hasattr(micro_batch, "to"):
@@ -70,12 +86,13 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         )
 
         if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
+            if perf_profiler is not None:
+                with perf_profiler:
+                    return _forward_step_with_engine_prepare(
+                        self, micro_batch, loss_function, forward_only, ps_config,
+                    )
             return _forward_step_with_engine_prepare(
-                self,
-                micro_batch,
-                loss_function,
-                forward_only,
-                ps_config,
+                self, micro_batch, loss_function, forward_only, ps_config,
             )
 
         from prefix_sharing.integrations.verl_fsdp import forward_prefix_sharing_fsdp_micro_batch
@@ -141,6 +158,13 @@ def _forward_step_with_engine_prepare(
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
 
+    # ── Perf profiling ──
+    from prefix_sharing.tools.perf_profiler import PerfProfiler
+    profiler = PerfProfiler.current()
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_PLAN)
+
     trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
         micro_batch,
         ps_config,
@@ -160,12 +184,15 @@ def _forward_step_with_engine_prepare(
             ),
         },
     )
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # CPU overhead: detect+plan+trim
+
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
 
     import os as _os_diag
     if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_on_metadata_verl080
+        from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
 
@@ -179,12 +206,17 @@ def _forward_step_with_engine_prepare(
         else torch.autocast(device_type=device_name, dtype=autocast_dtype)
     )
     with prefix_sharing_runtime_context(ps_state), autocast_ctx:
+        if profiler is not None:
+            profiler.start_memory()
+            profiler.start_phase(PerfProfiler.PHASE_FORWARD)
         raw_output = self.module(**model_inputs, use_cache=False)
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
 
-            dump_raw_logits_verl080(raw_output)
+            dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -192,11 +224,15 @@ def _forward_step_with_engine_prepare(
             micro_batch=trimmed_micro_batch,
             logits_processor_func=loss_function,
         )
+        if profiler is not None:
+            profiler.start_phase(PerfProfiler.PHASE_RESTORE)
         model_output = _restore_engine_model_output(model_output)
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU overhead: restore
 
         import os as _os_diag2
         if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_model_output_2d_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_fsdp_model_output_2d_verl080
 
             dump_fsdp_model_output_2d_verl080(
                 model_output,
@@ -205,15 +241,27 @@ def _forward_step_with_engine_prepare(
             )
 
         if loss_function is not None:
+            if profiler is not None:
+                profiler.start_phase(PerfProfiler.PHASE_LOSS)
             loss, metrics = loss_function(
                 model_output=model_output,
                 data=micro_batch,
                 dp_group=self.get_data_parallel_group(),
             )
+            if profiler is not None:
+                profiler.stop_phase(PerfProfiler.PHASE_LOSS)
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
+
+        # ── Stop memory sampling and save perf data ──
+        if profiler is not None:
+            profiler.stop_memory()
+            import os as _os_perf
+            _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
+            if _perf_dir is not None:
+                profiler.save(_perf_dir)
 
         return loss, {
             "model_output": model_output,
@@ -252,9 +300,9 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         raw_output = self.module(**model_inputs, use_cache=False)
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_raw_logits_verl080
+            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
 
-            dump_raw_logits_verl080(raw_output)
+            dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,

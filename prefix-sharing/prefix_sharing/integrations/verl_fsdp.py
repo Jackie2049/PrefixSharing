@@ -8,9 +8,7 @@ The helpers stay framework-light enough for CPU tests, while the explicit
 
 from __future__ import annotations
 
-import importlib
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 from prefix_sharing.backends.factory import get_backend_instance
@@ -19,59 +17,12 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
-from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
 from prefix_sharing.integrations.verl_mcore import _collect_kept_position_rows
 from prefix_sharing.integrations.verl_mcore import _extract_seq_from_nested_tensor
 from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
 from prefix_sharing.integrations.verl_mcore import _trim_nested_batch
-
-_SUPPORTED_TRANSFORMERS_ATTENTIONS = {
-    "flash_attention_2",
-    "flash_attention_3",
-    "sdpa",
-    "flex_attention",
-    "eager",
-}
-
-
-@dataclass
-class VerlFSDPIntegration:
-    """Install PrefixSharing helpers for the verl FSDP path."""
-
-    config: PrefixSharingConfig
-    backend: Any | None = None
-
-    def install(self, model_config: Any | None = None) -> PatchHandle:
-        self.config.validate(model_config=model_config, integrate_mode="verl_fsdp")
-        self._ensure_verl_importable()
-        return self._install_transformers_attention_patch()
-
-    @staticmethod
-    def _ensure_verl_importable() -> None:
-        try:
-            importlib.import_module("verl")
-        except ModuleNotFoundError as exc:
-            raise IntegrationUnavailable("verl is not importable in this environment") from exc
-
-    @staticmethod
-    def _install_transformers_attention_patch() -> PatchHandle:
-        try:
-            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-        except ModuleNotFoundError as exc:
-            raise IntegrationUnavailable("transformers is not importable in this environment") from exc
-
-        manager = PatchManager()
-        for name in list(ALL_ATTENTION_FUNCTIONS.keys()):
-            if name in _SUPPORTED_TRANSFORMERS_ATTENTIONS:
-                manager.patch_item(
-                    ALL_ATTENTION_FUNCTIONS,
-                    name,
-                    _create_prefix_sharing_attention_wrapper(ALL_ATTENTION_FUNCTIONS[name]),
-                )
-        return manager.handle()
 
 
 class PrefixSharingFSDPAttentionRuntime:
@@ -373,7 +324,13 @@ def _run_packed_attention_runtime(
     *,
     layer_id: int,
 ) -> Any:
+    from prefix_sharing.tools.perf_profiler import PerfProfiler
+
     plan = ctx.prefix_sharing_plan
+    profiler = PerfProfiler.current()
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_KV)
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
         packed_key,
         packed_value,
@@ -384,30 +341,22 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
-    return ctx.attention_backend.attention(
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
+    output = ctx.attention_backend.attention(
         packed_query,
         expanded_key,
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
     )
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
 
-
-def _create_prefix_sharing_attention_wrapper(original_fn: Any) -> Any:
-    """Wrap HF attention registry functions with PrefixSharing support."""
-
-    def wrapped(module: Any, query: Any, key: Any, value: Any, attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
-        prefix_sharing_runtime = kwargs.pop("prefix_sharing_runtime", None)
-        if prefix_sharing_runtime is None:
-            return original_fn(module, query, key, value, attention_mask, *args, **kwargs)
-
-        def attn_func(q: Any, k: Any, v: Any, *inner_args: Any, **inner_kwargs: Any) -> Any:
-            result = original_fn(module, q, k, v, attention_mask, *inner_args, **inner_kwargs)
-            return result[0] if isinstance(result, tuple) else result
-
-        return prefix_sharing_runtime.forward(attn_func, query, key, value, *args, **kwargs), None
-
-    return wrapped
+    return output
 
 
 def _call_fsdp_model(

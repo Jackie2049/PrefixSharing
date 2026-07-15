@@ -11,7 +11,7 @@ Patch 目标：
 from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
-from .attention import patch_transformers_attention
+from .rollout_patch import patch_ray_trainer_fit
 
 
 PATCH_SET: list[PatchSpec] = [
@@ -26,16 +26,18 @@ PATCH_SET: list[PatchSpec] = [
         eager=True,  # verl FSDP engine 仅在 actor 实例化时 lazy-load，必须 eager 触发
     ),
     PatchSpec(
-        module_name="transformers.modeling_utils",
-        target_getter=lambda mod: (
-            mod.ALL_ATTENTION_FUNCTIONS,
-            "get_interface",
-        ),
-        patch_factory=patch_transformers_attention,
+        module_name="verl.trainer.ppo.ray_trainer",
+        target_getter=lambda mod: (mod.RayPPOTrainer, "fit"),
+        patch_factory=patch_ray_trainer_fit,
         description=(
-            "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
-            "(HF attention KV store/load on Q-path kept tokens)"
+            "RayPPOTrainer.fit → intercept actor_rollout_wg + async_rollout_manager "
+            "for PREFIX_SHARING_CAPTURE_ROLLOUT / PREFIX_SHARING_FIXED_ROLLOUT"
         ),
-        # transformers 在 worker 启动早期就加载，无需 eager；context 不激活时透传。
+        eager=True,  # ray_trainer is imported by main_ppo at startup; eager ensures patch is in place
     ),
 ]
+
+# Attention patch: directly modify ALL_ATTENTION_FUNCTIONS dict (same approach as verl's PrefixGrouper).
+# Cannot use PatchSpec because get_interface is not an attribute/key of AttentionInterface.
+from .attention import install_attention_patch
+install_attention_patch()
