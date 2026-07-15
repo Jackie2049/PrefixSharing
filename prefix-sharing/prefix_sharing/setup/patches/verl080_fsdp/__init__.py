@@ -11,7 +11,6 @@ Patch 目标：
 from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
-from .attention import patch_transformers_attention
 from .rollout_patch import patch_ray_trainer_fit
 
 
@@ -56,21 +55,5 @@ PATCH_SET: list[PatchSpec] = [
 
 # Attention patch: directly modify ALL_ATTENTION_FUNCTIONS dict (same approach as verl's PrefixGrouper).
 # Cannot use PatchSpec because get_interface is not an attribute/key of AttentionInterface.
-try:
-    from prefix_sharing.integrations.verl_fsdp import (
-        _SUPPORTED_TRANSFORMERS_ATTENTIONS,
-        _create_prefix_sharing_attention_wrapper,
-    )
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    patched = []
-    for name in list(ALL_ATTENTION_FUNCTIONS.keys()):
-        if name in _SUPPORTED_TRANSFORMERS_ATTENTIONS:
-            ALL_ATTENTION_FUNCTIONS[name] = _create_prefix_sharing_attention_wrapper(
-                ALL_ATTENTION_FUNCTIONS[name]
-            )
-            patched.append(name)
-    if patched:
-        print(f"[PS] Attention patch installed on: {patched}")
-except Exception:
-    pass  # transformers not available on this process (e.g. trainer side)
+from .attention import install_attention_patch
+install_attention_patch()
