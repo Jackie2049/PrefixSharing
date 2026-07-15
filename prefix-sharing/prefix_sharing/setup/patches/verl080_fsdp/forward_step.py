@@ -141,6 +141,13 @@ def _forward_step_with_engine_prepare(
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
 
+    # DIAG_DUMP: dump 原始 full input_ids 必须在前面的 build_prefix_sharing_micro_batch_fsdp
+    # 之前执行，因为后者会就地修改 micro_batch（裁剪 prefix tokens）。
+    # 用原始 micro_batch 保存完整的 input_ids 供 cmp_diag 对齐 baseline。
+    import os as _ps_diag_fwd_ids2
+    if _ps_diag_fwd_ids2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        _dump_full_input_ids_only(micro_batch, "train")
+
     trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
         micro_batch,
         ps_config,
@@ -167,12 +174,6 @@ def _forward_step_with_engine_prepare(
         from prefix_sharing.tools.diagnostic_dump_verl080 import dump_fsdp_on_metadata_verl080
 
         dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, "train")
-
-    # DIAG_DUMP: ON path dump原始full input_ids（trimmed_micro_batch 是裁剪后的，
-    # 用 micro_batch 保存完整的原始 input_ids 供 cmp_diag 对齐 baseline）
-    import os as _ps_diag_fwd_ids2
-    if _ps_diag_fwd_ids2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-        _dump_full_input_ids_only(micro_batch, "train")
 
     # 获取模型层数以支持 per-layer diagnostic dump
     _diag_num_layers = int(getattr(
