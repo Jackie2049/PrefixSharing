@@ -35,8 +35,9 @@ class PrefixSharingFSDPAttentionRuntime:
     positions are restored later by the output/logprob restore step.
     """
 
-    def __init__(self, *, layer_id: int = 0) -> None:
+    def __init__(self, *, layer_id: int = 0, num_layers: int = 0) -> None:
         self.layer_id = layer_id
+        self.num_layers = num_layers
 
     def forward(self, attn_func: Any, query: Any, key: Any, value: Any, *args: Any, **kwargs: Any) -> Any:
         del attn_func, args, kwargs
@@ -55,6 +56,7 @@ class PrefixSharingFSDPAttentionRuntime:
                 packed_key,
                 packed_value,
                 layer_id=self.layer_id,
+                num_layers=self.num_layers,
             )
             return packed_output.unsqueeze(0)
         if query.shape[:2] != key.shape[:2] or query.shape[:2] != value.shape[:2]:
@@ -70,6 +72,7 @@ class PrefixSharingFSDPAttentionRuntime:
             packed_key,
             packed_value,
             layer_id=self.layer_id,
+            num_layers=self.num_layers,
         )
         return _scatter_packed_output_to_dense(packed_output, query, plan)
 
@@ -323,11 +326,21 @@ def _run_packed_attention_runtime(
     packed_value: Any,
     *,
     layer_id: int,
+    num_layers: int = 0,
 ) -> Any:
     from prefix_sharing.tools.perf_profiler import PerfProfiler
 
     plan = ctx.prefix_sharing_plan
     profiler = PerfProfiler.current()
+    layer_number = layer_id + 1
+
+    # ##### [PS-diag] per-layer dump: build_kv_input_v + rope_postqk ######
+    import os as _ps_dump_env
+    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+        from prefix_sharing.tools.diagnostic_dump import dump_build_kv_input_v_on, dump_rope_postqk_verl080
+        dump_build_kv_input_v_on(layer_number, packed_value, num_layers)
+        dump_rope_postqk_verl080(layer_number, packed_query, packed_key, num_layers)
+    # ##### [PS-diag] end #####
 
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_ATTN_KV)
@@ -343,6 +356,12 @@ def _run_packed_attention_runtime(
     )
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
+
+    # ##### [PS-diag] per-layer dump: expanded_kv (ON only) ######
+    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+        from prefix_sharing.tools.diagnostic_dump import dump_expanded_kv_on
+        dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
+    # ##### [PS-diag] end #####
 
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)

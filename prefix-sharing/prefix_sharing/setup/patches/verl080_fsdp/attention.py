@@ -69,7 +69,8 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
 
         layer_id = int(getattr(module, "layer_idx", 0) or 0)
-        runtime = PrefixSharingFSDPAttentionRuntime(layer_id=layer_id)
+        _num_layers = int(getattr(getattr(module, "config", None), "num_hidden_layers", 0) or 0)
+        runtime = PrefixSharingFSDPAttentionRuntime(layer_id=layer_id, num_layers=_num_layers)
 
         # HF attention interface expects [B, H, L, D]; runtime works in [B, L, H, D]
         query_ld = query.transpose(1, 2)
