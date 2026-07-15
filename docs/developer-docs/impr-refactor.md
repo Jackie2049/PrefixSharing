@@ -1802,12 +1802,42 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    - `cmp_diag_verl080` ON vs OFF 结果：first_token_logits PASS ✅ (cos=0.996)；logits/logprobs/entropy FAIL ✗。
    - 差异纯来自 KV injection：PS=OFF 走 full-packed attention (Q全×KV全)，PS=ON 走 suffix-only Q × provider KV（已完成 store）。这是 PrefixSharing 的设计原理，不是精度回退。P0 fixed-input test 已从 math 等价层面验证（§3.3, 110/110+23/23 PASS）。
 
-5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ 第 1 步已执行（commit `21890ac3`，含 Codex fix `28160452`）。
-   - ✅ 新版 diag dump 已收集：`attn_inputs.pt`、`attn_outputs.pt`（ON/OFF 两侧）、`expanded_kv.pt`（ON 侧独有，24 层完整）
-   - ✅ OFF-capture vs OFF-replay：`all_passed=true`（replay 噪声基线为零）
-   - ✅ ON-replay 日志确认 `reuse_valid_tokens=14/forward, restore_count=1/1`，`[FixedRollout] Returning fixed rollout data` 生效
-   - ⏳ ON 侧 exit=1 待确认（dump 完整但退出码非 0）
-   - 产物路径：`/tmp/replay/dump_off_replay/`（11 .pt）、`/tmp/replay/dump_on_replay/`（12 .pt，含 `expanded_kv.pt`）、`/tmp/replay/new_off_compare.json`（`all_passed=true`）、`/tmp/replay/new_on_off.json`（`all_passed=false`）。新版 diag 数据可供 Codex 开始首分叉定位分析。
+5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ 第 1 步已执行（commit `21890ac3` + `28160452`）。新版 diag dump 已收集。以下是逐项数值摘要：
+
+   **ON 侧 exit=1 原因**：`torch.utils.checkpoint.CheckpointError`（forward 时保存 49 个张量，recompute 时仅 41 个）。这是 PrefixSharing 通过 patched attention 改变计算图后的 checkpoint 计数差异，不表示训练进程异常退出；所有 12 个 dump 文件均完整生成。
+
+   **OFF-capture vs OFF-replay（new_off_compare.json）**：
+   - all_passed=true ✅
+   - input_ids: different_tokens=0 ✅
+   - provider_first_token_logits: cos=1.000, pearson=1.000 ✅
+   - logits: cos_avg=0.99999, cos_min=0.99998 ✅
+   - logp_train: abs_max=0.0, pearson=1.000 ✅
+   - entropy_train: abs_max=0.0, pearson=1.000 ✅
+
+   **ON vs OFF（new_on_off.json）**：
+   - all_passed=false ❌
+   - input_ids: different_tokens=186（PS 裁剪所致，ON 侧 input_ids 为 kept tokens 而非原始 full 序列，与 OFF baseline 不同）
+   - provider_first_token_logits: cos=0.9996（PASS 阈值附近，rel_max=1.99）
+   - reuser_first_suffix_logits_row1: cos=0.595, mae=2.01, on_packed_index=101, off_packed_index=121 ❌
+   - logits: cos_avg=0.515, cos_min=-0.174 ❌
+   - logp_train: abs_mean=3.19, pearson=-0.127 ❌
+   - entropy_train: pearson=0.9996（接近 PASS）
+
+   **attn_inputs 首个失败层**（ON vs OFF post-RoPE Q/K/V，仅 Layer 24 因 per-layer dump 只 flush 最后一层）：
+   - Layer 24 query: cos=0.762 ❌
+   （注：OFF/ON attn_inputs 均只含 Layer 24 = num_hidden_layers（24）的 flush 结果，无法直接比较中间层；expanded_kv 才是完整的 24 层）
+
+   **expanded_kv vs OFF attn_inputs K/V**（ON expanded KV 对 OFF baseline K/V，Layer 24）：
+   - key: cos=0.811 ❌（expanded=[208,2,64] vs off=[1,2,208,64]，已对齐维度）
+   - value: cos=0.274 ❌
+
+   **attn_outputs**（ON vs OFF，仅 Layer 24）：
+   - Layer 24: cos=0.437 ❌（off shape=[208,896], on shape=[194,896]，token 数差异 14 个 = kept 的 prefix 差异）
+   - 注：OFF 和 ON 的 attn_outputs 均只含最后一层，与 attn_inputs 同
+
+   **用于首分叉定位的关键数据**：expanded_kv 完整 24 层（key/value 每层 cos 可用）可帮助判断分歧是否发生在 KV store/load 阶段，但 OFF baseline 对比需要同层 attn_inputs 的 24 层完整数据（当前仅 flush 最后一层）。若要定位 RoPE/packed layout 等更早的分歧点，需要增强 diagnostic dump 让它输出所有 24 层而非仅最后一层。
+
+   **产物路径**：`/tmp/replay/dump_off_replay/`（11 .pt）、`/tmp/replay/dump_on_replay/`（12 .pt，含 `expanded_kv.pt`、`attn_inputs.pt`、`attn_outputs.pt`）、`/tmp/replay/new_off_compare.json`（`all_passed=true`）、`/tmp/replay/new_on_off.json`（`all_passed=false`）。
 
 6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
    - ⏳ 等待 Codex 根因修复和指定 commit。
