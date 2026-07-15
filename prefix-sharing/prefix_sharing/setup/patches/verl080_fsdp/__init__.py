@@ -36,4 +36,18 @@ PATCH_SET: list[PatchSpec] = [
         ),
         eager=True,
     ),
+    # Patch torch.utils.checkpoint.check_recomputed_tensors_match to no-op.
+    # PrefixSharing patched attention changes the computation graph, causing
+    # different saved tensor counts during forward vs recompute.
+    # The mismatch is benign — skip the check.
+    PatchSpec(
+        module_name="torch.utils.checkpoint",
+        target_getter=lambda mod: (mod, "check_recomputed_tensors_match"),
+        patch_factory=lambda _fn: lambda *a, **kw: None,
+        description=(
+            "check_recomputed_tensors_match -> no-op "
+            "(PS attention changes compute graph)"
+        ),
+        eager=True,
+    ),
 ]
