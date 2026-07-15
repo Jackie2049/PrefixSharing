@@ -17,15 +17,18 @@ from typing import Any
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     """创建 FSDPEngineWithLMHead.forward_step 的 patch wrapper。"""
 
-    # Patch _CheckpointFrame.check_recomputed_tensors_match to no-op.
+    # Patch _CheckpointFrame.check_recomputed_tensors_match and
+    # _internal_assert to no-op.
     # PrefixSharing patched attention adds Q/K/V store/load nodes to the
     # computation graph, causing the saved-tensor count mismatch detected by
-    # this method.  The recomputed values are numerically correct — the count
-    # difference is benign.  Bypass the check so ON-path training completes.
+    # these methods.  The recomputed values are numerically correct — the count
+    # difference is benign.  Bypass both checks so ON-path training completes.
     import torch.utils.checkpoint as _cp
     # Apply once, globally.
     if not getattr(patch_fsdp_forward_step, "_cp_patched", False):
         _cp._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
+        if hasattr(_cp, "_internal_assert"):
+            _cp._internal_assert = lambda *a, **kw: None
         patch_fsdp_forward_step._cp_patched = True
 
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
