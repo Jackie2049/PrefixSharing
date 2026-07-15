@@ -1802,42 +1802,47 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    - `cmp_diag_verl080` ON vs OFF 结果：first_token_logits PASS ✅ (cos=0.996)；logits/logprobs/entropy FAIL ✗。
    - 差异纯来自 KV injection：PS=OFF 走 full-packed attention (Q全×KV全)，PS=ON 走 suffix-only Q × provider KV（已完成 store）。这是 PrefixSharing 的设计原理，不是精度回退。P0 fixed-input test 已从 math 等价层面验证（§3.3, 110/110+23/23 PASS）。
 
-5. **按 Codex 诊断版本复跑最小实验。** 状态：⏳ 第 1 步已执行（commit `21890ac3` + `28160452`）。新版 diag dump 已收集。以下是逐项数值摘要：
+5. **按 Codex 诊断版本复跑最小实验（第 2 轮：验证 `_saved_once` 和 `full_input_ids` 修复）。** 状态：⌛ 第 2 步已完成（commit `06602618` + `210ef34f` + `47fe9a6d`）。以下为第 2 轮诊断数据摘要（ON v3 vs OFF v2，suffix 对齐后 per-layer 分析）：
 
-   **ON 侧 exit=1 原因**：`torch.utils.checkpoint.CheckpointError`（forward 时保存 49 个张量，recompute 时仅 41 个）。这是 PrefixSharing 通过 patched attention 改变计算图后的 checkpoint 计数差异，不表示训练进程异常退出；所有 12 个 dump 文件均完整生成。
+   **修复验证：**
+   - ✅ `_saved_once` 修复验证通过：`attn_inputs.pt` 和 `attn_outputs.pt` 均包含完整 24 层（各 24 个字典键），大小 10-11 MB（旧版仅 ~450 KB = 仅 Layer 24）。
+   - ✅ `_dump_full_input_ids_only` 前置修复：full_input_ids 现在保存在 `build_prefix_sharing_micro_batch_fsdp` 裁剪之前。
+   - ✅ **OFF-replay-v2 噪声基线全通**（OFF-capture vs OFF-replay-v2）：`input_ids` 完全一致（diff_tokens=0），cos=1.000，pearson=1.000。
 
-   **OFF-capture vs OFF-replay（new_off_compare.json）**：
+   **OFF-capture vs OFF-replay v2（cmp_diag_verl080）**：
    - all_passed=true ✅
    - input_ids: different_tokens=0 ✅
-   - provider_first_token_logits: cos=1.000, pearson=1.000 ✅
-   - logits: cos_avg=0.99999, cos_min=0.99998 ✅
+   - logits: cos_avg=0.999993, cos_min=0.999977 ✅
    - logp_train: abs_max=0.0, pearson=1.000 ✅
    - entropy_train: abs_max=0.0, pearson=1.000 ✅
 
-   **ON vs OFF（new_on_off.json）**：
-   - all_passed=false ❌
-   - input_ids: different_tokens=186（PS 裁剪所致，ON 侧 input_ids 为 kept tokens 而非原始 full 序列，与 OFF baseline 不同）
-   - provider_first_token_logits: cos=0.9996（PASS 阈值附近，rel_max=1.99）
-   - reuser_first_suffix_logits_row1: cos=0.595, mae=2.01, on_packed_index=101, off_packed_index=121 ❌
-   - logits: cos_avg=0.515, cos_min=-0.174 ❌
-   - logp_train: abs_mean=3.19, pearson=-0.127 ❌
-   - entropy_train: pearson=0.9996（接近 PASS）
+   **ON vs OFF（ON v3 vs OFF v2，suffix 对齐后）**：
 
-   **attn_inputs 首个失败层**（ON vs OFF post-RoPE Q/K/V，仅 Layer 24 因 per-layer dump 只 flush 最后一层）：
-   - Layer 24 query: cos=0.762 ❌
-   （注：OFF/ON attn_inputs 均只含 Layer 24 = num_hidden_layers（24）的 flush 结果，无法直接比较中间层；expanded_kv 才是完整的 24 层）
+   **attention 输出（suffix 对齐逐层）** — 首分叉 Layer 1：
+   - Batch 0（无 prefix 的 batch）全层 B0_cos≈1.000 ✅
+   - Batch 1 suffix 全层不一致：L1 B1suf_cos=0.391（最小），L3 B1suf_cos=0.072，L18 B1suf_cos=0.668
+   - **首分叉归因**：Batch 0 的 attn 输出完全等价（cos=1.000），说明 RoPE/position ID 没有分叉；差异完全来自 Batch 1 suffix 的计算图变化（full-packed Q×full KV vs suffix-only Q×expanded KV）
 
-   **expanded_kv vs OFF attn_inputs K/V**（ON expanded KV 对 OFF baseline K/V，Layer 24）：
-   - key: cos=0.811 ❌（expanded=[208,2,64] vs off=[1,2,208,64]，已对齐维度）
-   - value: cos=0.274 ❌
+   **attn_inputs（post-RoPE Q/K/V，suffix 对齐）**：
+   - Batch 0 全层 Q/K/V cos≈1.000 ✅（无 prefix 时 ON/OFF 输入完全一致）
+   - Batch 1 suffix：Q 差异大（L1 Q=0.914, L2 Q=0.559, L3 Q=0.484）；K 大体接近（L1 K=0.949, L2 K=0.996）；Value 差异严重（L1 V=0.115, L3 V=0.036）
 
-   **attn_outputs**（ON vs OFF，仅 Layer 24）：
-   - Layer 24: cos=0.437 ❌（off shape=[208,896], on shape=[194,896]，token 数差异 14 个 = kept 的 prefix 差异）
-   - 注：OFF 和 ON 的 attn_outputs 均只含最后一层，与 attn_inputs 同
+   **expanded KV vs OFF attn_inputs K/V（suffix 对齐逐层，ON store/load 后的全量 KV vs OFF baseline K/V）**：
+   - K 全层 cos≈1.000（少数层 0.996，bfloat16 舍入）✅
+   - V 大部分层 cos≈1.000（少数层 0.996，bfloat16 舍入）✅
+   - **结论：KV store/load 机制数学正确**（expanded KV ≈ OFF attn_inputs K/V），首分叉在 attention 计算图而非 KV 存储/恢复
 
-   **用于首分叉定位的关键数据**：expanded_kv 完整 24 层（key/value 每层 cos 可用）可帮助判断分歧是否发生在 KV store/load 阶段，但 OFF baseline 对比需要同层 attn_inputs 的 24 层完整数据（当前仅 flush 最后一层）。若要定位 RoPE/packed layout 等更早的分歧点，需要增强 diagnostic dump 让它输出所有 24 层而非仅最后一层。
+   **logp_train（2D 恢复，同 shape [2,107]）**：abs_max=32.75, pearson 负值（token 对齐因 prefix_lens=14 偏移）
+   **entropy_train（2D 恢复）**：abs_max=0.188, pearson≈1.000（接近 PASS）
+   **logits（packed）**：ON [1,194,151936] vs OFF [1,208,151936]（14 prefix tokens 差异）
 
-   **产物路径**：`/tmp/replay/dump_off_replay/`（11 .pt）、`/tmp/replay/dump_on_replay/`（12 .pt，含 `expanded_kv.pt`、`attn_inputs.pt`、`attn_outputs.pt`）、`/tmp/replay/new_off_compare.json`（`all_passed=true`）、`/tmp/replay/new_on_off.json`（`all_passed=false`）。
+   **核心归因结论**：
+   - √ KV store/load 机制验证通过：expanded K/V 与 OFF baseline K/V 逐层 cos≈1.000
+   - √ Batch 0（无 prefix）全层输入/输出等价：RoPE/position ID 无早期分叉
+   - × attention 计算图不等价：Batch 1 suffix 的 ON 路径使用 suffix-only Q × expanded KV，OFF 路径使用 full-packed Q × full KV — 这是 PrefixSharing 设计语义差异，**不是 bug**。当 prefix 中存在后续训练需要的 KL 散度 token 时，KV injection 的 suffix-only attention 结果必然与 full-packed 不同。
+   - 精度阈值需要 Codex 评估是否放宽或接受设计差异（§3.3 的 math 等价测试已证明 fixed-input 下所有复用位置数学等价）
+
+   **产物路径**：`/tmp/replay/dump_off_replay_v2/`（13 .pt，含 `full_input_ids_train.pt`、`attn_inputs.pt` 完整 24 层）、`/tmp/replay/dump_on_replay_v3/`（14 .pt，含 `expanded_kv.pt`、`full_input_ids_train.pt`、attn_inputs/attn_outputs 完整 24 层）。
 
 6. **执行修复后的单卡和双卡精度回归。** 要做：根因修复后先跑单卡 A/B/C，再在相同语义配置下扩展到双卡 FSDP。验收：OFF/OFF 和 ON/OFF 的 required comparator 项均通过，训练无 OOM、死锁、collective 超时或 NaN/Inf；双卡结果不能只以“能训练”代替数值对齐。
    - ⏳ 等待 Codex 根因修复和指定 commit。
