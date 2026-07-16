@@ -1,112 +1,90 @@
-# [RFC][Draft] Arbitrary-Prefix Sharing for RL Training
+# [RFC] Integrate PrefixSharing to verl: Generalizing PrefixGrouper for Arbitrary-Prefix Reuse in Agentic RL Training
 
 ## 1. Summary
 
-GRPO, step-wise RL, and tree-structured agent training often place trajectories with identical token prefixes in the same batch. Standard actor and reference-policy training recomputes those prefixes for every trajectory.
+**Prefix repetition across trajectories is prevalent** in Agentic RL scenarios, especially in GRPO, Step-wise, and Tree-structure rollout paradigms. Current training workflow always recomputes these prefix sub-sequences separately for different trajectories (during compute_old_log_prob & update_actor), resulting in redundant memory overhead and computational cost.
 
-We propose extending verl's existing PrefixGrouper feature from prompt-only sharing to **arbitrary-prefix sharing within a micro-batch**. The current PrefixSharing prototype uses differentiable KV injection, supports FSDP/Transformers and Megatron, and is designed to preserve baseline logits, log-probabilities, loss, and gradients.
+This issue proposes **PrefixSharing to extend verl's existing PrefixGrouper from fixed-length prompt reuse to arbitrary-length prefix sharing**, enabling better support for Step-wise and Tree-structure rollout trajectories. The key mechanism is to construct a prefix tree for input batches, then reuse KV activations during attention computation while preserving baseline logits, LogP, loss and gradient precisions. The current PrefixSharing has improved training throughput by xxx and reduced memory consumption by yyy.
 
 Prototype: https://github.com/Jackie2049/PrefixSharing/tree/open-source
 
-## 2. Motivation
+## 2. Concepts
 
-Shared-prefix redundancy appears in several RL trajectory structures, with different requirements on the sharing algorithm.
+* **Provider**: A trajectory sample whose prefix is shared and reused by reuser samples within the same batch.
+* **Reuser**: A trajectory who reuses providers' prefix. Note that a reuser can also be other reusers' provider in complex scenarios.
 
-### 2.1 GRPO-style trajectories
+## 3. Motivation
 
-```text
-trajectory 0: [prompt P][response A]
-trajectory 1: [prompt P][response B]
-trajectory 2: [prompt P][response C]
-```
+Prefix redundancy appears in 3 typical rollout paradigms, with different requirements on prefix reuse algorithm.
 
-All trajectories share one prompt and diverge once. This is the workload that PrefixGrouper already handles well: one explicit prompt group is transformed into one prefix plus multiple suffixes. PrefixSharing supports this case, but does not aim to replace PrefixGrouper's simpler and more efficient prompt-only path.
-
-### 2.2 StepRL-style trajectories
-
-Step-wise RL can sample or optimize continuations from intermediate reasoning steps:
+### 3.1 GRPO-style trajectories
 
 ```text
-trajectory 0: [prompt P][step 1][step 2A]
-trajectory 1: [prompt P][step 1][step 2B]
-trajectory 2: [prompt P][step 1][step 2A][step 3A]
-trajectory 3: [prompt P][step 1][step 2A][step 3B]
+trajectory 0: [prompt P][response A] <--- reward 0
+trajectory 1: [prompt P][response B] <--- reward 1
+trajectory 2: [prompt P][response C] <--- reward 2
 ```
 
-There are multiple reusable prefixes: `[P]`, `[P, step 1]`, and `[P, step 1, step 2A]`. Their lengths differ, and a trajectory that reuses one prefix can become the provider of a longer prefix. A single `one prompt + many responses` group cannot express all these chained relationships at once. PrefixSharing detects provider/reuser relationships at arbitrary token boundaries and reuses each available prefix within the same forward.
+This is the simplest reuse workload, where all trajectories share fix-length prompts (_prompt P_) and their responses diverge (_'response A/B/C'_). verl's existing PrefixGrouper splits attention into two stages (prompt & response) to enable prompt-only prefix reuse. PrefixSharing also supports prompt reuse by prefix tree algorithm, but DOES NOT aim to replace PrefixGroupers's simpler and more efficient path.
 
-### 2.3 TreeRL-style trajectories
+### 3.2 Step-style trajectories
 
-Tree-search and multi-turn agent RL naturally produce nested branches:
+```text
+trajectory 0: [prompt P][step 1][step 2A] <--- reward 0        
+trajectory 1: [prompt P][step 1][step 2B] <--- reward 1
+trajectory 2: [prompt P][step 1][step 2A][step 3A] <--- reward 2
+trajectory 3: [prompt P][step 1][step 2A][step 3B] <--- reward 3
+trajectory 4: [prompt P][step 1][step 2A][step 3A][step 4A] <--- reward 4
+```
+
+Step-wise rollout generates trajectories where some of them (_'trajectory 0'_) are sub-sequence and history steps of the others (_'trajectory 2/3'_). In this scenario, prefix lengths differ from one to another, and a trajectory that reuses prefix can also become provider of longer prefix for subsequent trajectories (**'trajectory 0' => 'trajectory 2' => 'trajectory 4'**). PrefixGrouper is not able to express such chained reusing relationship and fails to reuse prefix longer than prompt, while PrefixSharing handles this easily by a Trie.
+
+### 3.3 Tree-style trajectories
 
 ```text
                          /-- [turn 2A] -- [leaf A]
 [root][turn 1 shared] --+
                          \-- [turn 2B] -- [leaf B]
                                            \-- [turn 3B] -- [leaf C]
+
+trajectory 0: [root][turn 1 shared][turn 2A][leaf A]
+trajectory 1: [root][turn 1 shared][turn 2B][leaf B]
+trajectory 2: [root][turn 1 shared][turn 2B][turn 3B][leaf C]
 ```
 
-Different subsets of leaves share different ancestors. Flattening the leaves into independent sequences repeatedly computes the root and every internal branch. PrefixSharing represents these nested relationships as a provider/reuser plan, allowing internal tree nodes to be reused without requiring the workload to collapse into one prompt group.
+Tree-structure rollout produces branches with common ancestors and it is similar with Step-wise rollout from the view of trajectories. Common ancestors of leaves (_'[turn 1 shared][turn 2B]'_) are naturally common prefix among trajectories (_'trajectory 1'_ & _'trajectory 2'_). Currently verl and PrefixGrouper does not support reusing arbitray prefix in Tree-structure trajectories. 
 
-Inference prefix caches do not solve this training-side problem. Actor updates and reference log-probability computation require differentiable execution, correct token-level outputs, and gradients through the shared prefix computation.
+## 4. Design
 
-## 3. Design
+### 4.1 Scope
 
-### 3.1 Goals
-
-- Reuse arbitrary shared prefixes within one micro-batch. The logical plan and activation-store abstraction are designed so that sharing can later be extended across micro-batches, but cross-micro-batch lifetime and scheduling are outside the first upstream scope.
-- Preserve baseline forward and backward semantics. The optimized computation is mathematically equivalent to independent full-sequence forwards, and tests verify attention outputs, logits, log-probabilities, loss, and gradients against the baseline within dtype-appropriate numerical tolerance.
-- Extend the existing PrefixGrouper user-facing feature in verl 0.8.0 instead of adding a competing top-level switch. Users can select the existing prompt-only PrefixGrouper algorithm or the arbitrary-prefix PrefixSharing algorithm according to their trajectory structure.
-- Keep logical prefix relationships independent from the physical attention implementation.
-- Upstream the FSDP/Transformers path first and retain Megatron as another backend.
-
-### 3.2 Non-goals for the first upstream contribution
-
-- Cross-micro-batch activation sharing.
-- Context parallelism and every fused attention kernel.
-- DeltaNet or other recurrent-state reuse.
-- Upstreaming FSDP, Megatron, MindSpeed, and NPU support at the same time.
-- Guaranteeing speedup for every batch composition or prefix ratio.
+- Support arbitrary prefix reuse within micro-batch.
+- Performance improvement (less memory consumption or faster forward).
+- Preserve baseline forward and backward semantics. Compuatation precision aligned.
+- Inherit and extend PrefixGrouper's interface in verl. **Minimal modification to verl**.
+- FSDP/transformers as training engine for the first version.
+- Support full attention (e.g. Qwen-2/2.5/3) for the first version.
 
 ### 3.3 Overview
 
 ```mermaid
-flowchart TD
-    A["verl actor/ref micro-batch"] --> B["Shared-prefix mode dispatch"]
-    B -->|"prompt_only"| C["PrefixGrouper"]
-    B -->|"arbitrary_prefix"| D["PrefixSharing planner"]
-    D --> E["Trim reuser inputs and create runtime context"]
-    E --> F{"Training backend"}
-    F --> G["FSDP / Transformers attention"]
-    F --> H["Megatron attention"]
-    G --> I["KV injection and attention"]
-    H --> I
-    I --> J["Restore token layout and prefix-last outputs"]
-    C --> K["Standard verl training outputs"]
-    J --> K
-    K --> L["verl log-probability, loss, and backward"]
-
-    classDef verl fill:#dbeafe,stroke:#2563eb,color:#111827,stroke-width:2px
-    classDef prefixSharing fill:#dcfce7,stroke:#16a34a,color:#111827,stroke-width:2px
-    classDef existing fill:#f3f4f6,stroke:#6b7280,color:#111827,stroke-width:1px
-    class A,B,K,L verl
-    class D,E,F,I,J prefixSharing
-    class C,G,H existing
+flowchart LR
+    A["Sequences or prefix metadata"] --> B["Prefix sharing plan"]
+    B --> C["Execution backend"]
+    C --> D["FSDP KV injection"]
+    C --> E["Megatron KV injection"]
+    C --> F["Future sparse/tree attention"]
+    D --> G["Reconstructed training outputs"]
+    E --> G
+    F --> G
 ```
 
-Node colors indicate code ownership: blue marks verl integration touchpoints, green marks the self-contained PrefixSharing module, and gray marks existing components reused by the integration.
-
-The proposed verl integration follows five steps:
-
-1. **Prepare the verl micro-batch.** The actor or reference-policy path provides token sequences and masks using the normal verl batch contract.
-2. **Select the sharing algorithm.** `prompt_only` keeps the existing PrefixGrouper path; `arbitrary_prefix` invokes PrefixSharing. The feature remains opt-in and the baseline path is unchanged when disabled.
-3. **Build the logical plan.** PrefixSharing detects shared token ranges, selects providers and reusers, trims duplicated reuser inputs, and records the output positions that must be restored.
-4. **Execute through the model backend.** A per-forward runtime context carries the plan into supported FSDP/Transformers or Megatron attention modules. The attention path stores provider KV and injects it when computing each reuser suffix, without detaching the autograd graph.
-5. **Return the standard verl outputs.** PrefixSharing reconstructs the token layout and prefix-last boundary outputs before verl computes log-probabilities, loss, and backward. Downstream verl training logic continues to consume its existing output contract.
-
-The plan describes logical sharing semantics, while each backend owns its physical tensor layout and attention implementation. This keeps the verl-facing interface stable and leaves room for future sparse/tree-attention or cross-micro-batch execution strategies.
+The prefix plan describes provider/reuser relationships and prefix lengths. Execution backends decide how those relationships are implemented. This allows KV injection and future sparse/tree attention to share one logical interface without forcing the same tensor layout.
 
 ### 3.4 Integration
+
+3.4.1 代码集成：PrefixSharing和verl的集成关系
+3.4.2 参数集成、快速使用
 
 We propose a backward-compatible extension of the existing PrefixGrouper configuration:
 
@@ -118,7 +96,7 @@ actor_rollout_ref:
       mode: arbitrary_prefix
 ```
 
-The exact naming is open for discussion. The first upstream path would integrate with verl's FSDP model engine and Transformers attention dispatch. Megatron support can follow separately after the common interface stabilizes.
+The exact naming is open for discussion. The first upstream path would integrate with verl's FSDP model engine and Transformers attention dispatch. Megatron support is also ready and can follow separately after the common interface stabilizes.
 
 ### 3.5 Attention
 
@@ -129,6 +107,20 @@ The KV-injection backend follows three rules:
 3. **Prefix-last restore:** trimming a reuser prefix removes the output needed for its first suffix-token log-probability. The backend restores that boundary output before verl consumes token-level results.
 
 These rules are the precision boundary of the design. Performance optimizations must not change them.
+
+
+### 3.2 Non-goals for the first upstream contribution => Roadmap
+
+- Cross-micro-batch activation sharing.
+- Context parallelism and every fused attention kernel.
+- DeltaNet or other recurrent-state reuse.
+- Upstreaming FSDP, Megatron, MindSpeed, and NPU support at the same time.
+- Guaranteeing speedup for every batch composition or prefix ratio.
+1、支持Megatron模型并行。支持NPU等设备；
+2、未来支持自定义prefix-reuse关系；
+3、支持其他注意力；
+4、性能优化（build_kv）；
+5、支持BSHD；
 
 ## 4. Current Results
 
@@ -165,7 +157,11 @@ Current profiling indicates that no-sharing planning and physical expanded-KV co
 - [AReaL dynamic tree attention](https://github.com/areal-project/AReaL/tree/feat/dta) focuses on scalable tree execution and load balancing.
 - vLLM and SGLang prefix caches optimize inference/rollout execution; PrefixSharing targets differentiable actor and reference-policy training.
 
-## 6. Future Plans
+## 6. 实施事项
+
+1、monkey patch => verl侵入式修改 => PR；
+2、根据社区反馈修改方案、代码；
+3、官话；
 
 1. Complete and publish the minimal FSDP correctness and performance report.
 2. Finalize a PrefixGrouper-compatible logical metadata and configuration interface with community feedback.
