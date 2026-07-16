@@ -42,7 +42,18 @@ _DP_SHARDABLE_STEMS: list[str] = [
     "cu_seqlens_q",
     "cu_seqlens_q_logits",
     "attn_outputs",
+    "rope_postqk",
+    "build_kv_input_v",
+    "expanded_kv",
 ]
+
+# ── DP-shardable files that are per-layer dicts (not 1D/2D tensors) ──
+_DP_PER_LAYER_STEMS: set[str] = {
+    "attn_outputs",
+    "rope_postqk",
+    "build_kv_input_v",
+    "expanded_kv",
+}
 
 # ── Tag-suffixed files that may be DP-sharded ────────────────────
 _DP_TAG_PREFIXES: list[str] = [
@@ -213,7 +224,7 @@ def assemble(input_dir: str, output_dir: str) -> None:
             continue
 
         print(f"  [merge] {stem}.pt ← {len(shards)} dp shards")
-        if stem == "attn_outputs":
+        if stem in _DP_PER_LAYER_STEMS:
             merged = _merge_dp_per_layer_dict(shards)
             if merged is not None:
                 torch.save(merged, os.path.join(output_dir, f"{stem}.pt"))

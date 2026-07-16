@@ -317,15 +317,16 @@ def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
 
 
 def _flush_rope_buffer(dump_dir: str) -> None:
-    """Write accumulated rope_postqk dict to disk and clear buffer."""
+    """Write accumulated rope_postqk dict to disk and clear buffer. DP-aware."""
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
-    if not _should_write_for_scope("pp_stage"):
+    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         _ROPE_BUFFER = None
         return
     try:
-        filename = f"rope_postqk{_pp_suffix()}.pt"
+        filename = f"rope_postqk{_pp_suffix()}{_dp_suffix()}.pt"
         torch.save(_ROPE_BUFFER, os.path.join(dump_dir, filename))
         _log.warning("%s saved (%d layers)", filename, len(_ROPE_BUFFER))
         _ROPE_BUFFER = None
@@ -334,14 +335,15 @@ def _flush_rope_buffer(dump_dir: str) -> None:
 
 
 def _flush_dict_buffer(filename: str, buffer: dict, dump_dir: str) -> None:
-    """rank0 torch.save a dict buffer. PP-aware gating + suffix."""
-    if not _should_write_for_scope("pp_stage"):
+    """torch.save a dict buffer. PP + DP-aware gating and suffix."""
+    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         return
     try:
         stem, separator, extension = filename.rpartition(".")
-        pp_suffix_str = _pp_suffix()
-        pp_filename = f"{stem}{pp_suffix_str}{separator}{extension}" if separator else f"{filename}{pp_suffix_str}"
-        torch.save(buffer, os.path.join(dump_dir, pp_filename))
+        suffix = f"{_pp_suffix()}{_dp_suffix()}"
+        suffixed_filename = f"{stem}{suffix}{separator}{extension}" if separator else f"{filename}{suffix}"
+        torch.save(buffer, os.path.join(dump_dir, suffixed_filename))
     except Exception as exc:
         print(f"[PS-diag] {filename} save failed: {exc}", flush=True)
 
@@ -527,6 +529,10 @@ def dump_rope_postqk_verl080(layer_number: int,
         return
     _add_to_rope_buffer(layer_number, rotated_query, rotated_key, positions)
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _ROPE_BUFFER is None or len(_ROPE_BUFFER) < num_layers:
+            _ROPE_BUFFER = None
+            return
         _flush_rope_buffer(dump_dir)
 
 
@@ -570,6 +576,10 @@ def dump_expanded_kv_on(layer_number: int, expanded_key: torch.Tensor,
         "value": expanded_value.detach().cpu().clone(),
     }
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _EXPANDED_KV_BUFFER is None or len(_EXPANDED_KV_BUFFER) < num_layers:
+            _EXPANDED_KV_BUFFER = None
+            return
         _flush_dict_buffer("expanded_kv.pt", _EXPANDED_KV_BUFFER, dump_dir)
         _EXPANDED_KV_BUFFER = None
 
@@ -609,6 +619,10 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
         _BUILD_KV_INPUT_V_BUFFER = {}
     _BUILD_KV_INPUT_V_BUFFER[layer_number] = value.detach().cpu().clone()
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _BUILD_KV_INPUT_V_BUFFER is None or len(_BUILD_KV_INPUT_V_BUFFER) < num_layers:
+            _BUILD_KV_INPUT_V_BUFFER = None
+            return
         _flush_dict_buffer("build_kv_input_v.pt", _BUILD_KV_INPUT_V_BUFFER, dump_dir)
         _BUILD_KV_INPUT_V_BUFFER = None
 
