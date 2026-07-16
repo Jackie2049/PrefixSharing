@@ -18,6 +18,30 @@
 | ⭐ | rStar-Math | Microsoft | [arxiv 2501.04519](rstar-math/paper.pdf) | [microsoft/rStar](https://github.com/microsoft/rStar) | MCTS 深度思考 → 天然前缀共享树 | 同涉及前缀复用概念 | MCTS 推理框架，前缀共享是自然产物；我们是显式的训练阶段 attention 优化 |
 | ⭐ | DeepSearch | — | [arxiv 2509.25454](deepsearch/paper.pdf) | 无公开代码 | MCTS 嵌入 RLVR 训练循环 → 搜索树前缀共享 | 同 RLVR 训练场景 | 搜索树层面；不涉及 packed attention / KV cache 等底层优化 |
 
+## 性能表现
+
+各方案的实验数据集、测试环境与性能数据总览。数据来源于各论文与代码仓库公布的实验结果，metrics 保留原文报告方式。
+
+| 方案 | 实验数据集 | 测试环境 | 速度性能 | 显存性能 |
+|------|----------|--------|---------|---------|
+| **PrefixGrouper (verl PR #4368)** | 未公开（GRPO math reasoning） | Qwen3-4B, 4×H800, rollout.n=4, FSDP2 | 4K ctx: update_actor **1.26×**, step **1.14×**; 8K ctx: update_actor **1.70×**, step **1.27×**; old_log_prob 4K: 1.30×, 8K: 1.56× | — |
+| **Prefix Sharing (美团)** | — | — | —（verl_prefix_share 分支，与 PR #4368 同源 CASIA PG 库，未公布独立性能数据） | — |
+| **PrefixGrouper (CASIA)** | — | — | —（论文提出算法框架，性能数据见 PR #4368 集成评测；理论加速比 ≈ N - (N-1)·P²/(P+S)²） | — |
+| **DTA (快手)** | [SWE-smith](https://github.com/swe-smith/SWE-smith) agentic RL rollouts + [Terminal Bench 2.0](https://github.com/terminalbench/terminalbench) | Qwen3-32B (dense) / Qwen3-30B-A3B (MoE), 64×H100, Megatron-Core | 端到端 **6.2–6.3×**（think-mode data），理论上限 6.5×，内存无限场景 **8.7×**; Terminal Bench 2.0 avg@4: **28.8** vs baseline 20.9 (38% gain) | 额外张量仅 **1.2 MB**（Qwen3-32B），峰值内存 = 单条 root-to-leaf path |
+| **AReaL DTA (蚂蚁)** | — | — | —（DTA 引擎代码已开源，DTA 模式下平行化走 ZeRO-1 朴素 DP，未公布独立性能 benchmark） | — |
+| **RFC #6401 (美团/SandAI)** | Dataset A: 浅层树 (depth=2, branch=2, seq~12.8k, ~50% shared); Dataset B: 深层树 (depth=16, branch=2, 512 leaves, ~69% saved) | H20, TP=4 (Megatron) | Dataset A: MAGI step **3.97s** (vs FA3 6.7s, **42% faster**); Dataset B: fwd **394ms / 3.02×** (8K), 851ms / **2.99×** (16K) | Dataset A: MAGI 86GB vs FA3 mbs=4 122GB (**30% less**); Dataset B: FA3 16K backward OOM, MAGI 正常完成 |
+| **Forge (MiniMax)** | 未公开 | 未公开 | 声称 **40×** 端到端加速（不可验证，无细节） | — |
+| **DualKV** | [LongReason](https://arxiv.org/abs/2502.20329)（Ling et al. 2025, 长上下文 math reasoning, prompt ≤8K, response ≤2K）+ [GSM8K](https://arxiv.org/abs/2110.14168)（短 prompt ~150t） | Qwen3-8B, 8×H100, FSDP2, N=32, mb/GPU=4/8 | GRPO: policy-update **1.63–2.09×**, step **1.48–1.64×**, MFU 36%→**76%**; DAPO: policy-update **2.47×**, MFU 31%→**77%** | DualKV mb=8: **93GB** vs FA2 mb=4: 106GB†（FA2 mb=8 OOM） |
+| | [GSM8K](https://arxiv.org/abs/2110.14168) + kernel microbenchmark | A100, P∈{4K–64K}, N∈{16,28}, R=2048 | kernel fwd+bwd: P=16K N=28 **3.88×**, P=32K N=16 **5.48×**, P=64K N=16 FA2 OOM DualKV 正常; PrefixGrouper 对照 2–4× faster, 3–5× less memory | P=64K N=16: FA2 OOM, DualKV **1,358ms**; memory reduction: P=16K **85%**, P=32K **86%** |
+| | Qwen3-30B-A3B (MoE), 16×H100, FSDP2, N=32, mb/GPU=8 | MoE: policy-update **3.82×**, old_log_prob **3.45×**, step **3.38×**; cost: 12.6h vs 42.6h (FA2 SP=4) | FA2 SP=4: 92GB†（SP=2 OOM）; DualKV SP=1: **103GB**†（† 含 CUDA graphs 缓存） |
+| | Llama-3.1-8B memory sweep, P∈{8K–96K}, 16×H100 | P=96K mb=4→16 仅增~4GB (**<5%**); FA2 需 225→775GB (超 10× 物理容量) | DualKV peak **~100GB** vs FA2 **225–775GB** |
+| **MagiAttention** | — | — | —（分布式 attention 后端，非前缀复用方案本身；作为 RFC #6401 的 attention backend 贡献其性能数据） | — |
+| **TreeRL** | [AIME 2024](https://artofproblemsolving.com/wiki/index.php/2024_AIME_I) / [OlympiadBench](https://github.com/OpenBMB/OlympiadBench) / GSM8K / MATH | Qwen2.5 / GLM | —（论文强调 on-policy tree search 训练框架，前缀共享是自然产物，未单独报告 prefix sharing 加速比） | — |
+| **rStar-Math** | [AIME](https://artofproblemsolving.com) / [AMC](https://artofproblemsolving.com) / [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) | Qwen2.5-Math 7B / Qwen2.5-7B | —（MCTS 推理框架，前缀共享为自然产物；训练阶段不直接复用前缀，为树形训练提供场景验证） | — |
+| **DeepSearch** | — | — | —（ICLR 2026，论文阶段，无公开代码） | — |
+
+*注：† 标记含 CUDA graphs 缓存占用；— 表示该方案未公布对应数据。Prefix Sharing (美团) 与 PrefixGrouper (verl PR #4368) 同源 CASIA PG 库，预计性能接近。*
+
 ## 子目录说明
 
 每个子目录包含：
