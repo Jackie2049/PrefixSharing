@@ -26,9 +26,9 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         # ##### [PS-diag] dump logits（ON/OFF 都 dump，必须在 original_fn 之前） #####
         # logits 形态 [N, V//tp]（或 [N,1,V//tp]），cmp_diag.cmp_logits_packed 会
         # reshape 成 token-major [N,V] 再用 cu_seqlens+prefix_lens 对齐。
-        import os as _os
-        _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
-        if _diag_on:
+        import os as _diag_os
+        diag_enabled = _diag_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+        if diag_enabled:
             from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
             dump_logits_verl080(logits)
         # ##### [PS-diag] dump logits end #####
@@ -50,21 +50,21 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
             logits_2d = logits.view(-1, logits.size(-1))
 
             # ##### [PS-diag] 验证 packed 坐标对齐（logits N 是 valid 还是 padded） #####
-            if _diag_on:
-                _layout = ctx.packed_batch_layout
+            if diag_enabled:
+                packed_layout = ctx.packed_batch_layout
                 print(
                     f"[PS-diag][packed-align] logits_N={logits_2d.shape[0]} "
-                    f"total_padded={_layout.total_padded_length} "
-                    f"total_valid={_layout.total_valid_length} "
-                    f"has_padding={_layout.has_padding}",
+                    f"total_padded={packed_layout.total_padded_length} "
+                    f"total_valid={packed_layout.total_valid_length} "
+                    f"has_padding={packed_layout.has_padding}",
                     flush=True,
                 )
-                for _idx in ctx.prefix_last_restore_indices:
+                for restore_index in ctx.prefix_last_restore_indices:
                     print(
-                        f"[PS-diag][packed-align] reuser={_idx.reuse_idx_in_batch} "
-                        f"provider={_idx.provider_idx_in_batch} "
-                        f"provider_1d_pos={_idx.provider_1d_pos} "
-                        f"target_2d_pos={_idx.target_2d_pos}",
+                        f"[PS-diag][packed-align] reuser={restore_index.reuse_idx_in_batch} "
+                        f"provider={restore_index.provider_idx_in_batch} "
+                        f"provider_1d_pos={restore_index.provider_1d_pos} "
+                        f"target_2d_pos={restore_index.target_2d_pos}",
                         flush=True,
                     )
             # ##### [PS-diag] 验证 packed 坐标对齐 end #####

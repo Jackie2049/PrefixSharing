@@ -10,7 +10,7 @@ Supports two dump modes:
 
 2. Positional encoding:
    - ``position_ids.pt``    — packed position ids [N]
-   - ``rope_emb.pt``        — per-layer RoPE encoding dict
+   - ``rope_postqk.pt``        — per-layer RoPE encoding dict
                               {layer_idx: {"query": rotated_q, "key": rotated_k}}
 
 3. 2D format:
@@ -39,8 +39,7 @@ _DUMP_DIR: str | None = None
 _META_SAVED: set[str] = set()       # saved metadata keys (dedup per key)
 _ATTN_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: tensor}
 _ROPE_BUFFER: dict[int, dict] | None = None           # {layer_idx: {"query": q, "key": k}}
-_ROPE_FREQS_ON_BUFFER: dict[int, torch.Tensor] | None = None   # {layer_idx: q_freqs per-token}
-_ROPE_FREQS_OFF_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: q_pos_emb table}
+_ROPE_FREQS_BUFFER: dict[int, torch.Tensor] | None = None      # {layer_idx: per-token RoPE 角度}
 
 
 def _get_dump_dir() -> str | None:
@@ -87,7 +86,15 @@ def _rank0_only() -> bool:
 # cmp_diag knows how to gather each tensor without guessing.
 
 _TENSOR_SCOPES: dict[str, str] = {
-    "logits": "tp_vocab",   # packed logits [N, V//tp] — vocab-sharded under TP
+    "logits": "tp_vocab",        # packed logits [N, V//tp] — vocab-sharded under TP
+    "attn_outputs": "pp_stage",  # per-layer attn output dict — PP-sharded
+    "rope_postqk": "pp_stage",   # per-layer post-RoPE Q/K dict — PP-sharded
+    "rope_preqk": "pp_stage",    # per-layer pre-RoPE Q/K dict — PP-sharded
+    "rope_freqs": "pp_stage",    # per-layer RoPE freqs dict — PP-sharded
+    "expanded_kv": "pp_stage",   # per-layer expanded KV dict — PP-sharded (ON only)
+    "full_kv": "pp_stage",       # per-layer full KV dict — PP-sharded (OFF only)
+    "build_kv_input_v": "pp_stage",  # per-layer V dict — PP-sharded
+    "hidden_states": "pp_stage", # per-layer hidden_states dict — PP-sharded
 }
 
 _PARALLEL_INFO_CACHE: Any = None
@@ -113,6 +120,63 @@ def _cached_parallel_info() -> Any:
     return _PARALLEL_INFO_CACHE
 
 
+def _stage_last_layer(num_layers_global: int) -> int:
+    """Return the last global layer number owned by the current PP stage.
+
+    Under PP, ``num_layers_global`` is split across stages.
+    Non-last stages never reach ``layer_number == num_layers_global``,
+    so the standard auto-flush condition silently drops their data.
+    This function computes the stage-local last layer so every stage
+    flushes independently.
+
+    Uniform split (standard Megatron):
+      layers_per_stage = num_layers // pp_size
+      remainder stages get 1 extra layer.
+    """
+    pi = _cached_parallel_info()
+    if pi is None or pi.pp_size <= 1:
+        return num_layers_global
+    base = num_layers_global // pi.pp_size
+    rem = num_layers_global % pi.pp_size
+    if pi.pp_rank < rem:
+        return (pi.pp_rank + 1) * (base + 1)
+    else:
+        return rem * (base + 1) + (pi.pp_rank - rem + 1) * base
+
+
+def _pp_suffix() -> str:
+    """Return ``'_pp{r}'`` when ``pp_size > 1``, else ``''``."""
+    pi = _cached_parallel_info()
+    if pi is not None and pi.pp_size > 1:
+        return f"_pp{pi.pp_rank}"
+    return ""
+
+
+def _should_write_for_scope(scope: str) -> bool:
+    """Return True if this rank should dump data for the given scope.
+
+    Gate logic:
+      - ``"global"``   → rank 0 only (all ranks have identical data)
+      - ``"tp_vocab"`` → every tp rank dumps (each has different shard)
+      - ``"pp_last"``  → tp_rank==0 on pp_last stage only
+      - ``"pp_stage"`` → tp_rank==0 within each PP stage
+    """
+    pi = _cached_parallel_info()
+    if scope == "global":
+        return _rank0_only()
+    if scope == "tp_vocab":
+        return True
+    if scope == "pp_last":
+        if pi is not None and not pi.is_pipeline_last_stage:
+            return False
+        return pi is None or pi.tp_rank == 0
+    if scope == "pp_stage":
+        if pi is None or pi.pp_size <= 1:
+            return _rank0_only()
+        return pi.tp_rank == 0
+    return _rank0_only()
+
+
 def _with_suffix(name: str, suffix: str) -> str:
     """Insert a rank suffix before the extension: logits.pt → logits_tp0.pt."""
     if not suffix:
@@ -131,7 +195,13 @@ def _ensure_manifest(dump_dir: str, pi: Any) -> None:
     if dump_dir in _MANIFEST_WRITTEN:
         return
     _MANIFEST_WRITTEN.add(dump_dir)
-    if not _rank0_only():
+    # Under PP, each stage is a separate process; allow tp_rank==0 on any
+    # PP stage to write the manifest (content is identical across stages).
+    # This prevents data loss if pp0's dump path is never reached.
+    if pi is not None and pi.pp_size > 1:
+        if pi.tp_rank != 0:
+            return
+    elif not _rank0_only():
         return
     import json
     manifest = {
@@ -159,21 +229,28 @@ def _save_tensor(name: str, tensor: torch.Tensor, dump_dir: str,
 
     See the ``_TENSOR_SCOPES`` block above for the scope semantics.  ``scope``
     defaults to ``"global"`` (rank-0-only, plain filename) so existing callers
-    are unchanged; per-rank tensors opt in via ``scope="tp_vocab"`` (etc.).
+    are unchanged; per-rank tensors opt in via ``scope="tp_vocab"`` / ``"pp_last"``
+    (etc.).
+
+    Gate logic (delegated to ``_should_write_for_scope``):
+      - ``"global"``   → rank 0 only
+      - ``"tp_vocab"`` → every tp rank dumps
+      - ``"pp_last"``  → tp_rank==0 on pp_last only
     """
     pi = _cached_parallel_info()
     _ensure_manifest(dump_dir, pi)
 
+    if not _should_write_for_scope(scope):
+        return False
+
+    # Determine filename suffix from scope
     if scope == "tp_vocab" and pi is not None and pi.tp_size > 1:
         # Every tp rank dumps its own vocab shard; no rank-0 gate, no comm.
         fname = _with_suffix(name, f"_tp{pi.tp_rank}")
     else:
-        # global scope, OR tp_vocab with tp_size==1 (single shard == full):
-        # rank-0 dumps once under the plain name (single-card compatible).
+        # global / pp_last / tp_vocab with tp_size==1: plain filename.
         if scope == "tp_vocab":
             scope = "global"  # tp==1 → behaves as global for logging
-        if not _rank0_only():
-            return False
         fname = name
     try:
         path = os.path.join(dump_dir, fname)
@@ -232,25 +309,31 @@ def _add_to_attn_buffer(layer_number: int, tensor: torch.Tensor) -> None:
 
 
 def _flush_attn_buffer(dump_dir: str) -> None:
-    """Write accumulated attn_outputs dict to disk and clear buffer."""
+    """Write accumulated attn_outputs dict to disk and clear buffer.
+
+    Under PP, each stage's tp_rank==0 writes with ``_pp{r}`` suffix;
+    assembly later merges all stage files.
+    """
     global _ATTN_BUFFER
     if _ATTN_BUFFER is None:
         return
-    if not _rank0_only():
+    if not _should_write_for_scope("pp_stage"):
         _ATTN_BUFFER = None
         return
     try:
         # Move every tensor to CPU (dict has no .detach()/.cpu()/.clone())
         moved = {k: v.detach().cpu().clone() for k, v in _ATTN_BUFFER.items()}
-        torch.save(moved, os.path.join(dump_dir, "attn_outputs.pt"))
-        _log.warning("attn_outputs.pt saved (%d layers)", len(moved))
+        fname = f"attn_outputs{_pp_suffix()}.pt"
+        torch.save(moved, os.path.join(dump_dir, fname))
+        _log.warning("%s saved (%d layers)", fname, len(moved))
         _ATTN_BUFFER = None
     except Exception as e:
         _log.warning("attn_outputs.pt save failed: %s", e)
 
 
 def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
-                        rotated_key: torch.Tensor) -> None:
+                        rotated_key: torch.Tensor,
+                        positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's RoPE encoding into the global buffer."""
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
@@ -258,79 +341,60 @@ def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
     _ROPE_BUFFER[layer_number] = {
         "query": rotated_query.detach().cpu().clone(),
         "key": rotated_key.detach().cpu().clone(),
+        "positions": positions.detach().cpu().clone() if positions is not None else None,
     }
 
 
 def _flush_rope_buffer(dump_dir: str) -> None:
-    """Write accumulated rope_emb dict to disk and clear buffer."""
+    """Write accumulated rope_postqk dict to disk and clear buffer.
+
+    Under PP, each stage's tp_rank==0 writes with ``_pp{r}`` suffix;
+    assembly later merges all stage files.
+    """
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
-    if not _rank0_only():
+    if not _should_write_for_scope("pp_stage"):
         _ROPE_BUFFER = None
         return
     try:
-        torch.save(_ROPE_BUFFER, os.path.join(dump_dir, "rope_emb.pt"))
-        _log.warning("rope_emb.pt saved (%d layers)", len(_ROPE_BUFFER))
+        fname = f"rope_postqk{_pp_suffix()}.pt"
+        torch.save(_ROPE_BUFFER, os.path.join(dump_dir, fname))
+        _log.warning("%s saved (%d layers)", fname, len(_ROPE_BUFFER))
         _ROPE_BUFFER = None
     except Exception as e:
-        _log.warning("rope_emb.pt save failed: %s", e)
+        _log.warning("rope_postqk.pt save failed: %s", e)
 
 
 # ── RoPE angle dump (pre-apply, per-layer) ──────────────────────
 
-def dump_rope_freqs_on(q_freqs: torch.Tensor, layer_number: int,
-                       num_layers: int) -> None:
-    """Accumulate ON-mode per-token RoPE angles. Auto-flush on last layer.
+def dump_rope_freqs(q_freqs: torch.Tensor, layer_number: int,
+                    num_layers: int) -> None:
+    """Accumulate per-token RoPE angles (ON/OFF 共用). Auto-flush on last layer.
 
-    ``q_freqs`` is the result of ``q_pos_emb.index_select(0, packed_position_ids)``
-    — shape [T_on, 1, 1, D], each token's actual rotation angles **before
-    cos/sin**.  Stored as ``rope_freqs_on.pt`` (dict {layer_idx: tensor}).
+    ``q_freqs`` = 每 token 实际旋转角度（cos/sin 之前），shape [T, 1, 1, D]。
+    ON 由 ``q_pos_emb.index_select(0, packed_position_ids)`` 得到；OFF 由 raw 表
+    按 cu_seqlens 切 per-token（每段 0..seg-1）得到。两边语义统一，写到各自 dump
+    目录的 ``rope_freqs.pt``，cmp 侧 suffix 对齐后比 max_diff（角度应精确相等）。
     """
-    global _ROPE_FREQS_ON_BUFFER
+    global _ROPE_FREQS_BUFFER
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    if _ROPE_FREQS_ON_BUFFER is None:
-        _ROPE_FREQS_ON_BUFFER = {}
-    _ROPE_FREQS_ON_BUFFER[layer_number] = q_freqs.detach().cpu().clone()
-    if layer_number == num_layers:
-        if _rank0_only():
+    if _ROPE_FREQS_BUFFER is None:
+        _ROPE_FREQS_BUFFER = {}
+    _ROPE_FREQS_BUFFER[layer_number] = q_freqs.detach().cpu().clone()
+    if layer_number == _stage_last_layer(num_layers):
+        if _should_write_for_scope("pp_stage"):
             try:
-                torch.save(_ROPE_FREQS_ON_BUFFER,
-                           os.path.join(dump_dir, "rope_freqs_on.pt"))
-                _log.warning("rope_freqs_on.pt saved (%d layers)",
-                             len(_ROPE_FREQS_ON_BUFFER))
+                fname = f"rope_freqs{_pp_suffix()}.pt"
+                torch.save(_ROPE_FREQS_BUFFER,
+                           os.path.join(dump_dir, fname))
+                _log.warning("%s saved (%d layers)",
+                             fname, len(_ROPE_FREQS_BUFFER))
             except Exception as e:
-                _log.warning("rope_freqs_on.pt save failed: %s", e)
-        _ROPE_FREQS_ON_BUFFER = None
-
-
-def dump_rope_freqs_off(q_pos_emb: torch.Tensor, layer_number: int,
-                        num_layers: int) -> None:
-    """Accumulate OFF-mode raw RoPE angle table. Auto-flush on last layer.
-
-    ``q_pos_emb`` is the raw angle table (before per-token slicing) —
-    shape [L0, 1, 1, D], where ``freqs[p] = p * inv_freq``.
-    Stored as ``rope_freqs_off.pt`` (dict {layer_idx: tensor}).
-    """
-    global _ROPE_FREQS_OFF_BUFFER
-    dump_dir = _get_dump_dir()
-    if dump_dir is None:
-        return
-    if _ROPE_FREQS_OFF_BUFFER is None:
-        _ROPE_FREQS_OFF_BUFFER = {}
-    _ROPE_FREQS_OFF_BUFFER[layer_number] = q_pos_emb.detach().cpu().clone()
-    if layer_number == num_layers:
-        if _rank0_only():
-            try:
-                torch.save(_ROPE_FREQS_OFF_BUFFER,
-                           os.path.join(dump_dir, "rope_freqs_off.pt"))
-                _log.warning("rope_freqs_off.pt saved (%d layers)",
-                             len(_ROPE_FREQS_OFF_BUFFER))
-            except Exception as e:
-                _log.warning("rope_freqs_off.pt save failed: %s", e)
-        _ROPE_FREQS_OFF_BUFFER = None
+                _log.warning("rope_freqs.pt save failed: %s", e)
+        _ROPE_FREQS_BUFFER = None
 
 
 # ── Position IDs dump ───────────────────────────────────────────
@@ -349,8 +413,9 @@ def dump_position_ids(position_ids: torch.Tensor) -> None:
 
 # ── RoPE encoding dump (per layer) ──────────────────────────────
 
-def dump_rope_emb_layer(layer_number: int, rotated_query: torch.Tensor,
-                        rotated_key: torch.Tensor, num_layers: int) -> None:
+def dump_rope_postqk_layer(layer_number: int, rotated_query: torch.Tensor,
+                        rotated_key: torch.Tensor, num_layers: int,
+                        positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE query/key. Auto-flush on last layer.
 
     Call after RoPE is applied in each attention layer, for both ON and OFF modes.
@@ -358,8 +423,8 @@ def dump_rope_emb_layer(layer_number: int, rotated_query: torch.Tensor,
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _add_to_rope_buffer(layer_number, rotated_query, rotated_key)
-    if layer_number == num_layers:
+    _add_to_rope_buffer(layer_number, rotated_query, rotated_key, positions)
+    if layer_number == _stage_last_layer(num_layers):
         _flush_rope_buffer(dump_dir)
 
 
@@ -389,8 +454,8 @@ def dump_attn_on(
         _save_meta(packed_seq_params, list(prefix_sharing_plan.prefix_lens),
                    dump_dir, meta_key="attn")
 
-    # Flush on last layer
-    if layer_number == num_layers:
+    # Flush on last layer of this PP stage
+    if layer_number == _stage_last_layer(num_layers):
         _flush_attn_buffer(dump_dir)
 
 
@@ -419,8 +484,8 @@ def dump_attn_off(
     if layer_number == 1:
         _save_meta(packed_seq_params, [0] * batch_size, dump_dir, meta_key="attn")
 
-    # Flush on last layer
-    if layer_number == num_layers:
+    # Flush on last layer of this PP stage
+    if layer_number == _stage_last_layer(num_layers):
         _flush_attn_buffer(dump_dir)
 
 

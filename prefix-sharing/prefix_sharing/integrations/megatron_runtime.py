@@ -106,6 +106,15 @@ def prefix_attention(
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
+            ##### [PS-diag] ON expanded K/V dump（build_kv 输出）#####
+    try:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_expanded_kv_on
+        dump_expanded_kv_on(layer_id, expanded_key, expanded_value,
+                            attention_module.config.num_layers)
+    except Exception as exc:
+        print(f"expanded_kv dump failed: {exc}", flush=True)
+            ##### [PS-diag] ON expanded K/V dump end #####
+
     # 注意力计算
     core_attn_out = attention_backend.attention(
         query,
@@ -119,15 +128,15 @@ def prefix_attention(
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
 
-    ######### prefix-sharing diag: ON attention_output (per-layer) #########
+            ##### [PS-diag] ON attention_output (per-layer) #####
     try:
         from prefix_sharing.tools.diagnostic_dump import dump_attn_on
         dump_attn_on(output[0], packed_seq_params, prefix_sharing_context.prefix_sharing_plan,
                      attention_module.layer_number,
                      attention_module.config.num_layers)
-    except Exception as e:
-        print(f"last-attn dump (ON) failed: {e}")
-    ######### prefix-sharing diag: ON attention_output (per-layer) #########
+    except Exception as exc:
+        print(f"last-attn dump (ON) failed: {exc}")
+            ##### [PS-diag] ON attention_output (per-layer) end #####
     # ---
 
     return output
@@ -173,6 +182,32 @@ def _apply_positioned_rope(
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
+
+        # ── [PS-diag] RoPE extrapolation: 验证相邻位置 step 是否恒定 ──
+        _layer = getattr(attention_module, 'layer_number', -1)
+        _num_extra = int(max_needed - q_pos_emb.shape[0])
+        _step_vals = step.detach().flatten()
+        # 关键诊断: step01 == step12 ? (pos_emb[p] 对 p 是否线性)
+        _step01_vs_step12_diff = None
+        if q_pos_emb.shape[0] >= 3:
+            _step12 = q_pos_emb[2:3, :, :, :dim_half] - q_pos_emb[1:2, :, :, :dim_half]
+            _step12_vals = _step12.detach().flatten()
+            _diff = (_step_vals - _step12_vals).abs()
+            _step01_vs_step12_diff = _diff.max().item()
+        _is_linear = (_step01_vs_step12_diff is not None and _step01_vs_step12_diff < 1e-8)
+        print(
+            f"[PS][RoPE-extrapolate-Q] layer={_layer} "
+            f"max_needed={max_needed} precomputed={q_pos_emb.shape[0]} extra={_num_extra} "
+            f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
+            f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
+            f"step01_vs_step12_maxdiff={_step01_vs_step12_diff} is_linear={_is_linear}",
+            flush=True,
+        )
+        # ── [PS-diag] end ──
+
+        # RoPE 具有线性性质：freqs[p] = p * inv_freq。
+        # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
+        # 从而生成缺失的高位置频率向量。
         extra_positions = torch.arange(
             q_pos_emb.shape[0], max_needed,
             device=q_pos_emb.device, dtype=q_pos_emb.dtype,
@@ -183,6 +218,28 @@ def _apply_positioned_rope(
     if k_pos_emb is not None and max_needed > k_pos_emb.shape[0]:
         dim_half = k_pos_emb.shape[-1] // 2
         step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
+
+        # ── [PS-diag] RoPE extrapolation: 验证相邻位置 step 是否恒定 ──
+        _layer = getattr(attention_module, 'layer_number', -1)
+        _num_extra = int(max_needed - k_pos_emb.shape[0])
+        _step_vals = step.detach().flatten()
+        _step01_vs_step12_diff = None
+        if k_pos_emb.shape[0] >= 3:
+            _step12 = k_pos_emb[2:3, :, :, :dim_half] - k_pos_emb[1:2, :, :, :dim_half]
+            _step12_vals = _step12.detach().flatten()
+            _diff = (_step_vals - _step12_vals).abs()
+            _step01_vs_step12_diff = _diff.max().item()
+        _is_linear = (_step01_vs_step12_diff is not None and _step01_vs_step12_diff < 1e-8)
+        print(
+            f"[PS][RoPE-extrapolate-K] layer={_layer} "
+            f"max_needed={max_needed} precomputed={k_pos_emb.shape[0]} extra={_num_extra} "
+            f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
+            f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
+            f"step01_vs_step12_maxdiff={_step01_vs_step12_diff} is_linear={_is_linear}",
+            flush=True,
+        )
+        # ── [PS-diag] end ──
+
         extra_positions = torch.arange(
             k_pos_emb.shape[0], max_needed,
             device=k_pos_emb.device, dtype=k_pos_emb.dtype,
@@ -190,6 +247,54 @@ def _apply_positioned_rope(
         extra_angles = extra_positions[:, None, None, None] * step
         extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
         k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
+
+    # ── [PS-diag] RoPE ground-truth probe ──
+    # 当 PREFIX_SHARING_DIAG_ROPE_GROUND_TRUTH=1 时，从 inv_freq 直接计算完整
+    # 频率表（跳过线性外推），用于验证外推是否引入数值偏差。
+    # 如果启用此开关后 ON vs OFF 结果一致，RoPE 外推就是根因。
+    import os as _os_gt
+    if _os_gt.environ.get("PREFIX_SHARING_DIAG_ROPE_GROUND_TRUTH"):
+        _layer_gt = getattr(attention_module, 'layer_number', -1)
+        # 尝试从 attention_module 获取 inv_freq
+        _inv_freq = None
+        _rotary_emb = getattr(attention_module, 'rotary_pos_emb', None)
+        if _rotary_emb is not None:
+            _inv_freq = getattr(_rotary_emb, 'inv_freq', None)
+        if _inv_freq is None:
+            # fallback: 从 config 读取 RoPE 参数
+            _cfg = attention_module.config
+            _dim = getattr(_cfg, 'hidden_size', 4096) // getattr(_cfg, 'num_attention_heads', 32)
+            _base = getattr(_cfg, 'rope_theta', 10000.0)
+            _inv_freq = 1.0 / (_base ** (torch.arange(
+                0, _dim, 2, device=q_pos_emb.device if q_pos_emb is not None
+                else k_pos_emb.device).float() / _dim))
+
+        _device = q_pos_emb.device if q_pos_emb is not None else k_pos_emb.device
+        _dtype = q_pos_emb.dtype if q_pos_emb is not None else k_pos_emb.dtype
+        _all_positions = torch.arange(0, max_needed, device=_device, dtype=torch.float)
+        _freqs = torch.outer(_all_positions, _inv_freq.to(_device).float())  # [max_needed, dim/2]
+        _emb_gt = torch.cat([_freqs, _freqs], dim=-1)  # [max_needed, dim]
+        # reshape 匹配 pos_emb 维度 [max_needed, 1, 1, dim]
+        _emb_gt = _emb_gt.unsqueeze(1).unsqueeze(1).to(_dtype)
+
+        _extra_old = max(0, int(max_needed - (
+            q_pos_emb.shape[0] if q_pos_emb is not None else max_needed)))
+        _is_q_truncated = q_pos_emb is not None and q_pos_emb.shape[0] < max_needed
+        _is_k_truncated = k_pos_emb is not None and k_pos_emb.shape[0] < max_needed
+
+        if q_pos_emb is not None:
+            q_pos_emb = _emb_gt
+        if k_pos_emb is not None:
+            k_pos_emb = _emb_gt
+
+        print(
+            f"[PS][RoPE-ground-truth] layer={_layer_gt} "
+            f"max_needed={max_needed} emb_shape={_emb_gt.shape} "
+            f"was_extrapolated_q={_is_q_truncated} was_extrapolated_k={_is_k_truncated} "
+            f"old_extra_count={_extra_old}",
+            flush=True,
+        )
+    # ── [PS-diag] end ──
 
     # Build kwargs for apply_rotary_pos_emb.
     # Only include version-specific params when they're provided,
@@ -210,14 +315,14 @@ def _apply_positioned_rope(
 
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
-        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
+                ##### [PS-diag] ON rope_freqs (per-layer) #####
         try:
-            from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs_on
-            dump_rope_freqs_on(q_freqs, attention_module.layer_number,
+            from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs
+            dump_rope_freqs(q_freqs, attention_module.layer_number,
                                attention_module.config.num_layers)
-        except Exception as e:
-            print(f"rope_freqs_on dump failed: {e}")
-        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
+        except Exception as exc:
+            print(f"rope_freqs dump failed: {exc}")
+                ##### [PS-diag] ON rope_freqs (per-layer) end #####
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
             q_freqs,
@@ -230,6 +335,20 @@ def _apply_positioned_rope(
             k_freqs,
             **_rope_kwargs(cu_seqlens_kv),
         ).squeeze(1)
+
+    ##### [PS-diag] ON post-RoPE Q/K dump (per-layer) #####
+    try:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_postqk_verl080
+        dump_rope_postqk_verl080(
+            attention_module.layer_number,
+            query, key,
+            attention_module.config.num_layers,
+            positions=packed_position_ids,
+        )
+    except Exception as exc:
+        print(f"rope_postqk_layer dump failed: {exc}")
+    ##### [PS-diag] ON post-RoPE Q/K dump end #####
+
     return query, key
 
 

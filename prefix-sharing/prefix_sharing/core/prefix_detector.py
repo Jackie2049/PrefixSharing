@@ -180,6 +180,20 @@ class TriePrefixDetector(PrefixDetector):
         group_key_to_id: dict[tuple[int, int], int] = {}
         group_members: dict[int, list[int]] = {}
 
+        # 诊断开关：跳过 trie 检测，直接返回 0-prefix（所有序列当 provider，无复用）。
+        # 用法见 PREFIX_SHARING_FORCE_ZERO_PREFIX 说明（配合 build 层的 has_sharing 旁路）。
+        import os as _os
+        if _os.environ.get("PREFIX_SHARING_FORCE_ZERO_PREFIX"):
+            return PrefixDetectionResult(
+                batch_size=batch_size,
+                reuse_specs=(),
+                groups=(),
+                group_ids=tuple(group_ids),
+                provider_index=tuple(provider_index),
+                prefix_lens=tuple(prefix_lens),
+                is_provider=tuple(is_provider),
+            )
+
         for index, seq in enumerate(input_ids):
             node = root
             matched = 0

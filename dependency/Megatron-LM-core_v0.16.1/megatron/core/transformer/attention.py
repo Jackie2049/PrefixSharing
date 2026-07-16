@@ -1069,6 +1069,23 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
+        # ##### [PS-diag] OFF pre-RoPE Q/K/V dump（侵入式，post-squeeze、pre-RoPE）#####
+        import os as _ps_os
+        if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            try:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    dump_rope_preqk_verl080, dump_build_kv_input_v_on, dump_hidden_states_on,
+                )
+                dump_rope_preqk_verl080(self.layer_number, query, key,
+                                        self.config.num_layers)
+                dump_build_kv_input_v_on(self.layer_number, value,
+                                         self.config.num_layers)
+                dump_hidden_states_on(self.layer_number, hidden_states,
+                                      self.config.num_layers)
+            except Exception as exc:
+                print(f"[PS-diag] OFF preqkv dump failed: {exc}", flush=True)
+        # ##### [PS-diag] OFF pre-RoPE Q/K/V dump end #####
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
@@ -1125,6 +1142,20 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # ##### [PS-diag] OFF post-RoPE Q/K + full_kv dump（侵入式，rotary block 之后）#####
+        if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            try:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    dump_rope_postqk_verl080, dump_full_kv_off,
+                )
+                dump_rope_postqk_verl080(self.layer_number, query, key,
+                                         self.config.num_layers)
+                dump_full_kv_off(self.layer_number, key, value,
+                                 self.config.num_layers)
+            except Exception as exc:
+                print(f"[PS-diag] OFF postqk/full_kv dump failed: {exc}", flush=True)
+        # ##### [PS-diag] OFF post-RoPE Q/K + full_kv dump end #####
 
         # ==================================
         # core attention computation

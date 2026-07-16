@@ -20,19 +20,19 @@ def get_backend_instance(
     """
     if backend is not None:
         return backend
-    
+
     if config.backend == "torch_ref":
         from prefix_sharing.backends.torch_ref import TorchReferenceBackend
         return TorchReferenceBackend()
-    
+
     if config.backend == "flash_atten_gpu":
         from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
         return GpuFlashAttentionBackend()
-    
+
     if config.backend == "flash_atten_npu":
         from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
         return NpuFlashAttentionBackend()
-    
+
     raise ValueError(
         f"Unknown backend '{config.backend}'. "
         f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"

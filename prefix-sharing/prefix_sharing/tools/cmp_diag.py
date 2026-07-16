@@ -200,7 +200,7 @@ def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
             "cos": cos, "pearson": pr}
 
 
-def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
+def _logits_first_token(logits_on: torch.Tensor, logits_off: torch.Tensor
                         ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Extract first token's full-vocab vector from ON/OFF logits.
 
@@ -209,21 +209,21 @@ def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
     output_layer → [S, B, V//tp] → model returns [B, S, V//tp]).
     """
     # Flatten all leading batch/token dims into N, keep V as last dim
-    lo_2d = lo.reshape(-1, lo.size(-1))
-    lf_2d = lf.reshape(-1, lf.size(-1))
+    on_flat = logits_on.reshape(-1, logits_on.size(-1))
+    off_flat = logits_off.reshape(-1, logits_off.size(-1))
     # First token = first row → full-vocab vector [V]
-    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+    return on_flat[0, :].contiguous(), off_flat[0, :].contiguous()
 
 
-def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+def _logits_ensure_token_major(logits_on: torch.Tensor, logits_off: torch.Tensor
                                ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ensure logits are 2D [N, V] for packed alignment.
 
     Vocab is always the last dim (verified from Megatron model forward).
     Batch dim on leading axes is flattened into N.
     """
-    return (lo.reshape(-1, lo.size(-1)).contiguous(),
-            lf.reshape(-1, lf.size(-1)).contiguous())
+    return (logits_on.reshape(-1, logits_on.size(-1)).contiguous(),
+            logits_off.reshape(-1, logits_off.size(-1)).contiguous())
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -231,30 +231,30 @@ def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
 # ══════════════════════════════════════════════════════════════════
 
 def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
-    fp = os.path.join(dir_path, filename)
-    return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
+    filepath = os.path.join(dir_path, filename)
+    return torch.load(filepath, weights_only=True).float() if os.path.exists(filepath) else None
 
 
 def _load_packed_meta(dir_path: str,
                       cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
-    fp = os.path.join(dir_path, cu_fname)
-    if not os.path.exists(fp):
-        fp = os.path.join(dir_path, "cu_seqlens_q.pt")
-        if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, cu_fname)
+    if not os.path.exists(filepath):
+        filepath = os.path.join(dir_path, "cu_seqlens_q.pt")
+        if not os.path.exists(filepath):
             return None
-    pl_fp = os.path.join(dir_path, "prefix_lens.pt")
-    if not os.path.exists(pl_fp):
+    prefix_lens_filepath = os.path.join(dir_path, "prefix_lens.pt")
+    if not os.path.exists(prefix_lens_filepath):
         return None
-    return {"cu_seqlens": torch.load(fp, weights_only=True),
-            "prefix_lens": torch.load(pl_fp, weights_only=True)}
+    return {"cu_seqlens": torch.load(filepath, weights_only=True),
+            "prefix_lens": torch.load(prefix_lens_filepath, weights_only=True)}
 
 
 def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
     """Load a single layer's attn_output from attn_outputs.pt dict."""
-    fp = os.path.join(dir_path, "attn_outputs.pt")
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(filepath):
         return None
-    d = torch.load(fp, weights_only=True)
+    d = torch.load(filepath, weights_only=True)
     return d.get(layer) if isinstance(d, dict) else None
 
 
@@ -270,17 +270,17 @@ def _load_attention_mask_2d(dir_path: str) -> torch.Tensor | None:
     runs).  ON mask is a strict subset of OFF mask per row, which
     ``_build_alignment_mask_from_2d`` relies on.
     """
-    fp = os.path.join(dir_path, "attention_mask.pt")
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, "attention_mask.pt")
+    if not os.path.exists(filepath):
         return None
-    return torch.load(fp, weights_only=True).to(torch.bool)
+    return torch.load(filepath, weights_only=True).to(torch.bool)
 
 
 def _get_num_layers(dir_path: str) -> int:
-    fp = os.path.join(dir_path, "attn_outputs.pt")
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(filepath):
         return 0
-    d = torch.load(fp, weights_only=True)
+    d = torch.load(filepath, weights_only=True)
     return max(d.keys()) if isinstance(d, dict) and d else 0
 
 
@@ -386,25 +386,111 @@ def cmp_position_ids(dir_a: str, dir_b: str) -> CheckResult | None:
 #  2. RoPE encoding — absolute equality
 # ══════════════════════════════════════════════════════════════════
 
-def cmp_rope_emb(dir_a: str, dir_b: str) -> CheckResult | None:
-    fa = os.path.join(dir_a, "rope_emb.pt")
-    fb = os.path.join(dir_b, "rope_emb.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+def cmp_rope_postqk(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare post-RoPE Q/K between ON and OFF, aligned by position IDs.
+
+    ON  positions are absolute (preserved from original input).
+    OFF positions are per-segment relative (0..L-1 for each row).
+
+    Comparison strategy:
+    1. First packed token (row 0, pos 0): always a provider, must match exactly.
+    2. Within the first row: match tokens by position ID (0..L-1 for both paths).
+    3. For reuser rows: ON uses absolute positions (prefix_len..), OFF uses
+       relative (0..).  Positions differ by design — skip direct comparison.
+    """
+    filepath_on = os.path.join(dir_on, "rope_postqk.pt")
+    filepath_off = os.path.join(dir_off, "rope_postqk.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    a = torch.load(fa, weights_only=True)
-    b = torch.load(fb, weights_only=True)
+    a = torch.load(filepath_on, weights_only=True)
+    b = torch.load(filepath_off, weights_only=True)
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    la, lb = set(a.keys()), set(b.keys())
-    if la != lb:
-        return CheckResult(name="rope_emb", passed=False,
+    layers_on, layers_off =set(a.keys()), set(b.keys())
+    if layers_on != layers_off:
+        return CheckResult(name="rope_postqk", passed=False,
                            metrics={"error": "layer set mismatch"})
-    md = 0.0
-    for lyr in sorted(la):
-        for k in ("query", "key"):
-            md = max(md, float((a[lyr][k] - b[lyr][k]).abs().max()))
-    return CheckResult(name="rope_emb", passed=md == 0.0,
-                       metrics={"max_diff": md, "num_layers": len(la)})
+
+    max_diff_q = 0.0
+    max_diff_k = 0.0
+    first_token_q_diff = 0.0
+    first_token_k_diff = 0.0
+    first_row_q_diff = 0.0
+    first_row_k_diff = 0.0
+    first_row_len = 0
+    num_layers = len(layers_on)
+
+    for layer_idx in sorted(layers_on):
+        on_entry = a[layer_idx]
+        off_entry = b[layer_idx]
+        on_q, on_k = on_entry["query"], on_entry["key"]
+        off_q, off_k = off_entry["query"], off_entry["key"]
+        on_pos = on_entry.get("positions")
+        off_pos = off_entry.get("positions")
+
+        # ── Check 1: first packed token (row 0, position 0) ──
+        first_token_q_diff = max(first_token_q_diff,
+                                 float((on_q[0] - off_q[0]).abs().max()))
+        first_token_k_diff = max(first_token_k_diff,
+                                 float((on_k[0] - off_k[0]).abs().max()))
+
+        # ── Check 2: first row — match by ON position IDs ──
+        if on_pos is not None and off_pos is not None:
+            on_pos_t = on_pos.long()
+            off_pos_t = off_pos.long()
+            # Find first-row extent in ON: tokens before the first position reset
+            # (position decreases or jumps to prefix_start)
+            on_row1_end = 1
+            for j in range(1, len(on_pos_t)):
+                if on_pos_t[j] <= on_pos_t[j - 1]:
+                    break
+                on_row1_end = j + 1
+            on_row1_len = on_row1_end  # positions 0..L-1
+
+            # First row in OFF: positions go 0..L-1 (find matching extent)
+            off_row1_end = 1
+            for j in range(1, len(off_pos_t)):
+                if off_pos_t[j] <= off_pos_t[j - 1]:
+                    break
+                off_row1_end = j + 1
+            off_row1_len = off_row1_end
+
+            compare_length = min(on_row1_len, off_row1_len)
+            if compare_length > 0:
+                first_row_len = max(first_row_len, compare_length)
+                # Match by position ID within the first row
+                for position_id in range(compare_length):
+                    on_index = position_id  # ON row 1 starts at packed index 0
+                    off_index = position_id  # OFF row 1 starts at packed index 0
+                    first_row_q_diff = max(first_row_q_diff,
+                        float((on_q[on_index] - off_q[off_index]).abs().max()))
+                    first_row_k_diff = max(first_row_k_diff,
+                        float((on_k[on_index] - off_k[off_index]).abs().max()))
+                max_diff_q = max(max_diff_q, first_row_q_diff)
+                max_diff_k = max(max_diff_k, first_row_k_diff)
+        else:
+            # Fallback: no positions available, compare first row by direct offset
+            compare_length = min(on_q.shape[0], off_q.shape[0], 128)
+            first_row_len = compare_length
+            first_row_q_diff = float((on_q[:compare_length] - off_q[:compare_length]).abs().max())
+            first_row_k_diff = float((on_k[:compare_length] - off_k[:compare_length]).abs().max())
+            max_diff_q = first_row_q_diff
+            max_diff_k = first_row_k_diff
+
+    # Pass if all diffs are near zero
+    threshold = 1e-7
+    passed = (first_token_q_diff < threshold and first_token_k_diff < threshold
+              and first_row_q_diff < threshold and first_row_k_diff < threshold)
+    return CheckResult(name="rope_postqk", passed=passed, metrics={
+        "num_layers": num_layers,
+        "first_row_len": first_row_len,
+        "first_token_q_maxdiff": first_token_q_diff,
+        "first_token_k_maxdiff": first_token_k_diff,
+        "first_row_q_maxdiff": first_row_q_diff,
+        "first_row_k_maxdiff": first_row_k_diff,
+        "max_diff_q": max_diff_q,
+        "max_diff_k": max_diff_k,
+    })
 
 
 def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
@@ -419,40 +505,40 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
     The two are aligned to suffix-only via the same attention_mask dual-pointer
     logic used for attn_outputs / logits.
     """
-    fa = os.path.join(dir_on, "rope_freqs_on.pt")
-    fb = os.path.join(dir_off, "rope_freqs_off.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "rope_freqs_on.pt")
+    filepath_off = os.path.join(dir_off, "rope_freqs_off.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
 
-    la, lb = set(on_dict.keys()), set(off_dict.keys())
-    if la != lb:
+    layers_on, layers_off =set(on_dict.keys()), set(off_dict.keys())
+    if layers_on != layers_off:
         return CheckResult(name="rope_freqs", passed=False,
                            metrics={"error": "layer set mismatch",
-                                    "on_layers": sorted(la),
-                                    "off_layers": sorted(lb)})
+                                    "on_layers": sorted(layers_on),
+                                    "off_layers": sorted(layers_off)})
 
     # Load OFF metadata for per-token reconstruction + alignment
-    mb = _load_packed_meta(dir_off)
-    if mb is None:
+    meta_off = _load_packed_meta(dir_off)
+    if meta_off is None:
         return CheckResult(name="rope_freqs", passed=False,
                            metrics={"error": "OFF cu_seqlens missing"})
-    cu_off = mb["cu_seqlens"]
+    cu_off = meta_off["cu_seqlens"]
     T_off = int(cu_off[-1]) if cu_off.numel() > 0 else 0
 
     # Build alignment mask (prefer 2D attention_mask)
     mask_on_2d = _load_attention_mask_2d(dir_on)
     mask_off_2d = _load_attention_mask_2d(dir_off)
-    ma = _load_packed_meta(dir_on)
+    meta_on = _load_packed_meta(dir_on)
     if mask_on_2d is not None and mask_off_2d is not None:
         align_mask = _build_alignment_mask_from_2d(
             mask_on_2d, mask_off_2d, cu_off, T_off)
-    elif ma is not None:
+    elif meta_on is not None:
         align_mask = _build_alignment_mask(
-            cu_off, ma["prefix_lens"], T_off)
+            cu_off, meta_on["prefix_lens"], T_off)
     else:
         return CheckResult(name="rope_freqs", passed=False,
                            metrics={"error": "cannot build alignment mask"})
@@ -462,18 +548,18 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
 
     max_diff = 0.0
     mismatches: list[dict] = []  # [{layer, token_idx, dim, on_val, off_val, diff}]
-    for lyr in sorted(la):
-        on_freqs = on_dict[lyr]                          # [T_on, 1, 1, D]
+    for layer_idx in sorted(layers_on):
+        on_freqs = on_dict[layer_idx]                          # [T_on, 1, 1, D]
         # Reconstruct OFF per-token for this layer
         off_freqs = torch.cat(
-            [off_dict[lyr][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
+            [off_dict[layer_idx][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
 
         try:
             on_aligned, off_aligned = _align_packed(
                 on_freqs, off_freqs, align_mask)
         except ValueError as e:
             return CheckResult(name="rope_freqs", passed=False,
-                               metrics={"error": f"align failed L{lyr}: {e}"})
+                               metrics={"error": f"align failed L{layer_idx}: {e}"})
 
         diff = (on_aligned - off_aligned).abs()                # [N, 1, 1, D]
         md = float(diff.max())
@@ -487,7 +573,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
                 t = int(t)
                 d = int(token_diff.indices[t])
                 mismatches.append({
-                    "layer": lyr,
+                    "layer": layer_idx,
                     "token_idx": t,
                     "dim": d,
                     "on_val": float(on_aligned[t, 0, 0, d]),
@@ -495,7 +581,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
                     "diff": float(token_diff.values[t]),
                 })
 
-    metrics: dict = {"max_diff": max_diff, "num_layers": len(la)}
+    metrics: dict = {"max_diff": max_diff, "num_layers": len(layers_on)}
     if mismatches:
         metrics["mismatches"] = mismatches[:20]  # cap to top 20
         metrics["total_mismatches"] = len(mismatches)
@@ -515,7 +601,7 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
     extract the matching suffix region from OFF before comparison.
     """
 
-    def _cos_for_layer(a, b, lyr, need_align, align_mask):
+    def _cos_for_layer(a, b, layer_idx, need_align, align_mask):
         if a.dim() == 3:
             a, b = a.squeeze(1), b.squeeze(1)
         if need_align and a.shape[0] != b.shape[0]:
@@ -534,46 +620,46 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
         b = _load_attn_output(dir_off, layer)
         if a is None or b is None:
             return None
-        ma = _load_packed_meta(dir_on)
+        meta_on = _load_packed_meta(dir_on)
         align_mask = None
-        need_align = (ma is not None and a.shape[0] != b.shape[0])
+        need_align = (meta_on is not None and a.shape[0] != b.shape[0])
         if need_align:
-            mb = _load_packed_meta(dir_off)
-            T = int(mb["cu_seqlens"][-1]) if mb and mb["cu_seqlens"].numel() > 0 else b.shape[0]
+            meta_off = _load_packed_meta(dir_off)
+            T = int(meta_off["cu_seqlens"][-1]) if meta_off and meta_off["cu_seqlens"].numel() > 0 else b.shape[0]
             # Prefer 2D attention_mask.pt for exact suffix alignment (dp aligned)
             mask_on_2d = _load_attention_mask_2d(dir_on)
             mask_off_2d = _load_attention_mask_2d(dir_off)
-            if mask_on_2d is not None and mask_off_2d is not None and mb is not None:
+            if mask_on_2d is not None and mask_off_2d is not None and meta_off is not None:
                 align_mask = _build_alignment_mask_from_2d(
-                    mask_on_2d, mask_off_2d, mb["cu_seqlens"], T)
+                    mask_on_2d, mask_off_2d, meta_off["cu_seqlens"], T)
             else:
                 align_mask = _build_alignment_mask(
-                    mb["cu_seqlens"], ma["prefix_lens"], T)
+                    meta_off["cu_seqlens"], meta_on["prefix_lens"], T)
         d = _cos_for_layer(a, b, layer, need_align, align_mask)
         d["layer"] = layer
         return d
 
     # All-layers mode
-    fa = os.path.join(dir_on, "attn_outputs.pt")
-    fb = os.path.join(dir_off, "attn_outputs.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "attn_outputs.pt")
+    filepath_off = os.path.join(dir_off, "attn_outputs.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    da = torch.load(fa, weights_only=True)
-    db = torch.load(fb, weights_only=True)
-    if not isinstance(da, dict) or not isinstance(db, dict):
+    attn_dict_on = torch.load(filepath_on, weights_only=True)
+    attn_dict_off = torch.load(filepath_off, weights_only=True)
+    if not isinstance(attn_dict_on, dict) or not isinstance(attn_dict_off, dict):
         return None
 
     # Build alignment mask once from ON metadata
-    ma = _load_packed_meta(dir_on)
+    meta_on = _load_packed_meta(dir_on)
     align_mask = None
     need_align = False
-    if ma is not None:
-        mb = _load_packed_meta(dir_off)
-        T = int(mb["cu_seqlens"][-1]) if mb and mb["cu_seqlens"].numel() > 0 else 0
+    if meta_on is not None:
+        meta_off = _load_packed_meta(dir_off)
+        T = int(meta_off["cu_seqlens"][-1]) if meta_off and meta_off["cu_seqlens"].numel() > 0 else 0
         if T > 0:
             # Check if any layer has shape mismatch
-            for lyr in da:
-                if lyr in db and da[lyr].shape != db[lyr].shape:
+            for layer_idx in attn_dict_on:
+                if layer_idx in attn_dict_off and attn_dict_on[layer_idx].shape != attn_dict_off[layer_idx].shape:
                     need_align = True
                     break
             if need_align:
@@ -582,14 +668,14 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
                 mask_off_2d = _load_attention_mask_2d(dir_off)
                 if mask_on_2d is not None and mask_off_2d is not None:
                     align_mask = _build_alignment_mask_from_2d(
-                        mask_on_2d, mask_off_2d, mb["cu_seqlens"], T)
+                        mask_on_2d, mask_off_2d, meta_off["cu_seqlens"], T)
                 else:
                     align_mask = _build_alignment_mask(
-                        mb["cu_seqlens"], ma["prefix_lens"], T)
+                        meta_off["cu_seqlens"], meta_on["prefix_lens"], T)
 
     results = {}
-    for lyr in sorted(set(da.keys()) & set(db.keys())):
-        results[lyr] = _cos_for_layer(da[lyr], db[lyr], lyr, need_align, align_mask)
+    for layer_idx in sorted(set(attn_dict_on.keys()) & set(attn_dict_off.keys())):
+        results[layer_idx] = _cos_for_layer(attn_dict_on[layer_idx], attn_dict_off[layer_idx], layer_idx, need_align, align_mask)
     return results
 
 
@@ -599,8 +685,8 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
     if r is None:
         return None
     if "cos_avg" in r:
-        lyr = r["layer"]
-        return CheckResult(name=f"attn_L{lyr}",
+        layer_idx = r["layer"]
+        return CheckResult(name=f"attn_L{layer_idx}",
                            passed=r["cos_avg"] > 0.9999 and r["cos_min"] > 0.999,
                            metrics=r)
     return CheckResult(name="attn_per_layer", passed=True,
@@ -625,22 +711,22 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
         a = _load_attn_output(dir_on, last)
         b = _load_attn_output(dir_off, last)
         if a is not None and b is not None:
-            a0 = a.squeeze(1) if a.dim() == 3 else a
-            b0 = b.squeeze(1) if b.dim() == 3 else b
-            ft = _first_token_metrics(a0[0], b0[0])
-            results.append(CheckResult(name="first_token_attn", metrics=ft))
+            on_token0 = a.squeeze(1) if a.dim() == 3 else a
+            off_token0 = b.squeeze(1) if b.dim() == 3 else b
+            metrics = _first_token_metrics(on_token0[0], off_token0[0])
+            results.append(CheckResult(name="first_token_attn", metrics=metrics))
 
     # logits — packed[0], auto-detect [N,V] vs [V,N] format
-    lo = _load_tensor(dir_on,  "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
-    if lo is not None and lf is not None:
-        lo_first, lf_first = _logits_first_token(lo, lf)
-        if lo_first is not None:
-            ft = _first_token_metrics(lo_first, lf_first)
-            results.append(CheckResult(name="first_token_logits", metrics=ft))
+    logits_on = _load_tensor(dir_on,  "logits.pt")
+    logits_off = _load_tensor(dir_off, "logits.pt")
+    if logits_on is not None and logits_off is not None:
+        logits_on_first, logits_off_first = _logits_first_token(logits_on, logits_off)
+        if logits_on_first is not None:
+            metrics = _first_token_metrics(logits_on_first, logits_off_first)
+            results.append(CheckResult(name="first_token_logits", metrics=metrics))
         else:
             _log.warning("first_token_logits skipped: cannot determine token dim "
-                         "(ON %s, OFF %s)", _fmt_shape(lo.shape), _fmt_shape(lf.shape))
+                         "(ON %s, OFF %s)", _fmt_shape(logits_on.shape), _fmt_shape(logits_off.shape))
 
     return results
 
@@ -656,22 +742,22 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     with OFF (full-sequence) logits, same alignment logic as attn_output
     per-layer comparison.
     """
-    lo = _load_tensor(dir_on,  "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
-    if lo is None or lf is None:
+    logits_on = _load_tensor(dir_on,  "logits.pt")
+    logits_off = _load_tensor(dir_off, "logits.pt")
+    if logits_on is None or logits_off is None:
         return None
 
     # Logits may be [N,V] or [V,N] — ensure token-major [N,V] for alignment
-    lo, lf = _logits_ensure_token_major(lo, lf)
+    logits_on, logits_off = _logits_ensure_token_major(logits_on, logits_off)
 
     # Metadata for logits uses cu_seqlens_q_logits.pt
-    ma = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
-    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
-    if ma is None or mb is None:
+    meta_on = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
+    meta_off = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if meta_on is None or meta_off is None:
         return None
 
-    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
-    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+    total_off_tokens = int(meta_off["cu_seqlens"][-1]) if meta_off["cu_seqlens"].numel() > 0 else 0
+    if total_off_tokens == 0 or logits_on.shape[0] == 0 or logits_off.shape[0] == 0:
         return None
 
     # Build alignment mask (same logic as attn_output all-layers)
@@ -679,19 +765,19 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     mask_off_2d = _load_attention_mask_2d(dir_off)
     if mask_on_2d is not None and mask_off_2d is not None:
         align_mask = _build_alignment_mask_from_2d(
-            mask_on_2d, mask_off_2d, mb["cu_seqlens"], T_off)
+            mask_on_2d, mask_off_2d, meta_off["cu_seqlens"], total_off_tokens)
     else:
         align_mask = _build_alignment_mask(
-            mb["cu_seqlens"], ma["prefix_lens"], T_off)
+            meta_off["cu_seqlens"], meta_on["prefix_lens"], total_off_tokens)
 
     # Align: extract suffix-only region from OFF
     try:
-        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+        on_aligned, off_aligned = _align_packed(logits_on, logits_off, align_mask)
     except ValueError as e:
         return CheckResult(name="logits", passed=False,
                            metrics={"error": str(e),
-                                    "n_on": lo.shape[0],
-                                    "n_off": lf.shape[0]})
+                                    "n_on": logits_on.shape[0],
+                                    "n_off": logits_off.shape[0]})
 
     n_tokens = on_aligned.shape[0]
 
@@ -775,7 +861,7 @@ def _print_pos_ids(r: CheckResult):
 
 
 def _print_rope(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [rope_emb]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE + f"\n  [rope_postqk]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
     print(_SEP_SINGLE)
     m = r.metrics
     if "error" in m:
@@ -818,13 +904,13 @@ def _print_per_layer(r: CheckResult):
         print(f"  {'LAYER':>6s}  {'COS_AVG':>14s}  {'COS_MIN':>14s}  {'TOKENS':>8s}  {'STATUS':>8s}")
         print(f"  {'─'*6}  {'─'*14}  {'─'*14}  {'─'*8}  {'─'*8}")
         bad = []
-        for lyr in sorted(layers.keys()):
-            d = layers[lyr]
+        for layer_idx in sorted(layers.keys()):
+            d = layers[layer_idx]
             ok = d["cos_avg"] > 0.9999 and d["cos_min"] > 0.999
-            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
+            print(f"  {layer_idx:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
-                bad.append(lyr)
+                bad.append(layer_idx)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
     elif "cos_avg" in r.metrics:
@@ -1024,7 +1110,7 @@ def main():
 
     # ── ②b RoPE encoding (post-apply rotated Q/K) ──
     if not stop:
-        r = cmp_rope_emb(args.dir_on, args.dir_off)
+        r = cmp_rope_postqk(args.dir_on, args.dir_off)
         if r:
             all_results.append(r)
             _print_rope(r)
@@ -1052,20 +1138,20 @@ def main():
                 a = _load_attn_output(args.dir_on, last)
                 b = _load_attn_output(args.dir_off, last)
                 if a is not None and b is not None:
-                    a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
-                    b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
-                    _print_topk_vec(a0, b0, args.topk, "val",
+                    on_token0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
+                    off_token0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
+                    _print_topk_vec(on_token0, off_token0, args.topk, "val",
                                     "first_token_attn")
             # first_token_logits — per-dim top-K (real = ON signed value,
             # so positive logits — the tokens actually selectable by
             # sampling — surface first, not the large-magnitude negatives)
-            lo = _load_tensor(args.dir_on,  "logits.pt")
-            lf = _load_tensor(args.dir_off, "logits.pt")
-            if lo is not None and lf is not None:
-                ft = _logits_first_token(lo, lf)
-                if ft is not None:
-                    _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
-                                    "real", "first_token_logits")
+            logits_on = _load_tensor(args.dir_on,  "logits.pt")
+            logits_off = _load_tensor(args.dir_off, "logits.pt")
+            if logits_on is not None and logits_off is not None:
+                first_token_pair = _logits_first_token(logits_on, logits_off)
+                if first_token_pair is not None:
+                    _print_topk_vec(first_token_pair[0].cpu(), first_token_pair[1].cpu(),
+                                    args.topk, "real", "first_token_logits")
 
     # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
     if not stop:

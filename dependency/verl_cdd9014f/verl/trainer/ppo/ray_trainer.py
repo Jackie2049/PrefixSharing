@@ -1354,7 +1354,25 @@ class RayPPOTrainer:
                 max_prompt_length=self.config.data.max_prompt_length,
                 max_response_length=self.config.data.max_response_length,
             )
+        # Inject baseline synthetic data when PREFIX_SHARING_BASELINE_SYNTHETIC env is set
+        baseline_json = os.environ.get("PREFIX_SHARING_BASELINE_SYNTHETIC", None)
+        if baseline_json:
+            from prefix_sharing.tools.inject_baseline_synthetic import patch_baseline_synthetic
+
+            _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "1"))
+            _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
+            _seed = int(os.environ.get("PREFIX_SHARING_BASELINE_SEED", "42"))
+            patch_baseline_synthetic(
+                self,
+                json_path=baseline_json,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                num_seq=_num_seq,
+                stack=_stack,
+                seed=_seed,
+            )
         #####prefix-sharing：inject data########
+
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
