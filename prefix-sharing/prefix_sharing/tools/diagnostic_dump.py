@@ -950,6 +950,63 @@ def dump_fsdp_attn_output(
         _FSDP_ATTN_BUFFER.clear()
 
 
+
+# ============================================================
+#  FSDP per-layer attn_output gradient dump (backward hook)
+# ============================================================
+
+_ATTN_GRAD_BUFFER: dict[int, torch.Tensor] = {}
+
+
+def dump_attn_grad_verl080(
+    grad: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+) -> None:
+    """Accumulate one layer's attn_output gradient. Auto-flush to attn_grads.pt.
+
+    Called from the register_hook on each layer's attn_output during backward.
+    *grad* shape matches the forward output ([B, L, H, D] or [N, H, D]),
+    reshaped to [N, H*D] packed format matching dump_fsdp_attn_output.
+
+    Args:
+        grad: Gradient w.r.t. attention output tensor.
+        layer_number: 1-based layer index.
+        num_layers: Total number of layers in the model.
+    """
+    import torch as _torch
+
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if not hasattr(grad, 'dim') or grad.dim() < 3:
+        return
+    if num_layers == 0:
+        return
+
+    hidden_dim = grad.shape[-1] * grad.shape[-2]
+    grad_2d = grad.reshape(-1, hidden_dim).detach().cpu().contiguous()
+
+    global _ATTN_GRAD_BUFFER
+    if layer_number == 1:
+        _ATTN_GRAD_BUFFER.clear()
+    _ATTN_GRAD_BUFFER[layer_number] = grad_2d
+
+    if layer_number == num_layers:
+        if len(_ATTN_GRAD_BUFFER) < num_layers:
+            _ATTN_GRAD_BUFFER.clear()
+            return
+        if _get_dp_size() > 1:
+            filename = f'attn_grads_dp{_get_dp_rank()}.pt'
+        else:
+            if not _rank0_only():
+                _ATTN_GRAD_BUFFER.clear()
+                return
+            filename = 'attn_grads.pt'
+        _torch.save(_ATTN_GRAD_BUFFER, os.path.join(dump_dir, filename))
+        _ATTN_GRAD_BUFFER.clear()
+
+
 # ════════════════════════════════════════════════════════════════
 #  Backward-compatible aliases for Megatron path callers
 # ════════════════════════════════════════════════════════════════

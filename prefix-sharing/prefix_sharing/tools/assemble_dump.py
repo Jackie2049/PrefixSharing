@@ -45,6 +45,7 @@ _DP_SHARDABLE_STEMS: list[str] = [
     "rope_postqk",
     "build_kv_input_v",
     "expanded_kv",
+    "attn_grads",
 ]
 
 # ── DP-shardable files that are per-layer dicts (not 1D/2D tensors) ──
@@ -53,6 +54,7 @@ _DP_PER_LAYER_STEMS: set[str] = {
     "rope_postqk",
     "build_kv_input_v",
     "expanded_kv",
+    "attn_grads",
 }
 
 # ── Tag-suffixed files that may be DP-sharded ────────────────────

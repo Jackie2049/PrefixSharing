@@ -70,6 +70,16 @@ def _dump_attn_output(output: Any, module: Any) -> None:
     from prefix_sharing.tools.diagnostic_dump import dump_fsdp_attn_output
     dump_fsdp_attn_output(output, layer_number, num_layers)
 
+    # ##### [PS-diag] backward gradient hook (ON/OFF) ######
+    tensor = output[0] if isinstance(output, tuple) else output
+    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and tensor.requires_grad:
+        from prefix_sharing.tools.diagnostic_dump import dump_attn_grad_verl080
+        tensor.register_hook(
+            lambda grad, ln=layer_number, nl=num_layers:
+                dump_attn_grad_verl080(grad, ln, nl)
+        )
+    # ##### [PS-diag] end #####
+
 # ##### [PS-diag] end #####
 
 
