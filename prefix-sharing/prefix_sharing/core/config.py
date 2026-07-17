@@ -11,6 +11,16 @@ class PrefixSharingConfigError(ValueError):
     """Raised when prefix sharing is enabled under unsupported constraints."""
 
 
+# Backend names valid in config for both THD and BSHD modes.
+_VALID_BACKENDS = {
+    "torch_ref",
+    "flash_atten_gpu",
+    "flash_atten_npu",
+    "torch_ref_bshd",
+    "flash_atten_npu_bshd",
+}
+
+
 def _read_config_value(config: Any, name: str, default: Any = None) -> Any:
     if config is None:
         return default
@@ -115,11 +125,10 @@ class PrefixSharingConfig:
             return
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
-        supported_backends = {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}
-        if self.backend not in supported_backends:
+        if self.backend not in _VALID_BACKENDS:
             raise PrefixSharingConfigError(
                 f"backend='{self.backend}' is not supported. "
-                f"Supported backends: {supported_backends}"
+                f"Supported backends: {sorted(_VALID_BACKENDS)}"
             )
         if self.boundary_strategy != "prefix_last_restore":
             raise PrefixSharingConfigError(
@@ -223,10 +232,10 @@ class PrefixSharingConfig:
         # 基础校验
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
-        if self.backend not in {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}:
+        if self.backend not in _VALID_BACKENDS:
             raise PrefixSharingConfigError(
                 f"backend='{self.backend}' is not supported. "
-                f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"
+                f"Supported: {sorted(_VALID_BACKENDS)}"
             )
         if self.boundary_strategy != "prefix_last_restore":
             raise PrefixSharingConfigError(

@@ -55,15 +55,19 @@ def get_bshd_backend_instance(
     """
     backend_name = backend if backend is not None else config.backend
 
-    if backend_name == "torch_ref":
+    # Normalise _bshd suffixed names to their standard form so that users
+    # can write e.g. ``flash_atten_npu_bshd`` or ``torch_ref_bshd``.
+    normalised = backend_name.replace("_bshd", "")
+
+    if normalised == "torch_ref":
         from prefix_sharing.backends.torch_ref_bshd import TorchReferenceBackendBshd
         return TorchReferenceBackendBshd()
 
-    if backend_name == "flash_atten_npu":
+    if normalised == "flash_atten_npu":
         from prefix_sharing.backends.flash_atten_npu_bshd import NpuFlashAttentionBackendBshd
         return NpuFlashAttentionBackendBshd()
 
-    if backend_name == "flash_atten_gpu":
+    if normalised == "flash_atten_gpu":
         raise ValueError(
             "BSHD is not supported for backend 'flash_atten_gpu' yet "
             "(flash_attn_func has no attn_mask parameter). "
@@ -72,5 +76,5 @@ def get_bshd_backend_instance(
 
     raise ValueError(
         f"Unknown BSHD backend '{backend_name}'. "
-        f"Supported: torch_ref, flash_atten_npu"
+        f"Supported: torch_ref, torch_ref_bshd, flash_atten_npu, flash_atten_npu_bshd"
     )
