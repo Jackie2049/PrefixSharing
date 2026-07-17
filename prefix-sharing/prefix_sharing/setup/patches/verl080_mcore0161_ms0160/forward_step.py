@@ -109,8 +109,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     if ps_state is None
                     else (
                         f"valid={ps_state.packed_batch_layout.valid_lengths},"
-                        f"padded={ps_state.packed_batch_layout.padded_lengths},"
-                        f"cu={ps_state.packed_batch_layout.cu_seqlens}"
+                        f"type={'BSHD' if getattr(ps_state.packed_batch_layout, 'is_bshd', lambda: False)() else 'THD'}"
                     )
                 ),
             )
@@ -206,7 +205,9 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             # PP guard: 非末 stage 返回的是 tensor（hidden_states），不是 dict；
             # restore 只在末 stage（output 是含 log_probs 的 dict）才有意义。
             if ps_state is not None:
-                from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
+                from prefix_sharing.integrations.verl_mcore import (
+                    restore_via_2d_unfold_verl080, restore_via_bshd,
+                )
                 from prefix_sharing.integrations.context import current_prefix_sharing_context
                 from verl.utils.megatron.tensor_parallel import (
                     vocab_parallel_entropy,
@@ -214,11 +215,19 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 )
                 output_dict, postprocess_fn = output
                 if isinstance(output_dict, dict):
-                    output_dict = restore_via_2d_unfold_verl080(
-                        output_dict,
-                        vocab_parallel_log_probs_from_logits,
-                        vocab_parallel_entropy,
-                    )
+                    is_bshd = getattr(ps_state.packed_batch_layout, 'is_bshd', lambda: False)()
+                    if is_bshd:
+                        output_dict = restore_via_bshd(
+                            output_dict,
+                            vocab_parallel_log_probs_from_logits,
+                            vocab_parallel_entropy,
+                        )
+                    else:
+                        output_dict = restore_via_2d_unfold_verl080(
+                            output_dict,
+                            vocab_parallel_log_probs_from_logits,
+                            vocab_parallel_entropy,
+                        )
                     # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
                     # restore 已消费完毕）。clear 职责在此，不在包装函数内。
                     ctx = current_prefix_sharing_context()

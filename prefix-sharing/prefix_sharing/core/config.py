@@ -67,6 +67,7 @@ class PrefixSharingConfig:
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
+    batch_format: str = "auto"  # "auto" / "thd" / "bshd"（auto 按 use_remove_padding 解析）
 
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
     supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
@@ -125,6 +126,11 @@ class PrefixSharingConfig:
                 "phase 1 currently implements only "
                 "boundary_strategy='prefix_last_restore'; future strategies may include "
                 "'boundary_token' and 'strict_suffix'"
+            )
+        if self.batch_format not in {"auto", "thd", "bshd"}:
+            raise PrefixSharingConfigError(
+                f"batch_format='{self.batch_format}' is not supported. "
+                "Supported: auto, thd, bshd"
             )
         if self.min_prefix_len < 1:
             raise PrefixSharingConfigError("min_prefix_len must be >= 1")
@@ -231,10 +237,23 @@ class PrefixSharingConfig:
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
-        # THD packed layout 需要 use_remove_padding
-        if not use_remove_padding:
+        # batch_format 值校验 + 与 use_remove_padding 的一致性交叉校验
+        if self.batch_format not in {"auto", "thd", "bshd"}:
             raise PrefixSharingConfigError(
-                "[Config Error] Phase 1 THD 路径要求 use_remove_padding=True。"
-                "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
-                "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
+                f"batch_format='{self.batch_format}' is not supported. "
+                "Supported: auto, thd, bshd"
             )
+        if not use_remove_padding:
+            if self.batch_format == "thd":
+                raise PrefixSharingConfigError(
+                    "[Config Error] batch_format='thd' 要求 use_remove_padding=True，"
+                    "当前 use_remove_padding=False。"
+                    "请设置 batch_format='bshd'/'auto'，或启用 use_remove_padding。"
+                )
+        else:
+            if self.batch_format == "bshd":
+                raise PrefixSharingConfigError(
+                    "[Config Error] batch_format='bshd' 要求 use_remove_padding=False，"
+                    "当前 use_remove_padding=True。"
+                    "请设置 batch_format='thd'/'auto'，或关闭 use_remove_padding。"
+                )

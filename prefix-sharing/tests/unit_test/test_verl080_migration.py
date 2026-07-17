@@ -43,10 +43,28 @@ def test_validate_for_engine_accepts_remove_padding_true():
     config.validate_for_engine(use_remove_padding=True)
 
 
-def test_validate_for_engine_rejects_remove_padding_false():
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
+def test_validate_for_engine_accepts_remove_padding_false_with_auto():
+    """auto 格式 + use_remove_padding=False → 解析为 BSHD，合法。"""
+    config = PrefixSharingConfig(enable_prefix_sharing=True, batch_format="auto")
+    config.validate_for_engine(use_remove_padding=False)
+
+
+def test_validate_for_engine_rejects_thd_with_remove_padding_false():
+    config = PrefixSharingConfig(enable_prefix_sharing=True, batch_format="thd")
     with pytest.raises(PrefixSharingConfigError, match="use_remove_padding"):
         config.validate_for_engine(use_remove_padding=False)
+
+
+def test_validate_for_engine_rejects_bshd_with_remove_padding_true():
+    config = PrefixSharingConfig(enable_prefix_sharing=True, batch_format="bshd")
+    with pytest.raises(PrefixSharingConfigError, match="use_remove_padding"):
+        config.validate_for_engine(use_remove_padding=True)
+
+
+def test_validate_for_engine_rejects_invalid_batch_format():
+    config = PrefixSharingConfig(enable_prefix_sharing=True, batch_format="bhsd")
+    with pytest.raises(PrefixSharingConfigError, match="batch_format"):
+        config.validate_for_engine(use_remove_padding=True)
 
 
 @pytest.mark.parametrize(

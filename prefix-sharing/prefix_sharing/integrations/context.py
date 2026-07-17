@@ -34,7 +34,7 @@ class PackedPrefixLastRestoreIndex:
 @dataclass(init=False)
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
-    packed_batch_layout: PackedBatchLayout
+    packed_batch_layout: Any  # PackedBatchLayout (THD) | BatchedBatchLayout (BSHD)
     parallel_info: MegatronParallelInfo
     store: PrefixAttentionStore
     attention_backend: Any | None = None
@@ -88,33 +88,41 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
 
 def _build_prefix_last_restore_indices(
     prefix_sharing_plan: PrefixSharingPlan,
-    packed_batch_layout: PackedBatchLayout,
+    batch_layout: Any,
 ) -> list[PackedPrefixLastRestoreIndex]:
     """Build prefix-last restore indices — one per reuser-with-suffix.
 
     The planner now emits only prefix-last specs (interior prefix columns are
     bulk-sliced by the 2D restore off the direct provider's already-restored
-    row, so no per-position index is needed for them). The prefix-last logits
-    always live in the **direct provider's** packed region — chain reuse forces
-    ``prefix_len_reuser > prefix_len_provider`` (a reuser only becomes someone's
-    provider by extending the trie *beyond* its own prefix), so the reuser's
-    prefix-last position ``prefix_len - 1`` is at or beyond the direct
-    provider's ``keep_start`` and thus inside its computed suffix region. No
-    chain walk up to ancestors is needed.
+    row, so no per-position index is needed for them).
+
+    For THD layouts the 1-D packed position is resolved via
+    ``packed_batch_layout.packed_index()``.  For BSHD layouts the 2-D column
+    position is directly the ``target_2d_pos`` (identity mapping — BSHD never
+    trims data, so the column index in the restored 2D space is the same as
+    the padded column space).
     """
     indices = []
+    is_bshd = getattr(batch_layout, 'is_bshd', lambda: False)()
+
     for spec in prefix_sharing_plan.prefix_last_restore:
         provider = spec.provider_idx_in_batch  # direct provider
         target_pos = spec.target_2d_pos
-        # offset of prefix-last within the direct provider's packed region.
-        # Proven >= 0 (see docstring); guard cheaply to surface regressions.
-        provider_offset = target_pos - prefix_sharing_plan.input_keep_ranges[provider][0]
-        pos_1d_in_provider = packed_batch_layout.packed_index(provider, provider_offset)
+
+        if is_bshd:
+            # BSHD: identity mapping — target_2d_pos is directly the
+            # column index (no trimming, no offset).
+            provider_1d_pos = target_pos
+        else:
+            # THD: offset within the direct provider's packed region.
+            provider_offset = target_pos - prefix_sharing_plan.input_keep_ranges[provider][0]
+            provider_1d_pos = batch_layout.packed_index(provider, provider_offset)
+
         indices.append(
             PackedPrefixLastRestoreIndex(
                 reuse_idx_in_batch=spec.reuse_idx_in_batch,
                 provider_idx_in_batch=provider,
-                provider_1d_pos=pos_1d_in_provider,
+                provider_1d_pos=provider_1d_pos,
                 target_2d_pos=spec.target_2d_pos,
                 label_value=spec.label_value,
             )

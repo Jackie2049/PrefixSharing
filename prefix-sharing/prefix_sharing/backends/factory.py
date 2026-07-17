@@ -37,3 +37,40 @@ def get_backend_instance(
         f"Unknown backend '{config.backend}'. "
         f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"
     )
+
+
+def get_bshd_backend_instance(
+    config: PrefixSharingConfig, backend: Any | None = None
+) -> Any:
+    """Return a BSHD-compatible backend instance.
+
+    Uses the same backend names as the THD factory and maps them to the
+    BSHD implementations:
+
+    * ``"torch_ref"``       -> TorchReferenceBackendBshd
+    * ``"flash_atten_npu"`` -> NpuFlashAttentionBackendBshd
+    * ``"flash_atten_gpu"`` -> not supported yet: flash-attn has no 4-D
+      ``attn_mask`` support; a future GPU BSHD backend must convert to
+      varlen at the boundary (``flash_attn_varlen_func`` + cu_seqlens).
+    """
+    backend_name = backend if backend is not None else config.backend
+
+    if backend_name == "torch_ref":
+        from prefix_sharing.backends.torch_ref_bshd import TorchReferenceBackendBshd
+        return TorchReferenceBackendBshd()
+
+    if backend_name == "flash_atten_npu":
+        from prefix_sharing.backends.flash_atten_npu_bshd import NpuFlashAttentionBackendBshd
+        return NpuFlashAttentionBackendBshd()
+
+    if backend_name == "flash_atten_gpu":
+        raise ValueError(
+            "BSHD is not supported for backend 'flash_atten_gpu' yet "
+            "(flash_attn_func has no attn_mask parameter). "
+            "Use backend='torch_ref' for BSHD."
+        )
+
+    raise ValueError(
+        f"Unknown BSHD backend '{backend_name}'. "
+        f"Supported: torch_ref, flash_atten_npu"
+    )

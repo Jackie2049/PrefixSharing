@@ -39,7 +39,7 @@ from prefix_sharing.integrations.patch_manager import PatchHandle
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     attention_backend: Any
-    packed_batch_layout: PackedBatchLayout
+    packed_batch_layout: PackedBatchLayout | Any  # BatchedBatchLayout for BSHD
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
 
@@ -660,7 +660,34 @@ def build_prefix_sharing_micro_batch_verl080(
         print("[PS][prepare] no prefix sharing detected")
         return batch, None
 
-    # ── 阶段 5: 物理裁剪 batch ──
+    # ── 阶段 5: 格式解析 → BSHD 分支 ──
+    #   格式信号是 engine_config.use_remove_padding（不是 is_nested_tensor ——
+    #   verl080 的 left_right_2_no_padding 使得到达此处的 batch 永远是
+    #   NestedTensor，与 use_remove_padding 无关，见设计文档 §3.1）。
+    batch_format = _resolve_batch_format(ps_config, use_remove_padding)
+
+    if batch_format == "bshd":
+        # BSHD 路径：不裁剪任何数据。reuser 的 prefix 由 backend 的 4-D mask
+        # 在【绝对坐标】隐藏（数据保持完整，CSA 块边界等特性依赖这一点）。
+        # batch 原样送入 engine，由 verl 的 preprocess_bshd_engine 正常 pad
+        # 成 [B, S]（右 pad 左对齐，position=列号）。
+        from prefix_sharing.backends.batched_layout import BatchedBatchLayout
+        from prefix_sharing.backends.factory import get_bshd_backend_instance
+        parallel_info = get_megatron_parallel_info()
+        bshd_layout = BatchedBatchLayout.from_valid_lengths(plan.original_lengths)
+        state = PrefixSharingRuntimeState(
+            prefix_sharing_plan=plan,
+            attention_backend=get_bshd_backend_instance(ps_config),
+            packed_batch_layout=bshd_layout,
+            parallel_info=parallel_info,
+        )
+        print(
+            f"[PS][prepare] PATH 6 (BSHD): sharing detected, plan={plan}, "
+            f"layout={bshd_layout}"
+        )
+        return batch, state
+
+    # ── 阶段 5: 物理裁剪 batch（THD 路径）──
     #   与 v070 的核心区别：v070 只改 attention_mask（Megatron 从 mask 动态重算 packed），
     #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
     #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
@@ -924,3 +951,95 @@ def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
         values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
         for i in range(offsets.diff().shape[0])
     ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# BSHD 格式解析
+# ═══════════════════════════════════════════════════════════════
+
+
+def _resolve_batch_format(ps_config: Any, use_remove_padding: bool) -> str:
+    """解析 micro-batch 的格式：``'thd'`` 或 ``'bshd'``。
+
+    优先级：
+    1. ``ps_config.batch_format == 'thd'`` 或 ``'bshd'`` → 显式指定
+    2. ``'auto'`` → ``use_remove_padding``? ``'thd'`` : ``'bshd'``
+
+    .. warning::
+        禁止用 ``is_nested_tensor`` 检测格式。verl080 的
+        ``left_right_2_no_padding`` 使得到达 forward_step 处
+        batch 永远是 NestedTensor，与 use_remove_padding 无关。
+        格式信号 = engine_config.use_remove_padding。
+    """
+    bf = getattr(ps_config, 'batch_format', 'auto')
+    if bf in ('thd', 'bshd'):
+        return bf
+    return "thd" if use_remove_padding else "bshd"
+
+
+# ═══════════════════════════════════════════════════════════════
+# BSHD restore：nested（原始长度）→ 2D identity unfold → restore → fold
+# ═══════════════════════════════════════════════════════════════
+
+
+def restore_via_bshd(
+    output: dict,
+    vocab_parallel_log_probs_fn: Any,
+    vocab_parallel_entropy_fn: Any = None,
+) -> dict:
+    """BSHD restore —— nested（原始长度）→ 2D → restore → nested。
+
+    BSHD 不裁剪数据，engine 输出是 ``NestedTensor``（每行长度 =
+    ``plan.original_lengths``）。不需要 THD 的 keep_ranges
+    映射——行 i 的 2D 位置就是列号 j（identity）。展开后复用
+    :func:`restore_reuser_prefix_columns_2d`（列号 identity ✓），
+    再折叠回 NestedTensor。
+    """
+    ctx = current_prefix_sharing_context()
+    if ctx is None or not ctx.prefix_sharing_plan.has_sharing:
+        return output
+
+    log_probs = output.get("log_probs")
+    if log_probs is None:
+        return output
+
+    import torch
+
+    plan = ctx.prefix_sharing_plan
+    B = plan.batch_size
+    original_lengths = list(plan.original_lengths)
+    L_max = max(original_lengths) if original_lengths else 0
+
+    # Unfold nested → [B, L_max] 2D（identity：行 i 的列 [0, len_i)）
+    log_probs_2d = torch.zeros(B, L_max, dtype=log_probs.dtype, device=log_probs.device)
+    offsets = log_probs.offsets()
+    values = log_probs.values()
+    for i in range(B):
+        length = original_lengths[i]
+        log_probs_2d[i, :length] = values[offsets[i]:offsets[i] + length]
+
+    output_2d: dict[str, Any] = {"log_probs": log_probs_2d}
+
+    entropy = output.get("entropy")
+    if entropy is not None:
+        entropy_2d = torch.zeros(B, L_max, dtype=entropy.dtype, device=entropy.device)
+        ent_offsets = entropy.offsets()
+        ent_values = entropy.values()
+        for i in range(B):
+            length = original_lengths[i]
+            entropy_2d[i, :length] = ent_values[ent_offsets[i]:ent_offsets[i] + length]
+        output_2d["entropy"] = entropy_2d
+
+    # 2D restore（列号 identity——与 _build_prefix_last_restore_indices BSHD 分支一致）
+    output_2d = restore_reuser_prefix_columns_2d(
+        output_2d,
+        vocab_parallel_log_probs_fn,
+        vocab_parallel_entropy_fn,
+    )
+
+    # Fold back to NestedTensor（复用 THD 的 helper）
+    output["log_probs"] = _fold_2d_to_nested(output_2d["log_probs"], original_lengths)
+    if "entropy" in output_2d:
+        output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
+
+    return output

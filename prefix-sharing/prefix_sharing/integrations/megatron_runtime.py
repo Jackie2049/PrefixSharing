@@ -33,6 +33,26 @@ def prefix_attention(
     if prefix_sharing_context is None:
         print("\n\n\nprefix_sharing_context is None\n\n\n")
         return None
+
+    packed_batch_layout = prefix_sharing_context.packed_batch_layout
+
+    # ═══════════════════════════════════════════════
+    # BSHD path — delegate to BSHD-specific handler
+    # ═══════════════════════════════════════════════
+    if hasattr(packed_batch_layout, 'is_bshd') and packed_batch_layout.is_bshd():
+        return _prefix_attention_bshd(
+            attention_module=attention_module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+        )
+
+    # ═══════════════════════════════════════════════
+    # THD path (unchanged below)
+    # ═══════════════════════════════════════════════
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
     if rotary_pos_emb is None:
@@ -41,7 +61,6 @@ def prefix_attention(
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
     # 确保 QKV 符合 THD packing格式
-    packed_batch_layout = prefix_sharing_context.packed_batch_layout
     ensure_global_packed_token_lengths(
         {
             "query_length": query.shape[0],
@@ -402,3 +421,87 @@ def _get_cp_group(attention_module: Any) -> Any | None:
     if pg_collection is None:
         return None
     return getattr(pg_collection, "cp", None)
+
+
+# ══════════════════════════════════════════════════════════
+# BSHD attention — SBHD in, BSHD backend, SBHD out
+# ══════════════════════════════════════════════════════════
+
+
+def _prefix_attention_bshd(
+    attention_module: Any,
+    query: Any,
+    key: Any,
+    value: Any,
+    attention_mask: Any,
+    rotary_pos_emb: Any,
+    packed_seq_params: Any = None,  # noqa: ARG001 — API compat
+) -> tuple[Any, Any] | None:
+    """BSHD prefix-sharing attention hook.
+
+    Megatron provides Q/K/V in SBHD format ``[S, B, H, D]``.  This hook:
+    1. applies RoPE via Megatron's native bshd path (``cu_seqlens=None``)
+    2. transposes to ``[B, S, H, D]`` for the BSHD backend
+    3. delegates build_kv + attention to the BSHD backend
+    4. transposes back to ``[S, B, H, D]`` and applies linear_proj
+
+    Returns ``(tensor, bias)`` — same shape as the THD path.
+    """
+    prefix_sharing_context = current_prefix_sharing_context()
+    if prefix_sharing_context is None:
+        return None
+
+    packed_batch_layout = prefix_sharing_context.packed_batch_layout
+    plan = prefix_sharing_context.prefix_sharing_plan
+    parallel_info = prefix_sharing_context.parallel_info
+    backend = prefix_sharing_context.attention_backend
+
+    print(
+        f"[PS][bshd][layer={attention_module.layer_number}] "
+        f"q_shape={tuple(query.shape)} k_shape={tuple(key.shape)} "
+        f"v_shape={tuple(value.shape)} "
+        f"batch_size={packed_batch_layout.batch_size} "
+        f"seq_length={getattr(packed_batch_layout, 'seq_length', None)}"
+    )
+
+    # ── RoPE: Megatron native bshd path ──
+    # In BSHD mode Megatron precomputes freqs [S, 1, 1, D] and
+    # apply_rotary_pos_emb(t, freqs, cu_seqlens=None) routes to
+    # _apply_rotary_pos_emb_bshd which broadcasts across the batch dim.
+    # Position id == row index in the S dimension (verl's BSHD
+    # preprocessing assigns arange(S) per row).
+    if rotary_pos_emb is not None:
+        from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+        q_pos_emb, k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
+        if q_pos_emb is not None:
+            query = apply_rotary_pos_emb(query, q_pos_emb, config=attention_module.config, cu_seqlens=None)
+        if k_pos_emb is not None:
+            key = apply_rotary_pos_emb(key, k_pos_emb, config=attention_module.config, cu_seqlens=None)
+
+    # ── SBHD → BSHD for backend ──
+    query, key, value = (t.transpose(0, 1) for t in (query, key, value))
+
+    # ── build_kv ──
+    expanded_key, expanded_value = backend.build_kv(
+        key, value,
+        prefix_sharing_context.store,
+        plan,
+        packed_batch_layout=packed_batch_layout,
+        layer_id=int(getattr(attention_module, "layer_number", 0) or 0),
+        tp_rank=parallel_info.tp_rank,
+        stats=prefix_sharing_context.stats,
+    )
+
+    # ── attention ──
+    core_attn_out = backend.attention(
+        query, expanded_key, expanded_value,
+        plan,
+        packed_batch_layout=packed_batch_layout,
+        attention_mask=attention_mask,
+        layer_id=int(getattr(attention_module, "layer_number", 0) or 0),
+    )  # [B, S_q, H_q, D]
+
+    # ── BSHD → SBHD → linear_proj ──
+    S_q = core_attn_out.shape[1]
+    core_attn_out = core_attn_out.transpose(0, 1).reshape(S_q, core_attn_out.shape[0], -1)
+    return attention_module.linear_proj(core_attn_out)  # (tensor, bias)
