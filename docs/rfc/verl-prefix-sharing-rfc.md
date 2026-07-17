@@ -169,7 +169,6 @@ Current profiling indicates that no-sharing planning and physical expanded-KV co
 
 ## 5. Roadmap
 
-Roadmap:
 1. Optimize prefix-reuse performance (KV concat → FlexAttention → MagiAttention).
 2. Fully support Megatron-LM, including DP, TP, PP, and CP (partially already implemented).
 3. Support pre-defined reuse plan from user / rollout engine / verl.
@@ -179,7 +178,6 @@ Roadmap:
 
 ## 6. TODO
 
-TODO:
 1. Attach a minimal report into this RFC (including precision & performance results).
 2. Discuss with community developers and maintainers.
 3. Revise the design based on community feedback.
