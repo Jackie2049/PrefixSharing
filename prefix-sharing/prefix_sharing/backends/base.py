@@ -23,6 +23,7 @@ class BackendCapabilities:
     supports_flash_attention: bool = False
     supports_gated_attention: bool = False
     supports_deltanet_state_reuse: bool = False
+    supports_bshd: bool = False
 
 
 class PrefixAttentionBackend(Protocol):

@@ -100,6 +100,15 @@ class PackedBatchLayout:
     def batch_size(self) -> int:
         return len(self.valid_lengths)
 
+    @staticmethod
+    def is_bshd() -> bool:
+        """Returns ``False`` — this is the THD packed layout.
+
+        Together with :meth:`BatchedBatchLayout.is_bshd` this lets downstream
+        code write ``layout.is_bshd()`` uniformly on either type.
+        """
+        return False
+
     @property
     def has_padding(self) -> bool:
         """True when at least one row has a pad token (``padded > valid``)."""
