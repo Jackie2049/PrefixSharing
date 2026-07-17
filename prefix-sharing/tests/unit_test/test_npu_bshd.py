@@ -197,8 +197,9 @@ class TestAttentionMock:
         assert mask[1, 0, prefix_len, 0].item() is False, \
             "reuser suffix Q should see prefix KV col 0"
 
-    def test_gqa_num_kv_heads_passed(self):
-        """num_key_value_heads is passed to npu_fusion_attention."""
+    def test_gqa_kv_heads_inferred_from_shape(self):
+        """num_key_value_heads is NOT passed to npu_fusion_attention; GQA is
+        handled by the kernel inferring kv heads from the K tensor shape."""
         plan = _plan()
         backend = self._make_backend()
 
@@ -209,7 +210,8 @@ class TestAttentionMock:
             return (q,)
 
         self._run_attention(backend, plan, patch_fn=mock_npu)
-        assert captured["num_kv_heads"] == 1, "MQA: 1 kv head"
+        assert captured["num_kv_heads"] is None, \
+            "num_key_value_heads must not be passed (kernel infers from K shape)"
 
     def test_sparse_mode_1(self):
         """sparse_mode=1 is passed to npu_fusion_attention."""

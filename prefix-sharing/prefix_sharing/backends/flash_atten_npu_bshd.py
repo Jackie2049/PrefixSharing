@@ -218,7 +218,6 @@ class NpuFlashAttentionBackendBshd:
                 scale=scale,
                 keep_prob=keep_prob,
                 sparse_mode=1,
-                num_key_value_heads=H_kv,
             )
         except Exception as exc:
             raise RuntimeError(
