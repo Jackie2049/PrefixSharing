@@ -167,15 +167,7 @@ Systematic FSDP measurements are in progress. The report will compare baseline a
 
 Current profiling indicates that no-sharing planning and physical expanded-KV construction are the main optimization targets. No final speedup claim is made in this draft.
 
-## 5. Related Works
-
-- [PrefixGrouper](https://github.com/CASIA-IVA-Lab/PrefixGrouper) provides differentiable prompt-level sharing and the existing verl-facing integration model. This proposal extends the sharing granularity to arbitrary prefixes.
-- Prefix-tree shared attention systems use flat deduplicated token layouts and sparse/custom attention masks. We view this as a complementary execution backend to KV injection.
-- [Tree Training](https://arxiv.org/abs/2511.00413) studies tree-structured RL training and broader model architectures.
-- [AReaL dynamic tree attention](https://github.com/areal-project/AReaL/tree/feat/dta) focuses on scalable tree execution and load balancing.
-- vLLM and SGLang prefix caches optimize inference/rollout execution; PrefixSharing targets differentiable actor and reference-policy training.
-
-## 6. Roadmap
+## 5. Roadmap
 
 Roadmap:
 1. Optimize prefix-reuse performance (KV concat → FlexAttention → MagiAttention).
@@ -185,7 +177,7 @@ Roadmap:
 5. Support more complex attention structures (Qwen3.5 HybridAttention; DeepSeek SWA / CSA / HCA).
 6. Support prefix reuse across micro-batches.
 
-## 7. TODO
+## 6. TODO
 
 TODO:
 1. Attach a minimal report into this RFC (including precision & performance results).
