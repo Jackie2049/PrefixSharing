@@ -37,7 +37,7 @@ class TestFactory:
         """Factory creates NpuFlashAttentionBackendBshd when asked."""
         backend = get_bshd_backend_instance(
             PrefixSharingConfig(enable_prefix_sharing=True, batch_format="bshd"),
-            backend="flash_atten_npu",
+            backend="flash_atten_npu_bshd",
         )
         from prefix_sharing.backends.flash_atten_npu_bshd import NpuFlashAttentionBackendBshd
         assert isinstance(backend, NpuFlashAttentionBackendBshd)
@@ -45,7 +45,7 @@ class TestFactory:
     def test_bshd_backend_capabilities(self):
         backend = get_bshd_backend_instance(
             PrefixSharingConfig(enable_prefix_sharing=True, batch_format="bshd"),
-            backend="flash_atten_npu",
+            backend="flash_atten_npu_bshd",
         )
         caps = backend.capabilities
         assert caps.supports_bshd is True
@@ -53,10 +53,10 @@ class TestFactory:
         assert caps.supports_cpu is False
         assert caps.supports_cuda is False
 
-    def test_torch_ref_bshd_is_default(self):
-        """Default BSHD backend is torch_ref, not NPU."""
+    def test_torch_ref_bshd_via_explicit_name(self):
+        """Factory creates TorchReferenceBackendBshd via torch_ref_bshd."""
         backend = get_bshd_backend_instance(
-            PrefixSharingConfig(enable_prefix_sharing=True, backend="torch_ref", batch_format="bshd"),
+            PrefixSharingConfig(enable_prefix_sharing=True, backend="torch_ref_bshd", batch_format="bshd"),
         )
         assert isinstance(backend, TorchReferenceBackendBshd)
 

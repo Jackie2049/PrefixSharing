@@ -675,9 +675,13 @@ def build_prefix_sharing_micro_batch_verl080(
         from prefix_sharing.backends.factory import get_bshd_backend_instance
         parallel_info = get_megatron_parallel_info()
         bshd_layout = BatchedBatchLayout.from_valid_lengths(plan.original_lengths)
+        # Map standard backend name to its BSHD variant (e.g. torch_ref → torch_ref_bshd).
+        _bshd_name = {"torch_ref": "torch_ref_bshd", "flash_atten_npu": "flash_atten_npu_bshd"}.get(
+            ps_config.backend, ps_config.backend,
+        )
         state = PrefixSharingRuntimeState(
             prefix_sharing_plan=plan,
-            attention_backend=get_bshd_backend_instance(ps_config),
+            attention_backend=get_bshd_backend_instance(ps_config, backend=_bshd_name),
             packed_batch_layout=bshd_layout,
             parallel_info=parallel_info,
         )
