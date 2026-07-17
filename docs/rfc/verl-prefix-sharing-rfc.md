@@ -62,8 +62,8 @@ Tree-structure rollout produces branches with common ancestors and it is similar
 - Performance improvement (less memory consumption or faster forward).
 - Preserve baseline forward and backward semantics. Compuatation precision aligned.
 - Inherit and extend PrefixGrouper's interface in verl. **Minimal modification to verl**.
-- FSDP/transformers as training engine for the first version.
-- Support full attention (e.g. Qwen-2/2.5/3) for the first version.
+- FSDP/transformers as training engine andfor the first version.
+- Support full attention (e.g. Qwen-2/2.5/3) and THD format for the first version.
 
 ### 4.2 Overview
 
@@ -75,7 +75,7 @@ flowchart TD
     B -->|"arbitrary_prefix"| D["PrefixSharing"]
     D --> E1["detect & plan reuse relationships: PrefixSharing/planner.py"]
     E1 --> E2["trim redundant inputs: PrefixSharing/batch_trim.py"]
-    E2 --> E3["create context: PrefixSharing/context.py"]
+    E2 --> E3["create reuse context: PrefixSharing/context.py"]
     E3 --> G["dispatch attention: transformers/modeling_utils.py"]
     G --> F["KV reuse & compute attention: PrefixSharing/attention.py"]
     F --> J["restore prefix tokens: verl/verl_mcore.py"]
@@ -93,81 +93,52 @@ flowchart TD
     class C existing
 ```
 
-**Walkthrough (verl impact).** PrefixSharing hooks verl at `forward_step` only; rollout, dataloader, and PPO loss stay unchanged.
+verl + FSDP + PrefixSharing walkthrough:
 
-1. **Entry (A → B).** Patched `FSDPEngineWithLMHead.forward_step` reads `prefix_grouper.mode` (`prompt_only` | `arbitrary_prefix`). Disabled or non-`arbitrary_prefix` paths call the original `forward_step` with zero overhead.
-2. **Prompt-only (C → K).** Existing PrefixGrouper path; no PrefixSharing involvement.
-3. **Prepare (D → E3).** Inside the patch, before `prepare_model_inputs()`: plan reuse (`planner.py`), trim reuser prefixes (`batch_trim.py`), open runtime context (`context.py`). verl batch keys and engine prepare hooks are reused on the trimmed micro-batch.
-4. **Forward (E3 → G → F).** verl still runs `self.module(...)` unchanged. Transformers dispatches attention via `ALL_ATTENTION_FUNCTIONS.get_interface`; PrefixSharing intercepts externally and performs KV reuse. FSDP/Megatron engines keep autocast, FSDP wrap, and `use_cache=False`.
-5. **Restore (F → J → K).** After `prepare_model_outputs()`, restore reuser prefix columns to baseline layout (`integrations/verl_mcore.py`). log_probs / entropy match the **original** micro-batch shape so `loss_function` and backward need no changes.
-6. **Afterward (K → L).** Standard verl training continues (loss, optimizer, sync).
-
-**verl touch surface:** config (`prefix_grouper.mode`), monkey-patched `forward_step`, external attention hooks — everything else unchanged.
+1. **verl enters forward_step()**: Branch to PrefixGrouper/PrefixSharing according to `prefix_grouper.mode`.
+2. **prompt-only → PrefixGrouper**: For `mode=prompt_only`, PrefixGrouper is enabled for fixed-length prompt reuse.
+3. **arbitrary-prefix → PrefixSharing**: For `mode=arbitrary_prefix`, PrefixSharing is enabled for general prefix resuse.
+4. **PrefixSharing: detect & plan reuse**: Detect reuse relationships using Trie and emit a provider/reuser plan.
+5. **PrefixSharing: trim redundant inputs**: Physically trim reusers' prefix tokens from the batch. They will not be computed.
+6. **PrefixSharing: create reuse context**: Create a runtime context that carries necessary information for prefix reuse.
+7. **transformers: dispatch attention**: transformers routes each layer via `ALL_ATTENTION_FUNCTIONS` to attention functions.
+8. **PrefixSharing: KV reuse & attention**: Reuse prefixes' KV (by concat or crafted attention mask) and compute attention.
+9. **PrefixSharing: restore prefix tokens**: Restore prefix tokens in reuser after `prepare_model_outputs()`.
+10. **verl obtains loss and continue**: `loss`/`log_probs`/`entropy` are same as baseline; verl continues subsequent process.
 
 ### 4.3 Integration
 
+Currently we try to keep verl impact minimal: only 3 files will be changed. Core operations for prefix reuse should stay in the PrefixSharing package. Tighter integration can follow up later as verl and PrefixSharing evolve. 
+
 PrefixSharing plugs into verl as a **mode extension of PrefixGrouper**, not a parallel training entry. The first upstream PR targets the FSDP / Transformers path. Prototype code today reaches the same surfaces via external monkey-patches; the upstream form replaces those patches with thin in-tree hooks and keeps PrefixSharing algorithm logic in an external package.
 
-**FSDP first PR — verl files touched**
+**verl + FSDP + PrefixSharing — expected modifications to verl**
 
-| verl files | Impact | Modification |
-|---|---|---|
-| `workers/config/actor.py` | config schema | Keep `use_prefix_grouper` as the enable switch. Add fields like `mode` to `prefix_grouper`;  |
-| `workers/engine/fsdp/transformer_impl.py` | main training hook | In `FSDPEngineWithLMHead.forward_step`, branch on `mode`: `mode: prompt_only` keeps existing PrefixGrouper path; `mode: arbitrary_prefix` runs PrefixSharing(plan reusing → trim prefixes → create context → forward with prefix sharing → prefix logits/logp/entropy restore for outputs) |
-| `models/transformers/monkey_patch.py` | attention dispatch | Extend existing PrefixGrouper wrappers so that attention is routed to PrefixSharing's arbitrary KV reuse when its context is active; inactive context remains a zero-overhead passthrough. |
-| `trainer/ppo/prefix_grouper_utils.py` | mode boundary | Keep prompt-only helpers as-is; ensure `arbitrary_prefix` does not enter PrefixGrouper's fixed prompt/response regroup layout. |
+| file & function | modification |
+|---|---|
+| `workers/config/actor.py`<br>`ActorConfig` | Keep `use_prefix_grouper` as the enable switch. Add more fields to `prefix_grouper`, e.g. `mode`. |
+| `workers/engine/fsdp/transformer_impl.py`<br>`FSDPEngineWithLMHead.forward_step()` | Branch on `prefix_grouper.mode`: `prompt_only` keeps existing PrefixGrouper path; `arbitrary_prefix` goes to PrefixSharing. |
+| `models/transformers/monkey_patch.py`<br>`apply_prefix_grouper_patch()` | Extend existing PrefixGrouper wrappers so attention routes to PrefixSharing KV reuse when its context is active; inactive context remains a zero-overhead passthrough. |
 
-**Explicitly unchanged in verl**
+**verl + Megatron-LM + PrefixSharing (not first PR) — expected modifications to verl**
 
-| Area | Files / components | Why |
-|---|---|---|
-| Rollout / inference | vLLM / SGLang workers | PrefixSharing is actor / ref training only. |
-| Data pipeline | dataloader, sampler | Consumes the same micro-batch keys. |
-| PPO objective | `verl/workers/utils/losses.py`, advantage / KL helpers | Restore returns baseline-shaped `log_probs` / entropy; loss code needs no rewrite. |
-| Trainer control loop | `ray_trainer.py` step orchestration | Existing `use_prefix_grouper` batch-balance behavior can remain; no new trainer stage. |
-| Optimizer / checkpoint / param sync | FSDP engine non-forward paths | Outside the forward_step boundary. |
+| file & function | modification |
+|---|---|
+| `workers/config/actor.py`<br>`ActorConfig` | Keep `use_prefix_grouper` as the enable switch. Add more fields to `prefix_grouper`, e.g. `mode`. |
+| `workers/engine/megatron/transformer_impl.py`<br>`MegatronEngineWithLMHead.forward_step()` | Branch on `prefix_grouper.mode`: `prompt_only` keeps existing PrefixGrouper path; `arbitrary_prefix` goes to PrefixSharing. |
+| `workers/engine/megatron/transformer_impl.py`<br>`vocab_parallel_log_probs_from_logits()` | Restore prefix tokens for reusers to preserve same outputs as baseline. |
 
-**Megatron follow-up (not in the first PR)** — same integration idea, larger surface: `verl/workers/engine/megatron/transformer_impl.py` (`forward_step` + logprob restore), and trimming-aware `no_padding_2_padding` call sites under `verl/workers/utils/` and trainer loss helpers.
+### 4.4 Enablement and Configuration
 
-### 4.5 Quick Use
-
-参数集成、快速使用
-
-We propose a backward-compatible extension of the existing PrefixGrouper configuration:
+We propose a backward-compatible extension of the existing PrefixGrouper configuration, and the naming is open for discussion.
 
 ```yaml
 actor_rollout_ref:
   actor:
     use_prefix_grouper: true
     prefix_grouper:
-      mode: arbitrary_prefix
+      mode: arbitrary_prefix # arbitraray_prefix  → PrefixSharing; prompt_only → PrefixGrouper
 ```
-
-The exact naming is open for discussion. The first upstream path would integrate with verl's FSDP model engine and Transformers attention dispatch. Megatron support is also ready and can follow separately after the common interface stabilizes.
-
-### 3.5 Attention
-
-The KV-injection backend follows three rules:
-
-1. **One forward graph:** provider and reuser sequences remain in the same differentiable forward.
-2. **KV reuse without `detach()`:** reusers attend to provider prefix KV plus their own suffix KV, and gradients flow through the provider computation.
-3. **Prefix-last restore:** trimming a reuser prefix removes the output needed for its first suffix-token log-probability. The backend restores that boundary output before verl consumes token-level results.
-
-These rules are the precision boundary of the design. Performance optimizations must not change them.
-
-
-### 3.2 Non-goals for the first upstream contribution => Roadmap
-
-- Cross-micro-batch activation sharing.
-- Context parallelism and every fused attention kernel.
-- DeltaNet or other recurrent-state reuse.
-- Upstreaming FSDP, Megatron, MindSpeed, and NPU support at the same time.
-- Guaranteeing speedup for every batch composition or prefix ratio.
-1、支持Megatron模型并行。支持NPU等设备；
-2、未来支持自定义prefix-reuse关系；
-3、支持其他注意力；
-4、性能优化（build_kv）；
-5、支持BSHD；
 
 ## 4. Current Results
 
@@ -204,16 +175,20 @@ Current profiling indicates that no-sharing planning and physical expanded-KV co
 - [AReaL dynamic tree attention](https://github.com/areal-project/AReaL/tree/feat/dta) focuses on scalable tree execution and load balancing.
 - vLLM and SGLang prefix caches optimize inference/rollout execution; PrefixSharing targets differentiable actor and reference-policy training.
 
-## 6. TODO & Roadmap
+## 6. Roadmap
+
+Roadmap:
+1. Optimize prefix-reuse performance (KV concat → FlexAttention → MagiAttention).
+2. Fully support Megatron-LM, including DP, TP, PP, and CP (partially already implemented).
+3. Support pre-defined reuse plan from user / rollout engine / verl.
+4. Support BSHD format.
+5. Support more complex attention structures (Qwen3.5 HybridAttention; DeepSeek SWA / CSA / HCA).
+6. Support prefix reuse across micro-batches.
+
+## 7. TODO
 
 TODO:
 1. Attach a minimal report into this RFC (including precision & performance results).
 2. Discuss with community developers and maintainers.
 3. Revise the design based on community feedback.
 4. Convert PrefixSharing's verl monkey-patches into in-tree hooks and open a PR.
-
-Roadmap:
-1. Optimize prefix-reuse performance (KV concat → FlexAttention → MagiAttention).
-2. Fully support Megatron-LM, including DP, TP, PP, and CP (partially already implemented).
-3. Support prefix reuse across micro-batches.
-4. Support more complex attention structures (Qwen3.5 HybridAttention; DeepSeek SWA / CSA / HCA).
