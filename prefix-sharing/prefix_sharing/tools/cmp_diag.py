@@ -1231,6 +1231,7 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
         f"attention_mask_{tag}.pt",
         "logits.pt",
         "attn_outputs.pt",
+        "attn_grads.pt",
         "rope_postqk.pt",
         "rope_preqk.pt",
         "rope_freqs.pt",
@@ -1298,7 +1299,8 @@ def _print_rope_freqs(check_result: CheckResult):
 
 
 def _print_per_layer(check_result: CheckResult):
-    print(_SEP_SINGLE + "\n  [attn_output]  Per-Layer Cosine Similarity")
+    label = check_result.name.replace("_per_layer", "").replace("_", " ")
+    print(_SEP_SINGLE + f"\n  [{label}]  Per-Layer Cosine Similarity")
     print(_SEP_SINGLE)
     layers = check_result.metrics.get("layers")
     if isinstance(layers, dict):
