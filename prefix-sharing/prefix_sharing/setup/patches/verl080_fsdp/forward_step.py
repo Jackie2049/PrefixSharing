@@ -214,9 +214,34 @@ def _forward_step_with_engine_prepare(
     # the context from the module itself rather than ContextVar (compatible
     # with activation‑checkpointing recompute, which bypasses the context
     # manager that set the ContextVar).
+    _num_layers = int(getattr(getattr(self.module, "config", None),
+                              "num_hidden_layers", 0) or 0)
     for _mod in self.module.modules():
         if hasattr(_mod, 'layer_idx') and hasattr(_mod, 'q_proj'):
             _mod._ps_ctx = ctx
+
+            # ##### [PS-diag] gradient dump hook (register once per forward) #####
+            import os as _os_grad
+            if _os_grad.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and _num_layers > 0 and not forward_only:
+                _ln = int(_mod.layer_idx) + 1
+                # 清理上次 forward 残留的旧 handle
+                _old_handles = getattr(_mod, '_ps_grad_handles', None)
+                if _old_handles is not None:
+                    for _h in _old_handles:
+                        _h.remove()
+                    _old_handles.clear()
+                else:
+                    _mod._ps_grad_handles = []
+
+                def _make_grad_hook(layer_number: int):
+                    def _grad_hook(_m, _gi, grad_output):
+                        from prefix_sharing.tools.diagnostic_dump import dump_attn_grad_verl080
+                        dump_attn_grad_verl080(grad_output[0], layer_number, _num_layers)
+                    return _grad_hook
+
+                _mod._ps_grad_handles.append(
+                    _mod.register_full_backward_hook(_make_grad_hook(_ln)))
+            # ##### [PS-diag] end #####
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
@@ -226,6 +251,12 @@ def _forward_step_with_engine_prepare(
                 del _m._ps_ctx
             except AttributeError:
                 pass
+            # 清理梯度 dump 的 hook handle
+            _gh = getattr(_m, '_ps_grad_handles', None)
+            if _gh is not None:
+                for _h in _gh:
+                    _h.remove()
+                _m._ps_grad_handles = None
 
     self.module.register_full_backward_hook(_cleanup_ps_ctx)
 
