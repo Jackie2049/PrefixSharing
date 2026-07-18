@@ -182,6 +182,14 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
+    # TODO: debug only — randomize reward scores so GRPO advantage is non-zero.
+    # Remove after verifying gradient dump.
+    _rm = fixed_data.batch.get("token_level_rewards")
+    if _rm is not None:
+        import torch as _torch
+        _torch.manual_seed(42)
+        _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
+
     n = len(fixed_data)
     remainder = n % num_workers
     if remainder != 0:

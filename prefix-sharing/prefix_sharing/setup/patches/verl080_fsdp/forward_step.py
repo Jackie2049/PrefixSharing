@@ -299,6 +299,11 @@ def _forward_step_with_engine_prepare(
             if _perf_dir is not None:
                 profiler.save(_perf_dir)
 
+        if not forward_only:
+            loss.register_hook(
+                lambda g: print(f"[PS-diag] param_norm={next(self.module.parameters()).data.norm().item():.6e}",
+                                flush=True))
+
         return loss, {
             "model_output": model_output,
             "loss": loss.detach().item(),
