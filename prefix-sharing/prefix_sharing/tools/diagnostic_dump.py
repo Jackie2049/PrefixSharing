@@ -989,11 +989,14 @@ def dump_attn_grad_verl080(
     grad_2d = grad.reshape(-1, hidden_dim).detach().cpu().contiguous()
 
     global _ATTN_GRAD_BUFFER
-    if layer_number == 1:
+    # 注意：backward 时 hook 按 layer 逆序触发（24→23→...→1）。
+    # 最高层最先触发 = 清旧 buffer；最低层最后触发 = flush。
+    if layer_number == num_layers:
         _ATTN_GRAD_BUFFER.clear()
     _ATTN_GRAD_BUFFER[layer_number] = grad_2d
 
-    if layer_number == num_layers:
+    if layer_number == 1:
+        # 所有层的 grad 已收集完毕
         if len(_ATTN_GRAD_BUFFER) < num_layers:
             _ATTN_GRAD_BUFFER.clear()
             return
