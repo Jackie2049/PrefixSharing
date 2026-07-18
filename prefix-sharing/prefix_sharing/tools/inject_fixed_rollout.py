@@ -184,11 +184,12 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
 
     # TODO: debug only — randomize reward scores so GRPO advantage is non-zero.
     # Remove after verifying gradient dump.
-    _rm = fixed_data.batch.get("token_level_rewards")
-    if _rm is not None:
-        import torch as _torch
-        _torch.manual_seed(42)
-        _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
+    import torch as _torch
+    _torch.manual_seed(42)
+    for _key in ("token_level_rewards", "rm_scores"):
+        _rm = fixed_data.batch.get(_key)
+        if _rm is not None:
+            _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
 
     n = len(fixed_data)
     remainder = n % num_workers
