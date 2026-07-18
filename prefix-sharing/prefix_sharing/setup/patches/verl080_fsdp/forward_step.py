@@ -331,13 +331,8 @@ def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
 
             def _make_grad_hook(layer_number: int):
                 def _grad_hook(_m, _gi, grad_output):
-                    _g = grad_output[0]
-                    # TODO: 调试用，确认无误后删除
-                    print(f"[PS-grad-debug] L{layer_number}: shape={_g.shape} "
-                          f"abs_max={_g.abs().max().item():.6e} nonzero={_g.nonzero().size(0)}",
-                          flush=True)
                     from prefix_sharing.tools.diagnostic_dump import dump_attn_grad_verl080
-                    dump_attn_grad_verl080(_g, layer_number, _num_layers)
+                    dump_attn_grad_verl080(grad_output[0], layer_number, _num_layers)
                 return _grad_hook
 
             _mod._ps_grad_handles.append(
