@@ -246,13 +246,6 @@ def _forward_step_with_engine_prepare(
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
-        _raw_logits = raw_output["logits"] if isinstance(raw_output, dict) else raw_output.logits
-        print(f"[PS-diag] raw_logits requires_grad={_raw_logits.requires_grad} "
-              f"grad_fn={type(_raw_logits.grad_fn).__name__ if _raw_logits.grad_fn is not None else None}",
-              flush=True)
-        if _raw_logits.requires_grad:
-            _raw_logits.register_hook(
-                lambda g: print(f"[PS-diag] raw_logits_grad={float(g.abs().sum()):.6e}", flush=True))
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
@@ -267,15 +260,7 @@ def _forward_step_with_engine_prepare(
         )
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
-        _lp_before = model_output.get("log_probs")
-        if _lp_before is not None and _lp_before.requires_grad:
-            _lp_before.register_hook(
-                lambda g, tag="BEFORE": print(f"[PS-diag] log_probs_grad_{tag}={float(g.abs().sum()):.6e}", flush=True))
         model_output = _restore_engine_model_output(model_output)
-        _lp_after = model_output.get("log_probs")
-        if _lp_after is not None and _lp_after.requires_grad:
-            _lp_after.register_hook(
-                lambda g, tag="AFTER": print(f"[PS-diag] log_probs_grad_{tag}={float(g.abs().sum()):.6e}", flush=True))
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU overhead: restore
 
