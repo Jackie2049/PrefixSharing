@@ -110,6 +110,7 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
         # ── ON path: route through PrefixSharing attention runtime ──
         from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
+        from prefix_sharing.integrations.context import _current_context
 
         layer_id = int(getattr(module, "layer_idx", 0) or 0)
         _num_layers = _resolve_num_layers(module)
@@ -119,7 +120,14 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         query_ld = query.transpose(1, 2)
         key_ld = key.transpose(1, 2)
         value_ld = value.transpose(1, 2)
-        output_ld = runtime.forward(None, query_ld, key_ld, value_ld)
+
+        # runtime.forward() 内部读 ContextVar；AC recompute 时 ContextVar
+        # 可能已过期，但 ctx 来自 module._ps_ctx 仍然有效。临时注入 ContextVar。
+        _ctxvar_token = _current_context.set(ctx)
+        try:
+            output_ld = runtime.forward(None, query_ld, key_ld, value_ld)
+        finally:
+            _current_context.reset(_ctxvar_token)
 
         # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
         if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
