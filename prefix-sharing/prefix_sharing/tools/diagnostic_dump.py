@@ -524,6 +524,7 @@ def dump_rope_postqk_verl080(layer_number: int,
                              num_layers: int,
                              positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE Q/K. Auto-flush to rope_postqk.pt."""
+    global _ROPE_BUFFER
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
