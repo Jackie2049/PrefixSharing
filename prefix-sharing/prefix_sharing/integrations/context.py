@@ -132,11 +132,11 @@ def prefix_sharing_runtime_context(
 
     store = PrefixAttentionStore()
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
-    token = _current_context.set(ctx)
+    ctxvar_token = _current_context.set(ctx)
     try:
         yield ctx
     finally:
-        _current_context.reset(token)
+        _current_context.reset(ctxvar_token)
         _log_prefix_sharing_audit(ctx)
         ctx.store.close()
 
@@ -162,10 +162,10 @@ def create_prefix_sharing_context(
     """
     store = PrefixAttentionStore()
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
-    token = _current_context.set(ctx)
+    ctxvar_token = _current_context.set(ctx)
 
     def cleanup() -> None:
-        _current_context.reset(token)
+        _current_context.reset(ctxvar_token)
         _log_prefix_sharing_audit(ctx)
         ctx.store.close()
 
