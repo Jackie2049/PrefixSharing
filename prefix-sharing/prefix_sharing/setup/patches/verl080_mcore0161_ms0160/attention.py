@@ -31,9 +31,11 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         *,
         inference_params=None,
     ):
-        from prefix_sharing.integrations.context import current_prefix_sharing_context
-
-        ctx = current_prefix_sharing_context()
+        # 优先 module 属性（AC recompute 兼容），回退 ContextVar
+        ctx = getattr(self, '_ps_ctx', None)
+        if ctx is None:
+            from prefix_sharing.integrations.context import current_prefix_sharing_context
+            ctx = current_prefix_sharing_context()
         if ctx is None:
             # ── normal path: 调用原始 forward ──
             _result = original_forward(

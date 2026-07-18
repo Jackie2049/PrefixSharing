@@ -92,9 +92,11 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
     def patched_attention(module: Any, query: Any, key: Any, value: Any,
                           attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
-        from prefix_sharing.integrations.context import current_prefix_sharing_context
-
-        ctx = current_prefix_sharing_context()
+        # 优先 module 属性（AC recompute 兼容），回退 ContextVar（Megatron 等路径）
+        ctx = getattr(module, '_ps_ctx', None)
+        if ctx is None:
+            from prefix_sharing.integrations.context import current_prefix_sharing_context
+            ctx = current_prefix_sharing_context()
 
         # ── OFF path: no prefix sharing context → transparent passthrough ──
         if ctx is None:

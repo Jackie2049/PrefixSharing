@@ -155,7 +155,7 @@ def _forward_step_with_engine_prepare(
     from contextlib import nullcontext
 
     from prefix_sharing.integrations.context import current_prefix_sharing_context
-    from prefix_sharing.integrations.context import prefix_sharing_runtime_context
+    from prefix_sharing.integrations.context import create_prefix_sharing_context
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
 
@@ -207,7 +207,29 @@ def _forward_step_with_engine_prepare(
         if autocast_dtype == torch.float32
         else torch.autocast(device_type=device_name, dtype=autocast_dtype)
     )
-    with prefix_sharing_runtime_context(ps_state), autocast_ctx:
+    # ── Create PS context with manual lifecycle (survives backward for AC) ──
+    ctx, ctx_cleanup = create_prefix_sharing_context(ps_state)
+
+    # Set _ps_ctx on every attention module so the attention patch reads
+    # the context from the module itself rather than ContextVar (compatible
+    # with activation‑checkpointing recompute, which bypasses the context
+    # manager that set the ContextVar).
+    for _mod in self.module.modules():
+        if hasattr(_mod, 'layer_idx') and hasattr(_mod, 'q_proj'):
+            _mod._ps_ctx = ctx
+
+    def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
+        """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
+        ctx_cleanup()
+        for _m in self.module.modules():
+            try:
+                del _m._ps_ctx
+            except AttributeError:
+                pass
+
+    self.module.register_full_backward_hook(_cleanup_ps_ctx)
+
+    with autocast_ctx:
         if profiler is not None:
             profiler.start_memory()
             profiler.start_phase(PerfProfiler.PHASE_FORWARD)

@@ -179,75 +179,88 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         modified_iter = iter([batch_for_forward])
 
         # ── runtime context ──
-        from prefix_sharing.integrations.context import prefix_sharing_runtime_context
-        from contextlib import nullcontext
+        from prefix_sharing.integrations.context import create_prefix_sharing_context
 
-        context_manager = (
-            prefix_sharing_runtime_context(ps_state)
-            if ps_state is not None
-            else nullcontext()
-        )
+        if ps_state is not None:
+            ctx, ctx_cleanup = create_prefix_sharing_context(ps_state)
+
+            # Set _ps_ctx on Megatron Attention modules so the attention
+            # patch survives AC recompute (which bypasses the ContextVar).
+            for _mod in model.modules():
+                if hasattr(_mod, 'layer_number') and hasattr(_mod, 'get_query_key_value_tensors'):
+                    _mod._ps_ctx = ctx
+
+            def _cleanup_ps_ctx(*_args, **_kwargs):
+                ctx_cleanup()
+                for _m in model.modules():
+                    try:
+                        del _m._ps_ctx
+                    except AttributeError:
+                        pass
+
+            model.register_full_backward_hook(_cleanup_ps_ctx)
+        else:
+            ctx = None
 
         _ps_forward_step_probe("before_original_forward_step", has_runtime_state=ps_state is not None)
-        with context_manager:
-            output = original_forward_step(
-                self,
-                modified_iter,
-                model,
-                logits_processor_func,
-                postprocess_micro_batch_func,
+        output = original_forward_step(
+            self,
+            modified_iter,
+            model,
+            logits_processor_func,
+            postprocess_micro_batch_func,
+        )
+        # v080 restore：在 context 仍激活时重组 reuser prefix 区段。
+        # forward_step 返回 (output_dict, partial(postprocess_func))，
+        # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
+        # 会检查 context / restore_indices，无 restore 需求时 early return。
+        if ps_state is not None:
+            from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
+            from prefix_sharing.integrations.context import current_prefix_sharing_context
+            from verl.utils.megatron.tensor_parallel import (
+                vocab_parallel_entropy,
+                vocab_parallel_log_probs_from_logits,
             )
-            # v080 restore：在 context 仍激活时重组 reuser prefix 区段。
-            # forward_step 返回 (output_dict, partial(postprocess_func))，
-            # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
-            # 会检查 context / restore_indices，无 restore 需求时 early return。
-            if ps_state is not None:
-                from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
-                from prefix_sharing.integrations.context import current_prefix_sharing_context
-                from verl.utils.megatron.tensor_parallel import (
-                    vocab_parallel_entropy,
-                    vocab_parallel_log_probs_from_logits,
-                )
-                output_dict, postprocess_fn = output
-                output_dict = restore_via_2d_unfold_verl080(
-                    output_dict,
-                    vocab_parallel_log_probs_from_logits,
-                    vocab_parallel_entropy,
-                )
-                # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
-                # restore 已消费完毕）。clear 职责在此，不在包装函数内。
-                ctx = current_prefix_sharing_context()
-                if ctx is not None:
-                    ctx.prefix_last_logits_saved.clear()
-                output = (output_dict, postprocess_fn)
-            # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
-            # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
-            # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
-            import os as _os2
-            if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                from prefix_sharing.tools.diagnostic_dump import (
-                    nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
-                )
-                from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-                # 对齐 v070: tag = "old" if forward_only else "train"。
-                # forward_step 拿不到 forward_only，用 model.training 等价区分
-                # （eval_mode→training=False→"old" 对应 old_logp 阶段；
-                #  train_mode→training=True→"train" 对应 update_actor 阶段）。
-                # 这样一次 run 自动产出 logprobs_old + logprobs_train 两份，不互相覆盖。
-                _tag = "train" if model.training else "old"
-                _out_dict, _ = output
-                _lp = _out_dict.get("log_probs")
-                if _is_nested_tensor(_lp):
-                    if ps_state is not None:
-                        _ol = list(ps_state.prefix_sharing_plan.original_lengths)
-                    else:
-                        _ol = [int(d) for d in _lp.offsets().diff().tolist()]
-                    _Lmax = max(_ol) if _ol else 0
-                    dump_logprobs_2d_verl080(nested_to_2d_full(_lp, _ol, _Lmax), _tag)
-                    _ent = _out_dict.get("entropy")
-                    if _is_nested_tensor(_ent):
-                        dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
-            # ##### [PS-diag] dump 2D logprobs/entropy end #####
+            output_dict, postprocess_fn = output
+            output_dict = restore_via_2d_unfold_verl080(
+                output_dict,
+                vocab_parallel_log_probs_from_logits,
+                vocab_parallel_entropy,
+            )
+            # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
+            # restore 已消费完毕）。clear 职责在此，不在包装函数内。
+            _restore_ctx = current_prefix_sharing_context()
+            if _restore_ctx is not None:
+                _restore_ctx.prefix_last_logits_saved.clear()
+            output = (output_dict, postprocess_fn)
+        # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
+        # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
+        # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
+        import os as _os2
+        if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump import (
+                nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
+            )
+            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+            # 对齐 v070: tag = "old" if forward_only else "train"。
+            # forward_step 拿不到 forward_only，用 model.training 等价区分
+            # （eval_mode→training=False→"old" 对应 old_logp 阶段；
+            #  train_mode→training=True→"train" 对应 update_actor 阶段）。
+            # 这样一次 run 自动产出 logprobs_old + logprobs_train 两份，不互相覆盖。
+            _tag = "train" if model.training else "old"
+            _out_dict, _ = output
+            _lp = _out_dict.get("log_probs")
+            if _is_nested_tensor(_lp):
+                if ps_state is not None:
+                    _ol = list(ps_state.prefix_sharing_plan.original_lengths)
+                else:
+                    _ol = [int(d) for d in _lp.offsets().diff().tolist()]
+                _Lmax = max(_ol) if _ol else 0
+                dump_logprobs_2d_verl080(nested_to_2d_full(_lp, _ol, _Lmax), _tag)
+                _ent = _out_dict.get("entropy")
+                if _is_nested_tensor(_ent):
+                    dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
+        # ##### [PS-diag] dump 2D logprobs/entropy end #####
         _ps_forward_step_probe("after_original_forward_step")
         return output
 
