@@ -985,7 +985,13 @@ def dump_attn_grad_verl080(
     if num_layers == 0:
         return
 
-    hidden_dim = grad.shape[-1] * grad.shape[-2]
+    # grad_output[0] 来自 module.register_full_backward_hook，是 post-o_proj
+    # 的 [B, L, hidden]，只有一个尾部维度是 hidden dim。对比 dump_fsdp_attn_output
+    # 的 pre-o_proj [B, L, H, D] 需要 shape[-2]*shape[-1]。
+    if grad.dim() == 4:
+        hidden_dim = grad.shape[-1] * grad.shape[-2]
+    else:
+        hidden_dim = grad.shape[-1]
     grad_2d = grad.reshape(-1, hidden_dim).detach().cpu().contiguous()
 
     global _ATTN_GRAD_BUFFER
