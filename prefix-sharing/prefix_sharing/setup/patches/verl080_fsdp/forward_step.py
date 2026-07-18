@@ -307,6 +307,9 @@ def _forward_step_with_engine_prepare(
             if _perf_dir is not None:
                 profiler.save(_perf_dir)
 
+        loss.register_hook(
+            lambda g: print(f"[PS-grad-debug] loss_grad_norm={g.norm().item():.6e}", flush=True))
+
         return loss, {
             "model_output": model_output,
             "loss": loss.detach().item(),
@@ -407,6 +410,8 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
+        loss.register_hook(
+            lambda g: print(f"[PS-grad-debug-OFF] loss_grad_norm={g.norm().item():.6e}", flush=True))
         return loss, {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
 
 
