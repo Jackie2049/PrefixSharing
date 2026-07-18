@@ -224,6 +224,8 @@ def _forward_step_with_engine_prepare(
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
+        _p = next(_module.parameters())
+        print(f"[PS-diag] param_norm={_p.data.norm().item():.6e}", flush=True)
         ctx_cleanup()
         for _m in self.module.modules():
             try:
