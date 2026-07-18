@@ -260,7 +260,15 @@ def _forward_step_with_engine_prepare(
         )
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
+        _lp_before = model_output.get("log_probs")
+        if _lp_before is not None and _lp_before.requires_grad:
+            _lp_before.register_hook(
+                lambda g, tag="BEFORE": print(f"[PS-diag] log_probs_grad_{tag}={float(g.abs().sum()):.6e}", flush=True))
         model_output = _restore_engine_model_output(model_output)
+        _lp_after = model_output.get("log_probs")
+        if _lp_after is not None and _lp_after.requires_grad:
+            _lp_after.register_hook(
+                lambda g, tag="AFTER": print(f"[PS-diag] log_probs_grad_{tag}={float(g.abs().sum()):.6e}", flush=True))
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU overhead: restore
 
@@ -296,13 +304,6 @@ def _forward_step_with_engine_prepare(
             _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
             if _perf_dir is not None:
                 profiler.save(_perf_dir)
-
-        if loss_function is not None:
-            _lp = model_output.get("log_probs")
-            print(f"[PS-grad-debug] log_probs.requires_grad={_lp.requires_grad if _lp is not None else 'N/A'}", flush=True)
-            if _lp is not None and _lp.requires_grad:
-                _lp.register_hook(
-                    lambda g: print(f"[PS-grad-debug] log_probs_grad={float(g.abs().sum()):.6e}", flush=True))
 
         return loss, {
             "model_output": model_output,
