@@ -224,6 +224,16 @@ def _forward_step_with_engine_prepare(
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
+        # TODO: 调试用，确认梯度后删除
+        _any_nonzero = False
+        for _pn, _pp in _module.named_parameters():
+            if _pp.grad is not None and _pp.grad.abs().sum() > 0:
+                print(f"[PS-grad-debug] param '{_pn}' grad_norm={_pp.grad.norm().item():.6e}", flush=True)
+                _any_nonzero = True
+                break
+        if not _any_nonzero:
+            print("[PS-grad-debug] ALL params have zero grad", flush=True)
+
         ctx_cleanup()
         for _m in self.module.modules():
             try:
@@ -318,6 +328,7 @@ def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
     _num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
     if _num_layers == 0:
         return
+    _count = 0
     for _mod in model.modules():
         if hasattr(_mod, 'layer_idx') and hasattr(_mod, 'q_proj'):
             _ln = int(_mod.layer_idx) + 1
@@ -337,6 +348,10 @@ def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
 
             _mod._ps_grad_handles.append(
                 _mod.register_full_backward_hook(_make_grad_hook(_ln)))
+            _count += 1
+
+    print(f"[PS-grad-debug] registered hooks on {_count}/{_num_layers} layers, "
+          f"forward_only={forward_only}", flush=True)
 
 
 def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool) -> Any:
