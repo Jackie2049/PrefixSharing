@@ -302,7 +302,7 @@ def _forward_step_with_engine_prepare(
             print(f"[PS-grad-debug] log_probs.requires_grad={_lp.requires_grad if _lp is not None else 'N/A'}", flush=True)
             if _lp is not None and _lp.requires_grad:
                 _lp.register_hook(
-                    lambda g: print(f"[PS-grad-debug] log_probs_grad_norm={g.norm().item():.6e}", flush=True))
+                    lambda g: print(f"[PS-grad-debug] log_probs_grad={float(g.abs().sum()):.6e}", flush=True))
 
         return loss, {
             "model_output": model_output,
