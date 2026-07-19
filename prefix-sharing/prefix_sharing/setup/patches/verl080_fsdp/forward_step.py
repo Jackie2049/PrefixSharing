@@ -225,8 +225,8 @@ def _forward_step_with_engine_prepare(
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
-        _p = next(_module.parameters())
-        print(f"[PS-diag] param_norm={_p.data.norm().item():.6e}", flush=True)
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_BACKWARD)
         ctx_cleanup()
         for _m in self.module.modules():
             try:
@@ -301,10 +301,8 @@ def _forward_step_with_engine_prepare(
             if _perf_dir is not None:
                 profiler.save(_perf_dir)
 
-        if not forward_only:
-            loss.register_hook(
-                lambda g: print(f"[PS-diag] param_norm={next(self.module.parameters()).data.norm().item():.6e}",
-                                flush=True))
+        if profiler is not None and not forward_only:
+            profiler.start_phase(PerfProfiler.PHASE_BACKWARD)
 
         return loss, {
             "model_output": model_output,
