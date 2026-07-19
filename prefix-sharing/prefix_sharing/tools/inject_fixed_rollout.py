@@ -182,35 +182,53 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    # Select only the first N sequences (before reward randomize + stack).
-    _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "0"))
-    if _num_seq > 0:
-        n_orig = len(fixed_data)
-        if n_orig > _num_seq:
-            # Use TensorDict slice to properly update batch_size
-            fixed_data.batch = fixed_data.batch[:_num_seq]
-            for _meta_key in list(fixed_data.non_tensor_batch.keys()):
-                _mv = fixed_data.non_tensor_batch[_meta_key]
-                if hasattr(_mv, '__len__') and len(_mv) == n_orig:
-                    fixed_data.non_tensor_batch[_meta_key] = _mv[:_num_seq]
-            print(f"[FixedRollout] Selected {_num_seq}/{n_orig} sequences")
+    # Extract batch to a plain dict so we can manipulate it freely
+    # (TensorDict has strict batch_size validation that complicates
+    # in-place slicing/stacking).  Same pattern as prefix-0501.
+    batch = dict(fixed_data.batch)
+    non_tensor_batch = dict(fixed_data.non_tensor_batch) if fixed_data.non_tensor_batch else {}
+    meta_info = dict(fixed_data.meta_info)
+    n_orig = len(fixed_data)
 
-    # TODO: debug only — randomize reward scores so GRPO advantage is non-zero.
-    # Remove after verifying gradient dump.
     import torch as _torch
+
+    # ── 1. Select first N sequences ──
+    _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "0"))
+    if _num_seq > 0 and n_orig > _num_seq:
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key][:_num_seq]
+        for _key in non_tensor_batch:
+            _mv = non_tensor_batch[_key]
+            if hasattr(_mv, '__len__') and len(_mv) == n_orig:
+                non_tensor_batch[_key] = _mv[:_num_seq]
+        n_orig = _num_seq
+        print(f"[FixedRollout] Selected {_num_seq} sequences")
+
+    # ── 2. Randomize reward scores (debug only) ──
     _torch.manual_seed(42)
     for _key in ("token_level_rewards", "rm_scores"):
-        _rm = fixed_data.batch.get(_key)
+        _rm = batch.get(_key)
         if _rm is not None:
             _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
 
-    # Stack baseline: duplicate the entire batch N times (after reward randomize).
-    # Copies are adjacent: [A, B, C, A, B, C] for stack=2 with 3 original seqs.
+    # ── 3. Stack (repeat dim-0) ──
     _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
     if _stack > 1:
-        fixed_data.batch = _torch.cat([fixed_data.batch] * _stack, dim=0)
-        print(f"[FixedRollout] Stacked batch x{_stack}: "
-              f"{len(fixed_data)} sequences (before padding)")
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key].repeat(_stack, *([1] * (batch[_key].dim() - 1)))
+        for _key in non_tensor_batch:
+            _mv = non_tensor_batch[_key]
+            if hasattr(_mv, '__len__') and len(_mv) == n_orig and not isinstance(_mv, (str, bytes)):
+                non_tensor_batch[_key] = _mv * _stack
+        total_bs = n_orig * _stack
+        print(f"[FixedRollout] Stacked batch x{_stack}: {total_bs} sequences (before padding)")
+
+    # ── 4. Rebuild DataProto ──
+    from verl.protocol import DataProto
+    fixed_data = DataProto.from_dict(batch, non_tensors=non_tensor_batch)
+    fixed_data.meta_info = meta_info
 
     n = len(fixed_data)
     remainder = n % num_workers
