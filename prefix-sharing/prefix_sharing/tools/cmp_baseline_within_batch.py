@@ -392,7 +392,7 @@ def _worst_pair_by_rel_within(
             for j in range(i + 1, stack):
                 ri = tensor_2d[seq + i * num_sequences]
                 rj = tensor_2d[seq + j * num_sequences]
-                rel_diff = (ri - rj).abs() / ri.abs().clamp(min=1e-8)
+                rel_diff = (ri - rj).abs() / torch.maximum(ri.abs(), rj.abs()).clamp(min=1e-8)
                 rmax = float(rel_diff.max())
                 if rmax > worst_rel_max:
                     worst_rel_max = rmax

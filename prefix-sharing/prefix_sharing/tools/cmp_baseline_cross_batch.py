@@ -411,7 +411,7 @@ def _worst_pair_by_rel(
                 continue
             multi_row = multi_2d[multi_off]
 
-            rel_diff = (single_row - multi_row).abs() / single_row.abs().clamp(min=1e-8)
+            rel_diff = (single_row - multi_row).abs() / torch.maximum(single_row.abs(), multi_row.abs()).clamp(min=1e-8)
             rmax = float(rel_diff.max())
             if rmax > worst_rel_max:
                 worst_rel_max = rmax
