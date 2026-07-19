@@ -524,6 +524,7 @@ def main():
         _print_logits_packed(result)
 
     # ── 2D ──
+    _2d_tensors: list[tuple[str, torch.Tensor]] = []
     for file_tag, compare_name in [("logprobs", "logp"), ("entropy", "entropy")]:
         filename = f"{file_tag}_{args.tag}.pt"
         tensor_2d = _load_tensor(args.dir_multi, filename)
@@ -582,6 +583,7 @@ def main():
         )
         all_results.append(result)
         _print_2d_result(result)
+        _2d_tensors.append((f"{compare_name}_{args.tag}", tensor_2d))
 
     # ── Top-K ──
     if args.topk > 0:
