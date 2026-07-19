@@ -191,6 +191,16 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
         if _rm is not None:
             _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
 
+    # Stack baseline: duplicate the entire batch N times (after reward randomize).
+    # Copies are adjacent: [A, B, C, A, B, C] for stack=2 with 3 original seqs.
+    _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
+    if _stack > 1:
+        for _key, _val in fixed_data.batch.items():
+            if isinstance(_val, _torch.Tensor):
+                fixed_data.batch[_key] = _torch.cat([_val] * _stack, dim=0)
+        print(f"[FixedRollout] Stacked batch x{_stack}: "
+              f"{len(fixed_data)} sequences (before padding)")
+
     n = len(fixed_data)
     remainder = n % num_workers
     if remainder != 0:
