@@ -633,11 +633,27 @@ class FSDPEngine(BaseEngine):
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
+                # [PS-perf] start — backward + memory stop + save ——————
+                import os as _ps_perf_os
+                _ps_perf = getattr(self, '_ps_perf', None)
+                if _ps_perf is not None and not forward_only:
+                    _ps_perf.start_phase(_ps_perf.PHASE_BACKWARD)
+                # [PS-perf] end ——————————————————————————————————
+
                 if not forward_only:
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+
+                # [PS-perf] start ————————————————
+                if _ps_perf is not None and not forward_only:
+                    _ps_perf.stop_phase(_ps_perf.PHASE_BACKWARD)
+                    _ps_perf.stop_memory()
+                    _perf_dir = _ps_perf_os.environ.get("PREFIX_SHARING_PERF_DIR")
+                    if _perf_dir is not None:
+                        _ps_perf.save(_perf_dir)
+                # [PS-perf] end ——————————————————
 
             output_lst.append(meta_info)
 

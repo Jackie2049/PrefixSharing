@@ -20,18 +20,22 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
         from prefix_sharing.tools.perf_profiler import PerfProfiler
 
-        perf_profiler = PerfProfiler.create_if_enabled()
+        # Create profiler once per engine and reuse across old_logp + training calls.
+        if not hasattr(self, '_ps_perf'):
+            self._ps_perf = PerfProfiler.create_if_enabled()
+        perf_profiler = self._ps_perf
 
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
             import os as _os_diag_off
 
-            # ── Perf profiling for OFF baseline ──
+            # [PS-perf] start — OFF forward ——————————————
             if perf_profiler is not None:
                 perf_profiler.start_memory()
                 _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
                 perf_profiler.start_phase(_fwd_phase)
+            # [PS-perf] end ————————————————————————————————
 
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
@@ -48,13 +52,11 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
 
+            # [PS-perf] start — OFF forward stop ——————————
             if perf_profiler is not None:
                 perf_profiler.stop_phase(_fwd_phase)
-                perf_profiler.stop_memory()
-                import os as _os_perf_off
-                _perf_dir = _os_perf_off.environ.get("PREFIX_SHARING_PERF_DIR")
-                if _perf_dir is not None:
-                    perf_profiler.save(_perf_dir)
+                # memory stopped + saved in forward_backward_batch (verl)
+            # [PS-perf] end —————————————————————————————————
             return result
 
         if hasattr(micro_batch, "to"):
@@ -88,11 +90,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         )
 
         if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
-            if perf_profiler is not None:
-                with perf_profiler:
-                    return _forward_step_with_engine_prepare(
-                        self, micro_batch, loss_function, forward_only, ps_config,
-                    )
             return _forward_step_with_engine_prepare(
                 self, micro_batch, loss_function, forward_only, ps_config,
             )
@@ -160,12 +157,13 @@ def _forward_step_with_engine_prepare(
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
 
-    # ── Perf profiling ──
+    # [PS-perf] start — plan ——————————————————
     from prefix_sharing.tools.perf_profiler import PerfProfiler
-    profiler = PerfProfiler.current()
+    profiler = getattr(self, '_ps_perf', None)
 
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
+    # [PS-perf] end ———————————————————————————
 
     trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
         micro_batch,
@@ -188,6 +186,7 @@ def _forward_step_with_engine_prepare(
     )
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # CPU overhead: detect+plan+trim
+    # [PS-perf] end ———————————————————————————
 
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
@@ -225,13 +224,6 @@ def _forward_step_with_engine_prepare(
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
-        if profiler is not None:
-            profiler.stop_phase(PerfProfiler.PHASE_BACKWARD)
-            profiler.stop_memory()
-            import os as _os_perf
-            _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
-            if _perf_dir is not None:
-                profiler.save(_perf_dir)
         ctx_cleanup()
         for _m in self.module.modules():
             try:
@@ -248,6 +240,7 @@ def _forward_step_with_engine_prepare(
     self.module.register_full_backward_hook(_cleanup_ps_ctx)
 
     with autocast_ctx:
+        # [PS-perf] start — fwd —————————————————————
         if profiler is not None:
             profiler.start_memory()
             _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
@@ -255,6 +248,7 @@ def _forward_step_with_engine_prepare(
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
             profiler.stop_phase(_fwd_phase)
+        # [PS-perf] end ——————————————————————————————
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
@@ -267,11 +261,13 @@ def _forward_step_with_engine_prepare(
             micro_batch=trimmed_micro_batch,
             logits_processor_func=loss_function,
         )
+        # [PS-perf] start — restore ———————————————
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
         model_output = _restore_engine_model_output(model_output)
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU overhead: restore
+        # [PS-perf] end ——————————————————————————————
 
         import os as _os_diag2
         if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
@@ -284,6 +280,7 @@ def _forward_step_with_engine_prepare(
             )
 
         if loss_function is not None:
+            # [PS-perf] start — loss —————————————————
             if profiler is not None:
                 profiler.start_phase(PerfProfiler.PHASE_LOSS)
             loss, metrics = loss_function(
@@ -293,20 +290,11 @@ def _forward_step_with_engine_prepare(
             )
             if profiler is not None:
                 profiler.stop_phase(PerfProfiler.PHASE_LOSS)
+            # [PS-perf] end ———————————————————————————
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
-
-        if profiler is not None and forward_only:
-            # old_logp: no backward, stop memory + save now
-            profiler.stop_memory()
-            import os as _os_perf
-            _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
-            if _perf_dir is not None:
-                profiler.save(_perf_dir)
-        if profiler is not None and not forward_only:
-            profiler.start_phase(PerfProfiler.PHASE_BACKWARD)
 
         return loss, {
             "model_output": model_output,
@@ -380,8 +368,19 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     _register_grad_dump_hooks(self.module, forward_only)
     # ##### [PS-diag] end #####
 
+    # [PS-perf] start — OFF engine fwd ——————————————————
+    _perf = getattr(self, '_ps_perf', None)
+    if _perf is not None:
+        _perf.start_memory()
+        _fwd_phase = _perf.PHASE_FORWARD_OLD if forward_only else _perf.PHASE_FORWARD
+        _perf.start_phase(_fwd_phase)
+
     with autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
+        if _perf is not None:
+            _perf.stop_phase(_fwd_phase)
+            # memory stopped + saved in forward_backward_batch (verl)
+    # [PS-perf] end ———————————————————————————————————————
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
