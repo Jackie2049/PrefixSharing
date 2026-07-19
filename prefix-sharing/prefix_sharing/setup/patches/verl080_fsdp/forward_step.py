@@ -30,7 +30,8 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             # ── Perf profiling for OFF baseline ──
             if perf_profiler is not None:
                 perf_profiler.start_memory()
-                perf_profiler.start_phase(PerfProfiler.PHASE_FORWARD)
+                _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
+                perf_profiler.start_phase(_fwd_phase)
 
             # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
             # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
@@ -48,7 +49,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
 
             if perf_profiler is not None:
-                perf_profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
+                perf_profiler.stop_phase(_fwd_phase)
                 perf_profiler.stop_memory()
                 import os as _os_perf_off
                 _perf_dir = _os_perf_off.environ.get("PREFIX_SHARING_PERF_DIR")
@@ -244,10 +245,11 @@ def _forward_step_with_engine_prepare(
     with autocast_ctx:
         if profiler is not None:
             profiler.start_memory()
-            profiler.start_phase(PerfProfiler.PHASE_FORWARD)
+            _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
+            profiler.start_phase(_fwd_phase)
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
-            profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
+            profiler.stop_phase(_fwd_phase)
         import os as _os_logits_on
         if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size

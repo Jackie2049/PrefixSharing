@@ -59,7 +59,8 @@ class PerfProfiler:
 
     # ── Phase name constants ─────────────────────────────────────
     PHASE_PLAN = "ps.plan"            # detect + plan + batch trim (CPU)
-    PHASE_FORWARD = "fwd"             # model forward (includes attention)
+    PHASE_FORWARD = "fwd"             # model forward (training)
+    PHASE_FORWARD_OLD = "fwd.old"     # model forward (old_logp / forward_only)
     PHASE_BACKWARD = "bwd"            # model backward (via autograd)
     PHASE_ATTN_KV = "attn.kv"         # build_kv: store provider + load reuser
     PHASE_ATTN_COMPUTE = "attn.comp"  # attention computation (FA kernel)
