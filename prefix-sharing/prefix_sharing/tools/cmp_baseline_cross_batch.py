@@ -319,7 +319,7 @@ def _compare_2d_cross_batch(
             multi_row = multi_2d[multi_offset].reshape(-1)
 
             abs_diff = (single_row - multi_row).abs()
-            rel_diff = abs_diff / single_row.abs().clamp(min=1e-8)
+            rel_diff = abs_diff / torch.maximum(single_row.abs(), multi_row.abs()).clamp(min=1e-8)
             all_abs_diffs.extend(abs_diff.tolist())
             all_rel_diffs.extend(rel_diff.tolist())
 

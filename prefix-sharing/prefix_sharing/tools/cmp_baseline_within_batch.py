@@ -549,7 +549,7 @@ def main():
                 row_b = tensor_2d[row_b_offset].reshape(-1)
 
                 abs_diff = (row_a - row_b).abs()
-                rel_diff = abs_diff / row_a.abs().clamp(min=1e-8)
+                rel_diff = abs_diff / torch.maximum(row_a.abs(), row_b.abs()).clamp(min=1e-8)
                 all_abs_diffs.extend(abs_diff.tolist())
                 all_rel_diffs.extend(rel_diff.tolist())
                 worst_max_diff = max(worst_max_diff, float(abs_diff.max()))
