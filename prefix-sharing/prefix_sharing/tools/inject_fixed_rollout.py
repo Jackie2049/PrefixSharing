@@ -208,9 +208,7 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
     # Copies are adjacent: [A, B, C, A, B, C] for stack=2 with 3 original seqs.
     _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
     if _stack > 1:
-        for _key, _val in fixed_data.batch.items():
-            if isinstance(_val, _torch.Tensor):
-                fixed_data.batch[_key] = _torch.cat([_val] * _stack, dim=0)
+        fixed_data.batch = _torch.cat([fixed_data.batch] * _stack, dim=0)
         print(f"[FixedRollout] Stacked batch x{_stack}: "
               f"{len(fixed_data)} sequences (before padding)")
 
