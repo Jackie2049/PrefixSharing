@@ -585,11 +585,13 @@ def main():
 
     # ── Top-K ──
     if args.topk > 0:
-        _print_topk_plain_within(
-            args.dir_multi, cu_seqlens, num_sequences, args.stack,
-            "build_kv_input_v.pt", "build_kv_input_v",
-            args.topk, args.sort_err,
-        )
+        for _fn, _lb in [("attn_outputs.pt", "attn_outputs"),
+                         ("build_kv_input_v.pt", "build_kv_input_v"),
+                         ("attn_grads.pt", "attn_grads")]:
+            _print_topk_plain_within(
+                args.dir_multi, cu_seqlens, num_sequences, args.stack,
+                _fn, _lb, args.topk, args.sort_err,
+            )
         _print_topk_kv_within(
             args.dir_multi, cu_seqlens, num_sequences, args.stack,
             "rope_postqk.pt", "query", "key", "rope_postqk",

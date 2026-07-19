@@ -642,12 +642,14 @@ def main():
     # ── Top-K ──
     if args.topk > 0:
         # Per-layer plain dict: cos_min-worst pair → top-K dims
-        _print_topk_plain(
-            args.dir_single, args.dir_stacked,
-            cu_seqlens_single, cu_seqlens_multi, stack_count,
-            "build_kv_input_v.pt", "build_kv_input_v",
-            args.topk, args.sort_err,
-        )
+        for _fn, _lb in [("attn_outputs.pt", "attn_outputs"),
+                         ("build_kv_input_v.pt", "build_kv_input_v"),
+                         ("attn_grads.pt", "attn_grads")]:
+            _print_topk_plain(
+                args.dir_single, args.dir_stacked,
+                cu_seqlens_single, cu_seqlens_multi, stack_count,
+                _fn, _lb, args.topk, args.sort_err,
+            )
         # Per-layer KV dict (Q/K): cos_min-worst pair each → top-K dims
         _print_topk_kv(
             args.dir_single, args.dir_stacked,
