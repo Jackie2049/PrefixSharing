@@ -345,6 +345,94 @@ def _print_kv_table_baseline(result: CheckResult, label: str):
 
 
 # ============================================================
+#  Top-K helpers — find worst copy pair within a single dump
+# ============================================================
+
+def _worst_pair_by_cos_within(
+    data: dict, cu_seqlens: torch.Tensor,
+    num_sequences: int, stack: int, layer_idx: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
+    """Across all copy pairs, find the cos_min-worst token in *layer_idx*."""
+    tensor = data[layer_idx].float()
+    worst_cos_min = 1.0
+    worst_a = worst_b = None
+
+    for seq in range(num_sequences):
+        copies = [_slice_sequence(tensor, cu_seqlens, seq + k * num_sequences)
+                  for k in range(stack)]
+        for i in range(stack):
+            for j in range(i + 1, stack):
+                fi = copies[i].reshape(-1)
+                fj = copies[j].reshape(-1)
+                cos_vec = _cosine_sim(fi, fj, dim=-1)
+                cmin = float(cos_vec.min())
+                if cmin < worst_cos_min:
+                    worst_cos_min = cmin
+                    worst_a = fi[cos_vec.argmin()].cpu()
+                    worst_b = fj[cos_vec.argmin()].cpu()
+    return worst_a, worst_b, worst_cos_min
+
+
+def _worst_pair_by_rel_within(
+    tensor_2d: torch.Tensor, num_sequences: int, stack: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
+    """Across all copy pairs, find the rel_max-worst row in 2D tensor."""
+    worst_rel_max = 0.0
+    worst_a = worst_b = None
+
+    for seq in range(num_sequences):
+        if seq >= tensor_2d.shape[0]:
+            break
+        for i in range(stack):
+            for j in range(i + 1, stack):
+                ri = tensor_2d[seq + i * num_sequences]
+                rj = tensor_2d[seq + j * num_sequences]
+                rel_diff = (ri - rj).abs() / ri.abs().clamp(min=1e-8)
+                rmax = float(rel_diff.max())
+                if rmax > worst_rel_max:
+                    worst_rel_max = rmax
+                    worst_a = ri.cpu()
+                    worst_b = rj.cpu()
+    return worst_a, worst_b, worst_rel_max
+
+
+def _print_topk_plain_within(
+    directory: str, cu_seqlens: torch.Tensor,
+    num_sequences: int, stack: int,
+    filename: str, label: str, topk: int, sort_err: str,
+):
+    data = _load_per_layer_dict(directory, filename)
+    if data is None:
+        return
+    last_layer = max(_sorted_layer_keys(data))
+    a, b, cmin = _worst_pair_by_cos_within(
+        data, cu_seqlens, num_sequences, stack, last_layer)
+    if a is not None:
+        _print_topk_vec(a, b, topk, sort_err,
+                        f"{label}_L{last_layer}_cosmin_{cmin:.4f}")
+
+
+def _print_topk_kv_within(
+    directory: str, cu_seqlens: torch.Tensor,
+    num_sequences: int, stack: int,
+    filename: str, field_a: str, field_b: str,
+    label: str, topk: int, sort_err: str,
+):
+    data = _load_per_layer_dict(directory, filename)
+    if data is None:
+        return
+    last_layer = max(_sorted_layer_keys(data))
+    for field, tag in [(field_a, f"{label}_{field_a}"),
+                       (field_b, f"{label}_{field_b}")]:
+        single_f = {k: v[field] for k, v in data.items() if field in v}
+        a, b, cmin = _worst_pair_by_cos_within(
+            single_f, cu_seqlens, num_sequences, stack, last_layer)
+        if a is not None:
+            _print_topk_vec(a, b, topk, sort_err,
+                            f"{tag}_L{last_layer}_cosmin_{cmin:.4f}")
+
+
+# ============================================================
 #  Main
 # ============================================================
 
@@ -488,6 +576,27 @@ def main():
         )
         all_results.append(result)
         _print_2d_result(result)
+
+    # ── Top-K ──
+    if args.topk > 0:
+        _print_topk_plain_within(
+            args.dir_multi, cu_seqlens, num_sequences, args.stack,
+            "build_kv_input_v.pt", "build_kv_input_v",
+            args.topk, args.sort_err,
+        )
+        _print_topk_kv_within(
+            args.dir_multi, cu_seqlens, num_sequences, args.stack,
+            "rope_postqk.pt", "query", "key", "rope_postqk",
+            args.topk, args.sort_err,
+        )
+        for label, tensor_2d in _2d_tensors:
+            if tensor_2d.dim() >= 2:
+                t1, t2, rel = _worst_pair_by_rel_within(
+                    tensor_2d, num_sequences, args.stack)
+                if t1 is not None:
+                    _print_topk_2d(t1.unsqueeze(0), t2.unsqueeze(0), None,
+                                   args.topk, args.sort_err,
+                                   f"{label}_relmax_{rel:.4f}")
 
     _print_summary(all_results)
 
