@@ -182,6 +182,26 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
+    # Select only the first N sequences (before reward randomize + stack).
+    _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "0"))
+    if _num_seq > 0:
+        n_orig = len(fixed_data)
+        if n_orig > _num_seq:
+            for _key, _val in fixed_data.batch.items():
+                if isinstance(_val, torch.Tensor) and _val.shape[0] == n_orig:
+                    fixed_data.batch[_key] = _val[:_num_seq]
+            for _meta_key in list(fixed_data.non_tensor_batch.keys()):
+                _mv = fixed_data.non_tensor_batch[_meta_key]
+                if isinstance(_mv, list) and len(_mv) == n_orig:
+                    fixed_data.non_tensor_batch[_meta_key] = _mv[:_num_seq]
+            # Update batch_size metadata so __len__ returns the new count
+            if hasattr(fixed_data.batch, 'batch_size'):
+                try:
+                    fixed_data.batch.batch_size = (_num_seq,)
+                except (AttributeError, TypeError):
+                    pass
+            print(f"[FixedRollout] Selected {_num_seq}/{n_orig} sequences")
+
     # TODO: debug only — randomize reward scores so GRPO advantage is non-zero.
     # Remove after verifying gradient dump.
     import torch as _torch
