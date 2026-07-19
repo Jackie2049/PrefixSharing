@@ -68,15 +68,6 @@ def _sorted_layer_keys(data: dict) -> list[int]:
     return sorted(int(k) for k in data.keys())
 
 
-def _group_by_token_count(tensors: list[torch.Tensor]
-                          ) -> dict[int, list[torch.Tensor]]:
-    """Group tensors by their leading dimension (token count)."""
-    groups: dict[int, list[torch.Tensor]] = {}
-    for tensor in tensors:
-        groups.setdefault(tensor.shape[0], []).append(tensor)
-    return groups
-
-
 # ============================================================
 #  Pairwise comparison within a group of same-length tensors
 # ============================================================
@@ -111,10 +102,14 @@ def _pairwise_metrics(copies: list[torch.Tensor]) -> dict:
 
 def _compare_plain_within(
     directory: str, filename: str,
-    cu_seqlens: torch.Tensor, total_sequences: int,
+    cu_seqlens: torch.Tensor, num_sequences: int, stack: int,
     filter_layer: int | None, label: str,
 ) -> CheckResult | None:
-    """Pairwise-compare copies within a single dump for ``filename``."""
+    """Pairwise-compare copies within a single dump for ``filename``.
+
+    Only compares the SAME logical sequence across copies (seq[i] of copy 0
+    vs seq[i] of copy 1 vs ...), NOT cross-sequence pairs.
+    """
     data = _load_per_layer_dict(directory, filename)
     if data is None:
         return None
@@ -131,30 +126,28 @@ def _compare_plain_within(
 
     for layer_index in layers:
         multi_tensor = data[layer_index].float()
-        copies = [_slice_sequence(multi_tensor, cu_seqlens, seq_index)
-                  for seq_index in range(total_sequences)]
-        groups = _group_by_token_count(copies)
-
         layer_max_diff = 0.0
         layer_cos_min = 1.0
-        group_cos_avgs: list[float] = []
+        layer_cos_avgs: list[float] = []
 
-        for group_copies in groups.values():
-            if len(group_copies) < 2:
+        for seq_index in range(num_sequences):
+            # Collect the *same* logical sequence across copies
+            copies = [_slice_sequence(multi_tensor, cu_seqlens,
+                                      seq_index + k * num_sequences)
+                      for k in range(stack)]
+            if len(copies) < 2:
                 continue
-            metrics = _pairwise_metrics(group_copies)
+            metrics = _pairwise_metrics(copies)
             layer_max_diff = max(layer_max_diff, metrics["max_diff"])
             layer_cos_min = min(layer_cos_min, metrics["cos_min"])
-            group_cos_avgs.append(metrics["cos_avg"])
+            layer_cos_avgs.append(metrics["cos_avg"])
 
         per_layer[layer_index] = {
             "max_diff": layer_max_diff,
-            "cos_avg": (sum(group_cos_avgs) / len(group_cos_avgs)
-                        if group_cos_avgs else 0.0),
+            "cos_avg": (sum(layer_cos_avgs) / len(layer_cos_avgs)
+                        if layer_cos_avgs else 0.0),
             "cos_min": layer_cos_min,
             "n_tokens": multi_tensor.shape[0],
-            "on_T": multi_tensor.shape[0],
-            "off_T": multi_tensor.shape[0],
         }
         worst_max_diff = max(worst_max_diff, layer_max_diff)
         worst_cos_min = min(worst_cos_min, layer_cos_min)
@@ -174,11 +167,12 @@ def _compare_plain_within(
 
 def _compare_kv_within(
     directory: str, filename: str,
-    cu_seqlens: torch.Tensor, total_sequences: int,
+    cu_seqlens: torch.Tensor, num_sequences: int, stack: int,
     filter_layer: int | None, label: str,
     field_first: str, field_second: str,
 ) -> CheckResult | None:
-    """Pairwise-compare ``{layer: {field_first, field_second}}`` within a dump."""
+    """Pairwise-compare ``{layer: {field_first, field_second}}`` within a dump.
+    Only compares the same logical sequence across copies."""
     data = _load_per_layer_dict(directory, filename)
     if data is None:
         return None
@@ -197,31 +191,28 @@ def _compare_kv_within(
             continue
         multi_first = layer_data[field_first].float()
         multi_second = layer_data[field_second].float()
-        first_copies = [_slice_sequence(multi_first, cu_seqlens, seq_index)
-                        for seq_index in range(total_sequences)]
-        second_copies = [_slice_sequence(multi_second, cu_seqlens, seq_index)
-                         for seq_index in range(total_sequences)]
-
-        first_groups = _group_by_token_count(first_copies)
-        second_groups = _group_by_token_count(second_copies)
 
         first_worst = {"max_diff": 0.0, "cos_min": 1.0, "cos_avg": 0.0}
         second_worst = {"max_diff": 0.0, "cos_min": 1.0, "cos_avg": 0.0}
         first_avgs, second_avgs = [], []
 
-        for group in first_groups.values():
-            if len(group) >= 2:
-                metrics = _pairwise_metrics(group)
-                first_worst["max_diff"] = max(first_worst["max_diff"], metrics["max_diff"])
-                first_worst["cos_min"] = min(first_worst["cos_min"], metrics["cos_min"])
-                first_avgs.append(metrics["cos_avg"])
-
-        for group in second_groups.values():
-            if len(group) >= 2:
-                metrics = _pairwise_metrics(group)
-                second_worst["max_diff"] = max(second_worst["max_diff"], metrics["max_diff"])
-                second_worst["cos_min"] = min(second_worst["cos_min"], metrics["cos_min"])
-                second_avgs.append(metrics["cos_avg"])
+        for seq_index in range(num_sequences):
+            f_copies = [_slice_sequence(multi_first, cu_seqlens,
+                                        seq_index + k * num_sequences)
+                        for k in range(stack)]
+            s_copies = [_slice_sequence(multi_second, cu_seqlens,
+                                        seq_index + k * num_sequences)
+                        for k in range(stack)]
+            if len(f_copies) >= 2:
+                m = _pairwise_metrics(f_copies)
+                first_worst["max_diff"] = max(first_worst["max_diff"], m["max_diff"])
+                first_worst["cos_min"] = min(first_worst["cos_min"], m["cos_min"])
+                first_avgs.append(m["cos_avg"])
+            if len(s_copies) >= 2:
+                m = _pairwise_metrics(s_copies)
+                second_worst["max_diff"] = max(second_worst["max_diff"], m["max_diff"])
+                second_worst["cos_min"] = min(second_worst["cos_min"], m["cos_min"])
+                second_avgs.append(m["cos_avg"])
 
         per_layer[layer_index] = {
             "Q_max_diff": first_worst["max_diff"],
@@ -230,7 +221,11 @@ def _compare_kv_within(
             "Q_cos_min": first_worst["cos_min"],
             "K_cos_avg": sum(second_avgs) / len(second_avgs) if second_avgs else 0.0,
             "K_cos_min": second_worst["cos_min"],
-            "n_tokens": sum(g[0].shape[0] * len(g) for g in first_groups.values()),
+            "n_tokens": sum(g[0].shape[0] * len(g) for g in
+                            [_slice_sequence(multi_first, cu_seqlens,
+                                             seq_index + k * num_sequences)
+                             for seq_index in range(num_sequences)
+                             for k in range(stack)][:1]),
         }
 
     result_name = f"{label}_L{filter_layer}" if filter_layer is not None else label
@@ -244,26 +239,25 @@ def _compare_kv_within(
 def _compare_logits_within(
     directory: str,
     cu_seqlens: torch.Tensor,
-    total_sequences: int,
+    num_sequences: int, stack: int,
 ) -> CheckResult | None:
-    """Pairwise-compare packed logits within a dump."""
+    """Pairwise-compare packed logits within a dump. Same-sequence copies only."""
     filepath = os.path.join(directory, "logits.pt")
     if not os.path.exists(filepath):
         return None
 
     multi_logits = torch.load(filepath, weights_only=True).float()
     multi_logits = multi_logits.reshape(-1, multi_logits.size(-1))
-    copies = [_slice_sequence(multi_logits, cu_seqlens, seq_index)
-              for seq_index in range(total_sequences)]
-    groups = _group_by_token_count(copies)
-
     worst_max_diff = 0.0
     worst_cos_min = 1.0
     all_cos_avgs: list[float] = []
 
-    for group in groups.values():
-        if len(group) >= 2:
-            metrics = _pairwise_metrics(group)
+    for seq_index in range(num_sequences):
+        copies = [_slice_sequence(multi_logits, cu_seqlens,
+                                  seq_index + k * num_sequences)
+                  for k in range(stack)]
+        if len(copies) >= 2:
+            metrics = _pairwise_metrics(copies)
             worst_max_diff = max(worst_max_diff, metrics["max_diff"])
             worst_cos_min = min(worst_cos_min, metrics["cos_min"])
             all_cos_avgs.append(metrics["cos_avg"])
@@ -271,7 +265,7 @@ def _compare_logits_within(
     return CheckResult(
         name="logits", passed=worst_max_diff == 0.0,
         metrics={
-            "n_tokens": copies[0].shape[0] if copies else 0,
+            "n_tokens": (num_sequences * stack) if num_sequences > 0 else 0,
             "cos_avg": (sum(all_cos_avgs) / len(all_cos_avgs)
                         if all_cos_avgs else 0.0),
             "cos_min": worst_cos_min,
@@ -498,7 +492,7 @@ def main():
         ("attn_grads.pt", "attn_grads"),
     ]:
         result = _compare_plain_within(
-            args.dir_multi, filename, cu_seqlens, total_sequences,
+            args.dir_multi, filename, cu_seqlens, num_sequences, args.stack,
             args.layer, label,
         )
         if result:
@@ -510,7 +504,7 @@ def main():
         ("rope_postqk.pt", "rope_postqk", "query", "key"),
     ]:
         result = _compare_kv_within(
-            args.dir_multi, filename, cu_seqlens, total_sequences,
+            args.dir_multi, filename, cu_seqlens, num_sequences, args.stack,
             args.layer, label, field_a, field_b,
         )
         if result:
@@ -518,7 +512,7 @@ def main():
             _print_kv_table_baseline(result, label)
 
     # ── Logits ──
-    result = _compare_logits_within(args.dir_multi, cu_seqlens, total_sequences)
+    result = _compare_logits_within(args.dir_multi, cu_seqlens, num_sequences, args.stack)
     if result:
         all_results.append(result)
         _print_logits_packed(result)
