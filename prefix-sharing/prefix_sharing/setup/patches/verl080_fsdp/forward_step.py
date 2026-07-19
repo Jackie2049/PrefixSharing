@@ -227,6 +227,11 @@ def _forward_step_with_engine_prepare(
         """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_BACKWARD)
+            profiler.stop_memory()
+            import os as _os_perf
+            _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
+            if _perf_dir is not None:
+                profiler.save(_perf_dir)
         ctx_cleanup()
         for _m in self.module.modules():
             try:
@@ -293,14 +298,13 @@ def _forward_step_with_engine_prepare(
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
 
-        # ── Stop memory sampling and save perf data ──
-        if profiler is not None:
+        if profiler is not None and forward_only:
+            # old_logp: no backward, stop memory + save now
             profiler.stop_memory()
             import os as _os_perf
             _perf_dir = _os_perf.environ.get("PREFIX_SHARING_PERF_DIR")
             if _perf_dir is not None:
                 profiler.save(_perf_dir)
-
         if profiler is not None and not forward_only:
             profiler.start_phase(PerfProfiler.PHASE_BACKWARD)
 
