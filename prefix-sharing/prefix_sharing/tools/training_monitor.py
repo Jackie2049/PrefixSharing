@@ -169,6 +169,12 @@ class MemoryMonitor:
         self._running = False
         self._thread: threading.Thread | None = None
         self.device_type = self._resolve_device(device_type)
+        self._proc = None
+        try:
+            import psutil
+            self._proc = psutil.Process()
+        except (ImportError, Exception):
+            pass
 
     # ------------------------------------------------------------------
     # public
@@ -176,11 +182,8 @@ class MemoryMonitor:
 
     def start(self) -> None:
         """Begin background sampling."""
-        try:
-            import psutil
-            psutil.cpu_percent(interval=None)  # prime the first-call baseline
-        except (ImportError, Exception):
-            pass
+        if self._proc is not None:
+            self._proc.cpu_percent(interval=None)  # prime the first-call baseline
         self._samples.clear()
         self._running = True
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
@@ -281,11 +284,8 @@ class MemoryMonitor:
             return MemorySnapshot(time.time(), 0.0, 0.0)
 
         cpu_pct = 0.0
-        try:
-            import psutil
-            cpu_pct = psutil.cpu_percent(interval=None)
-        except (ImportError, Exception):
-            pass
+        if self._proc is not None:
+            cpu_pct = self._proc.cpu_percent(interval=None)
 
         return MemorySnapshot(
             timestamp=time.time(),
