@@ -187,19 +187,12 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
     if _num_seq > 0:
         n_orig = len(fixed_data)
         if n_orig > _num_seq:
-            for _key, _val in fixed_data.batch.items():
-                if isinstance(_val, torch.Tensor) and _val.shape[0] == n_orig:
-                    fixed_data.batch[_key] = _val[:_num_seq]
+            # Use TensorDict slice to properly update batch_size
+            fixed_data.batch = fixed_data.batch[:_num_seq]
             for _meta_key in list(fixed_data.non_tensor_batch.keys()):
                 _mv = fixed_data.non_tensor_batch[_meta_key]
-                if isinstance(_mv, list) and len(_mv) == n_orig:
+                if hasattr(_mv, '__len__') and len(_mv) == n_orig:
                     fixed_data.non_tensor_batch[_meta_key] = _mv[:_num_seq]
-            # Update batch_size metadata so __len__ returns the new count
-            if hasattr(fixed_data.batch, 'batch_size'):
-                try:
-                    fixed_data.batch.batch_size = (_num_seq,)
-                except (AttributeError, TypeError):
-                    pass
             print(f"[FixedRollout] Selected {_num_seq}/{n_orig} sequences")
 
     # TODO: debug only — randomize reward scores so GRPO advantage is non-zero.
