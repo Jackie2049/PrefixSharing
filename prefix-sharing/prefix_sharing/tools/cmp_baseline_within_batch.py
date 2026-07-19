@@ -364,9 +364,9 @@ def _worst_pair_by_cos_within(
                   for k in range(stack)]
         for i in range(stack):
             for j in range(i + 1, stack):
-                fi = copies[i].reshape(-1)
-                fj = copies[j].reshape(-1)
-                cos_vec = _cosine_sim(fi, fj, dim=-1)
+                fi = copies[i].reshape(copies[i].shape[0], -1)  # [T, D]
+                fj = copies[j].reshape(copies[j].shape[0], -1)  # [T, D]
+                cos_vec = _cosine_sim(fi, fj, dim=-1)           # [T] per-token
                 cmin = float(cos_vec.min())
                 if cmin < worst_cos_min:
                     worst_cos_min = cmin
