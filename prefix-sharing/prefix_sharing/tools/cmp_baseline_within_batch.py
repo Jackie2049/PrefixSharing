@@ -351,11 +351,13 @@ def _print_kv_table_baseline(result: CheckResult, label: str):
 def _worst_pair_by_cos_within(
     data: dict, cu_seqlens: torch.Tensor,
     num_sequences: int, stack: int, layer_idx: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
-    """Across all copy pairs, find the cos_min-worst token in *layer_idx*."""
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float, int, int, int]:
+    """Across all copy pairs, find the cos_min-worst token. Returns
+    (a, b, cos_min, seq, copy_i, copy_j)."""
     tensor = data[layer_idx].float()
     worst_cos_min = 1.0
     worst_a = worst_b = None
+    w_seq = w_i = w_j = -1
 
     for seq in range(num_sequences):
         copies = [_slice_sequence(tensor, cu_seqlens, seq + k * num_sequences)
@@ -370,15 +372,18 @@ def _worst_pair_by_cos_within(
                     worst_cos_min = cmin
                     worst_a = fi[cos_vec.argmin()].cpu()
                     worst_b = fj[cos_vec.argmin()].cpu()
-    return worst_a, worst_b, worst_cos_min
+                    w_seq, w_i, w_j = seq, i, j
+    return worst_a, worst_b, worst_cos_min, w_seq, w_i, w_j
 
 
 def _worst_pair_by_rel_within(
     tensor_2d: torch.Tensor, num_sequences: int, stack: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
-    """Across all copy pairs, find the rel_max-worst row in 2D tensor."""
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float, int, int, int]:
+    """Across all copy pairs, find the rel_max-worst row. Returns
+    (a, b, rel_max, seq, copy_i, copy_j)."""
     worst_rel_max = 0.0
     worst_a = worst_b = None
+    w_seq = w_i = w_j = -1
 
     for seq in range(num_sequences):
         if seq >= tensor_2d.shape[0]:
@@ -393,7 +398,8 @@ def _worst_pair_by_rel_within(
                     worst_rel_max = rmax
                     worst_a = ri.cpu()
                     worst_b = rj.cpu()
-    return worst_a, worst_b, worst_rel_max
+                    w_seq, w_i, w_j = seq, i, j
+    return worst_a, worst_b, worst_rel_max, w_seq, w_i, w_j
 
 
 def _print_topk_plain_within(
@@ -405,11 +411,11 @@ def _print_topk_plain_within(
     if data is None:
         return
     last_layer = max(_sorted_layer_keys(data))
-    a, b, cmin = _worst_pair_by_cos_within(
+    a, b, cmin, wseq, wi, wj = _worst_pair_by_cos_within(
         data, cu_seqlens, num_sequences, stack, last_layer)
     if a is not None:
         _print_topk_vec(a, b, topk, sort_err,
-                        f"{label}_L{last_layer}_cosmin_{cmin:.4f}")
+                        f"{label}_L{last_layer}_seq{wseq}_copy{wi}vs{wj}_cosmin_{cmin:.4f}")
 
 
 def _print_topk_kv_within(
@@ -425,11 +431,11 @@ def _print_topk_kv_within(
     for field, tag in [(field_a, f"{label}_{field_a}"),
                        (field_b, f"{label}_{field_b}")]:
         single_f = {k: v[field] for k, v in data.items() if field in v}
-        a, b, cmin = _worst_pair_by_cos_within(
+        a, b, cmin, wseq, wi, wj = _worst_pair_by_cos_within(
             single_f, cu_seqlens, num_sequences, stack, last_layer)
         if a is not None:
             _print_topk_vec(a, b, topk, sort_err,
-                            f"{tag}_L{last_layer}_cosmin_{cmin:.4f}")
+                            f"{tag}_L{last_layer}_seq{wseq}_copy{wi}vs{wj}_cosmin_{cmin:.4f}")
 
 
 # ============================================================
@@ -591,12 +597,12 @@ def main():
         )
         for label, tensor_2d in _2d_tensors:
             if tensor_2d.dim() >= 2:
-                t1, t2, rel = _worst_pair_by_rel_within(
+                t1, t2, rel, wseq, wi, wj = _worst_pair_by_rel_within(
                     tensor_2d, num_sequences, args.stack)
                 if t1 is not None:
                     _print_topk_2d(t1.unsqueeze(0), t2.unsqueeze(0), None,
                                    args.topk, args.sort_err,
-                                   f"{label}_relmax_{rel:.4f}")
+                                   f"{label}_seq{wseq}_copy{wi}vs{wj}_relmax_{rel:.4f}")
 
     _print_summary(all_results)
 
