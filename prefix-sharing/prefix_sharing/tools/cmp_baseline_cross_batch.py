@@ -349,6 +349,130 @@ def _compare_2d_cross_batch(
 
 
 # ============================================================
+#  Top-K helper — find worst pair (cos_min or rel_max)
+# ============================================================
+
+def _worst_pair_by_cos(
+    single_data: dict, multi_data: dict,
+    cu_seqlens_single: torch.Tensor, cu_seqlens_multi: torch.Tensor,
+    num_sequences: int, stack_count: int,
+    layer_idx: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
+    """Return (single_flat, multi_flat, cos_min) of the pair with the
+    smallest per-token cosine across all seq×copy comparisons for *layer_idx*."""
+    single_field = single_data[layer_idx].float()
+    multi_field = multi_data[layer_idx].float()
+    worst_cos_min = 1.0
+    worst_single = worst_multi = None
+
+    for seq_index in range(num_sequences):
+        single_seq = _slice_sequence(single_field, cu_seqlens_single, seq_index)
+        if single_seq.shape[0] == 0:
+            continue
+        single_flat = single_seq.reshape(single_seq.shape[0], -1)
+
+        for copy_index in range(stack_count):
+            multi_seq = _slice_sequence(multi_field, cu_seqlens_multi,
+                                        seq_index + copy_index * num_sequences)
+            if multi_seq.shape[0] != single_seq.shape[0]:
+                continue
+            multi_flat = multi_seq.reshape(multi_seq.shape[0], -1)
+
+            cos_vec = _cosine_sim(single_flat, multi_flat, dim=-1)
+            cmin = float(cos_vec.min())
+            if cmin < worst_cos_min:
+                worst_cos_min = cmin
+                worst_single = single_flat[cos_vec.argmin()].cpu()
+                worst_multi = multi_flat[cos_vec.argmin()].cpu()
+
+    return worst_single, worst_multi, worst_cos_min
+
+
+def _worst_pair_by_rel(
+    single_2d: torch.Tensor, multi_2d: torch.Tensor,
+    num_sequences: int, stack_count: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float]:
+    """Return (single_row, multi_row, rel_max) of the pair with the
+    largest relative difference across all seq×copy comparisons."""
+    worst_rel_max = 0.0
+    worst_single = worst_multi = None
+
+    for seq_index in range(num_sequences):
+        if seq_index >= single_2d.shape[0]:
+            break
+        single_row = single_2d[seq_index]
+
+        for copy_index in range(stack_count):
+            multi_off = seq_index + copy_index * num_sequences
+            if multi_off >= multi_2d.shape[0]:
+                continue
+            multi_row = multi_2d[multi_off]
+
+            rel_diff = (single_row - multi_row).abs() / single_row.abs().clamp(min=1e-8)
+            rmax = float(rel_diff.max())
+            if rmax > worst_rel_max:
+                worst_rel_max = rmax
+                worst_single = single_row.cpu()
+                worst_multi = multi_row.cpu()
+
+    return worst_single, worst_multi, worst_rel_max
+
+
+def _print_topk_plain(
+    dir_single: str, dir_stacked: str,
+    cu_seqlens_single: torch.Tensor, cu_seqlens_multi: torch.Tensor,
+    stack_count: int,
+    filename: str, label: str,
+    topk: int, sort_err: str,
+):
+    """Per-layer plain dict: pick the cos_min-worst pair and print top-K dims."""
+    single_data = _load_per_layer_dict(dir_single, filename)
+    multi_data = _load_per_layer_dict(dir_stacked, filename)
+    if single_data is None or multi_data is None:
+        return
+
+    last_layer = max(_sorted_layer_keys(single_data))
+    num_sequences = cu_seqlens_single.numel() - 1
+    a, b, cmin = _worst_pair_by_cos(
+        single_data, multi_data, cu_seqlens_single, cu_seqlens_multi,
+        num_sequences, stack_count, last_layer,
+    )
+    if a is not None:
+        _print_topk_vec(a, b, topk, sort_err,
+                        f"{label}_L{last_layer}_cosmin_{cmin:.4f}")
+
+
+def _print_topk_kv(
+    dir_single: str, dir_stacked: str,
+    cu_seqlens_single: torch.Tensor, cu_seqlens_multi: torch.Tensor,
+    stack_count: int,
+    filename: str, field_a: str, field_b: str,
+    label: str, topk: int, sort_err: str,
+):
+    """Per-layer KV dict: pick cos_min-worst pair for each of Q and K."""
+    single_data = _load_per_layer_dict(dir_single, filename)
+    multi_data = _load_per_layer_dict(dir_stacked, filename)
+    if single_data is None or multi_data is None:
+        return
+
+    last_layer = max(_sorted_layer_keys(single_data))
+    num_sequences = cu_seqlens_single.numel() - 1
+
+    for field, tag in [(field_a, f"{label}_{field_a}"),
+                       (field_b, f"{label}_{field_b}")]:
+        # Extract just that field into a flat {layer: tensor}
+        single_f = {k: v[field] for k, v in single_data.items() if field in v}
+        multi_f = {k: v[field] for k, v in multi_data.items() if field in v}
+        a, b, cmin = _worst_pair_by_cos(
+            single_f, multi_f, cu_seqlens_single, cu_seqlens_multi,
+            num_sequences, stack_count, last_layer,
+        )
+        if a is not None:
+            _print_topk_vec(a, b, topk, sort_err,
+                            f"{tag}_L{last_layer}_cosmin_{cmin:.4f}")
+
+
+# ============================================================
 #  Print wrappers
 # ============================================================
 
@@ -513,14 +637,30 @@ def main():
 
     # ── Top-K ──
     if args.topk > 0:
+        # Per-layer plain dict: cos_min-worst pair → top-K dims
+        _print_topk_plain(
+            args.dir_single, args.dir_stacked,
+            cu_seqlens_single, cu_seqlens_multi, stack_count,
+            "build_kv_input_v.pt", "build_kv_input_v",
+            args.topk, args.sort_err,
+        )
+        # Per-layer KV dict (Q/K): cos_min-worst pair each → top-K dims
+        _print_topk_kv(
+            args.dir_single, args.dir_stacked,
+            cu_seqlens_single, cu_seqlens_multi, stack_count,
+            "rope_postqk.pt", "query", "key", "rope_postqk",
+            args.topk, args.sort_err,
+        )
+        # 2D scalar data: rel_max-worst pair → top-K dims
         for label, single_2d, multi_2d in _2d_tensors:
             if (single_2d.dim() >= 2 and multi_2d.dim() >= 2
                     and single_2d.shape[1] == multi_2d.shape[1]):
-                t1 = single_2d[:num_sequences]
-                t2 = multi_2d[:num_sequences]
-                if t1.shape == t2.shape:
-                    _print_topk_2d(t1.cpu(), t2.cpu(), None,
-                                   args.topk, args.sort_err, label)
+                t1, t2, rel = _worst_pair_by_rel(
+                    single_2d, multi_2d, num_sequences, stack_count)
+                if t1 is not None:
+                    _print_topk_2d(t1.unsqueeze(0), t2.unsqueeze(0), None,
+                                   args.topk, args.sort_err,
+                                   f"{label}_relmax_{rel:.4f}")
 
     _print_summary(all_results)
 
