@@ -124,7 +124,23 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+        # [PS-perf] start — update phase ——————————————————————
+        try:
+            from prefix_sharing.tools.perf_profiler import ProfilerScope as _PSProfilerScope
+
+            _ps_scope = _PSProfilerScope.current()
+        except Exception:
+            _ps_scope = None
+        if _ps_scope is not None:
+            _ps_scope.start_phase(_ps_scope.PHASE_UPDATE)
+        # [PS-perf] end ———————————————————————————————————————
+        try:
+            grad_norm = self.optimizer_step()
+        finally:
+            # [PS-perf] start — update phase stop —————————————
+            if _ps_scope is not None and _ps_scope.is_phase_active(_ps_scope.PHASE_UPDATE):
+                _ps_scope.stop_phase(_ps_scope.PHASE_UPDATE)
+            # [PS-perf] end ———————————————————————————————————
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm

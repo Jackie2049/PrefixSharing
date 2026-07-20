@@ -19,11 +19,19 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         from prefix_sharing.core.config import PrefixSharingConfig
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
         from prefix_sharing.tools.perf_profiler import PerfProfiler
+        from prefix_sharing.tools.perf_profiler import ProfilerScope
 
-        # Create profiler once per engine and reuse across old_logp + training calls.
-        if not hasattr(self, '_ps_perf'):
-            self._ps_perf = PerfProfiler.create_if_enabled()
-        perf_profiler = self._ps_perf
+        # [PS-perf] start — profiler selection ——————————————
+        # v2.0: prefer the active step-level ProfilerScope (entered in verl
+        # engine_workers train_mini_batch / infer_batch); fall back to a
+        # per-engine legacy PerfProfiler created once and reused across
+        # old_logp + training calls.
+        perf_profiler = ProfilerScope.current()
+        if perf_profiler is None:
+            if not hasattr(self, '_ps_perf'):
+                self._ps_perf = PerfProfiler.create_if_enabled()
+            perf_profiler = self._ps_perf
+        # [PS-perf] end ————————————————————————————————————
 
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
@@ -159,7 +167,9 @@ def _forward_step_with_engine_prepare(
 
     # [PS-perf] start — plan ——————————————————
     from prefix_sharing.tools.perf_profiler import PerfProfiler
-    profiler = getattr(self, '_ps_perf', None)
+    from prefix_sharing.tools.perf_profiler import ProfilerScope
+    # v2.0: prefer the active ProfilerScope; legacy per-engine profiler as fallback.
+    profiler = ProfilerScope.current() or getattr(self, '_ps_perf', None)
 
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
@@ -369,7 +379,9 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     # ##### [PS-diag] end #####
 
     # [PS-perf] start — OFF engine fwd ——————————————————
-    _perf = getattr(self, '_ps_perf', None)
+    from prefix_sharing.tools.perf_profiler import ProfilerScope as _ProfilerScope
+    # v2.0: prefer the active ProfilerScope; legacy per-engine profiler as fallback.
+    _perf = _ProfilerScope.current() or getattr(self, '_ps_perf', None)
     if _perf is not None:
         _perf.start_memory()
         _fwd_phase = _perf.PHASE_FORWARD_OLD if forward_only else _perf.PHASE_FORWARD
