@@ -24,8 +24,10 @@ Usage::
     profiler.save("/path/to/perf_results")
     print(profiler.summary())
 
-Activation: set env ``PREFIX_SHARING_PERF_PROFILE=1``.  When disabled,
-all public methods are safe no-ops.
+Activation: set ``PREFIX_SHARING_PERF_DIR`` to the output directory.  The legacy
+``PREFIX_SHARING_PERF_PROFILE=1`` switch remains supported and uses
+``./perf_results`` when no directory is specified.  When disabled, all public
+methods are safe no-ops.
 """
 
 from __future__ import annotations
@@ -54,6 +56,20 @@ _profiler_context: ContextVar[Any] = ContextVar(
 )
 
 _PER_LAYER_NAME_RE = re.compile(r"\.l\d+$")
+
+
+def _profiling_enabled() -> bool:
+    """Profiling is on when the explicit switch is set OR an output dir is given.
+
+    ``PREFIX_SHARING_PERF_PROFILE=1`` is the explicit switch; setting
+    ``PREFIX_SHARING_PERF_DIR`` alone also enables profiling (the dir implies
+    intent to collect results).
+    """
+    if os.environ.get("PREFIX_SHARING_PERF_PROFILE", "").strip() in (
+        "1", "true", "True", "yes", "on",
+    ):
+        return True
+    return bool(os.environ.get("PREFIX_SHARING_PERF_DIR", "").strip())
 
 
 class PerfProfiler:
@@ -232,8 +248,7 @@ class PerfProfiler:
 
         May be a legacy ``PerfProfiler`` or a v2.0 ``ProfilerScope``
         (both expose ``start_phase``/``stop_phase``).  ``None`` when
-        ``PREFIX_SHARING_PERF_PROFILE`` is not set or no profiler
-        context has been entered.
+        profiling is disabled or no profiler context has been entered.
         """
         return _profiler_context.get()
 
@@ -249,14 +264,13 @@ class PerfProfiler:
     def create_if_enabled(
         memory_interval: float = 0.05,
     ) -> PerfProfiler | None:
-        """Factory: return a PerfProfiler if ``PREFIX_SHARING_PERF_PROFILE=1``.
+        """Factory: return a PerfProfiler when profiling is enabled.
 
-        Otherwise return ``None`` — callers can use ``if profiler:``
-        guards throughout.
+        Enabled via ``PREFIX_SHARING_PERF_PROFILE=1`` or by setting
+        ``PREFIX_SHARING_PERF_DIR``.  Otherwise return ``None`` — callers
+        can use ``if profiler:`` guards throughout.
         """
-        if os.environ.get("PREFIX_SHARING_PERF_PROFILE", "").strip() in (
-            "1", "true", "True", "yes", "on",
-        ):
+        if _profiling_enabled():
             return PerfProfiler(memory_interval=memory_interval, enabled=True)
         return None
 
@@ -460,16 +474,17 @@ class ProfilerScope:
         kind: str = "train",
         perf_dir: str | None = None,
     ) -> ProfilerScope | None:
-        """Factory: return a ProfilerScope if ``PREFIX_SHARING_PERF_PROFILE=1``.
+        """Factory: return a ProfilerScope when profiling is enabled.
+
+        Enabled via ``PREFIX_SHARING_PERF_PROFILE=1`` or by setting
+        ``PREFIX_SHARING_PERF_DIR``.
 
         Configuration via env:
           - ``PREFIX_SHARING_PERF_DIR`` — output root (default ``./perf_results``)
           - ``PREFIX_SHARING_PERF_MEMORY_INTERVAL`` — sampling interval s (default 0.05)
           - ``PREFIX_SHARING_PERF_PER_LAYER`` — ``0`` disables per-layer attention timing
         """
-        if os.environ.get("PREFIX_SHARING_PERF_PROFILE", "").strip() not in (
-            "1", "true", "True", "yes", "on",
-        ):
+        if not _profiling_enabled():
             return None
         perf_dir = perf_dir or os.environ.get("PREFIX_SHARING_PERF_DIR", "./perf_results")
         try:

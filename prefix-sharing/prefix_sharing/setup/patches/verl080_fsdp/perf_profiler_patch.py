@@ -6,8 +6,10 @@ These patches replace the direct source edits in:
   - verl.workers.engine_workers.TrainingWorker.train_mini_batch / infer_batch
 
 They are installed by ``prefix_sharing.setup.patches.verl080_fsdp`` when the
-perf-profiler patch set is loaded.  When ``PREFIX_SHARING_PERF_PROFILE`` is not
-set, the patches are no-ops and behave exactly like the original methods.
+perf-profiler patch set is loaded.  Profiling is enabled by setting
+``PREFIX_SHARING_PERF_DIR`` (or the legacy ``PREFIX_SHARING_PERF_PROFILE=1``
+switch).  Otherwise the patches are no-ops and behave exactly like the original
+methods.
 """
 
 from __future__ import annotations

@@ -35,7 +35,17 @@ def test_per_layer_phase_name_detection():
 
 def test_create_if_enabled_disabled_by_default(monkeypatch):
     monkeypatch.delenv("PREFIX_SHARING_PERF_PROFILE", raising=False)
+    monkeypatch.delenv("PREFIX_SHARING_PERF_DIR", raising=False)
     assert ProfilerScope.create_if_enabled(0) is None
+
+
+def test_create_if_enabled_dir_alone_enables(perf_dir, monkeypatch):
+    """Setting PREFIX_SHARING_PERF_DIR alone (no PROFILE switch) enables profiling."""
+    monkeypatch.delenv("PREFIX_SHARING_PERF_PROFILE", raising=False)
+    monkeypatch.setenv("PREFIX_SHARING_PERF_DIR", perf_dir)
+    scope = ProfilerScope.create_if_enabled(0)
+    assert scope is not None
+    assert scope.perf_dir == perf_dir
 
 
 def test_create_if_enabled_reads_env(perf_dir, monkeypatch):
