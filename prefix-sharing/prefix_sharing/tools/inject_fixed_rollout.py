@@ -170,15 +170,13 @@ def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
     print(f"[FixedRollout] Patched generate_sequences for capture → {json_path}")
 
 
-def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
+def patch_fixed_rollout(rollout_obj: Any, json_path: str):
     """Monkey-patch ``generate_sequences`` on *rollout_obj* to return fixed data.
 
     Args:
         rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
                       (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
         json_path: Absolute path to the JSON file.
-        num_workers: Number of agent loop workers (default 8). The fixed data
-            will be auto-padded to a multiple of this value.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
@@ -214,7 +212,7 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
             if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
                 batch[_key] = batch[_key].repeat(_stack, *([1] * (batch[_key].dim() - 1)))
         n_orig *= _stack
-        print(f"[FixedRollout] Stacked batch x{_stack}: {n_orig} sequences (before padding)")
+        print(f"[FixedRollout] Stacked batch x{_stack}: {n_orig} sequences")
 
     # ── 4. Rebuild DataProto (non_tensors built fresh like prefix-0501) ──
     from verl.protocol import DataProto
@@ -223,13 +221,6 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
         non_tensors={"multi_modal_inputs": _np.array([{}] * n_orig, dtype=object)},
     )
     fixed_data.meta_info = meta_info
-
-    n = len(fixed_data)
-    remainder = n % num_workers
-    if remainder != 0:
-        pad_size = num_workers - remainder
-        fixed_data.padding(pad_size, "last")
-        print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
 
     def _patched(batch, **kwargs):
         print("[FixedRollout] Returning fixed rollout data, skipping generation.")
