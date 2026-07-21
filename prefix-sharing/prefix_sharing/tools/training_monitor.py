@@ -135,7 +135,6 @@ class MemorySnapshot:
     timestamp: float
     allocated_gb: float  # memory_allocated()  – tensor 占用
     reserved_gb: float   # memory_reserved()  – 分配器保留（含缓存）
-    cpu_percent: float = 0.0  # psutil.cpu_percent()
 
 
 class MemoryMonitor:
@@ -169,12 +168,6 @@ class MemoryMonitor:
         self._running = False
         self._thread: threading.Thread | None = None
         self.device_type = self._resolve_device(device_type)
-        self._proc = None
-        try:
-            import psutil
-            self._proc = psutil.Process()
-        except (ImportError, Exception):
-            pass
 
     # ------------------------------------------------------------------
     # public
@@ -182,8 +175,6 @@ class MemoryMonitor:
 
     def start(self) -> None:
         """Begin background sampling."""
-        if self._proc is not None:
-            self._proc.cpu_percent(interval=None)  # prime the first-call baseline
         self._samples.clear()
         self._running = True
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
@@ -223,7 +214,6 @@ class MemoryMonitor:
             return {"device_type": self.device_type, "num_samples": 0}
         al = [s.allocated_gb for s in self._samples]
         rs = [s.reserved_gb for s in self._samples]
-        cp = [s.cpu_percent for s in self._samples if s.cpu_percent > 0]
         return {
             "device_type": self.device_type,
             "num_samples": len(self._samples),
@@ -232,8 +222,6 @@ class MemoryMonitor:
             "peak_reserved_gib": round(max(rs), 3),
             "avg_allocated_gib": round(sum(al) / len(al), 3),
             "avg_reserved_gib": round(sum(rs) / len(rs), 3),
-            "cpu_peak_pct": round(max(cp), 1) if cp else 0.0,
-            "cpu_avg_pct": round(sum(cp) / len(cp), 1) if cp else 0.0,
         }
 
     def save_to_csv(self, path: str) -> None:
@@ -248,10 +236,10 @@ class MemoryMonitor:
             raise RuntimeError("[MemoryMonitor] No samples to save. Did you forget to call start()/stop()?")
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "allocated_gb", "reserved_gb", "cpu_pct"])
+            writer.writerow(["timestamp", "allocated_gb", "reserved_gb"])
             for s in self._samples:
-                writer.writerow([s.timestamp, s.allocated_gb, s.reserved_gb, s.cpu_percent])
-        print(f"[MemoryMonitor] Saved {len(self._samples)} samples (GPU mem + CPU%) to {path}")
+                writer.writerow([s.timestamp, s.allocated_gb, s.reserved_gb])
+        print(f"[MemoryMonitor] Saved {len(self._samples)} samples to {path}")
 
     # ------------------------------------------------------------------
     # internal
@@ -283,15 +271,10 @@ class MemoryMonitor:
         else:
             return MemorySnapshot(time.time(), 0.0, 0.0)
 
-        cpu_pct = 0.0
-        if self._proc is not None:
-            cpu_pct = self._proc.cpu_percent(interval=None)
-
         return MemorySnapshot(
             timestamp=time.time(),
             allocated_gb=allocated / (1024**3),
             reserved_gb=reserved / (1024**3),
-            cpu_percent=cpu_pct,
         )
 
     def _sample_loop(self) -> None:

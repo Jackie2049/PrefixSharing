@@ -75,6 +75,7 @@ class PerfProfiler:
     PHASE_RESTORE = "ps.restore"      # output logprob/entropy restore (CPU)
     PHASE_LOSS = "loss"               # loss function computation
     PHASE_UPDATE = "update"           # optimizer step (mini-batch level)
+    PHASE_ATTN_OFF = "attn.off"       # original HF attention compute (OFF / baseline)
 
     def __init__(
         self,
@@ -311,6 +312,7 @@ class ProfilerScope:
     PHASE_RESTORE = PerfProfiler.PHASE_RESTORE
     PHASE_LOSS = PerfProfiler.PHASE_LOSS
     PHASE_UPDATE = PerfProfiler.PHASE_UPDATE
+    PHASE_ATTN_OFF = PerfProfiler.PHASE_ATTN_OFF
 
     def __init__(
         self,
@@ -510,6 +512,7 @@ class ProfilerScope:
             PerfProfiler.PHASE_ATTN_KV,
             PerfProfiler.PHASE_ATTN_COMPUTE,
             PerfProfiler.PHASE_ATTN_UNPACK,
+            PerfProfiler.PHASE_ATTN_OFF,
             PerfProfiler.PHASE_BACKWARD,
             PerfProfiler.PHASE_RESTORE,
             PerfProfiler.PHASE_LOSS,

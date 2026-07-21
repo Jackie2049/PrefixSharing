@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from prefix_sharing.tools.perf_profiler import PerfProfiler
+
 _SUPPORTED_ATTENTIONS = {
     "flash_attention_2",
     "flash_attention_3",
@@ -93,7 +95,17 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
         # ── OFF path: no prefix sharing context → transparent passthrough ──
         if ctx is None:
-            result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
+            # [PS-perf] start — OFF attention timing —————————————
+            profiler = PerfProfiler.current()
+            if profiler is not None:
+                profiler.start_phase(PerfProfiler.PHASE_ATTN_OFF)
+            try:
+                result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
+            finally:
+                if profiler is not None:
+                    profiler.stop_phase(PerfProfiler.PHASE_ATTN_OFF)
+            # [PS-perf] end ——————————————————————————————————————
+
             # ##### [PS-diag] OFF per-layer dump (baseline / context 不激活) #####
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 _dump_attn_output(result, module)
