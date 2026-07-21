@@ -6,23 +6,18 @@ unified save/summary methods.
 
 Usage::
 
-    from prefix_sharing.tools.perf_profiler import PerfProfiler
+    from prefix_sharing.tools.perf_profiler import ProfilerScope, PerfProfiler
 
-    profiler = PerfProfiler(memory_interval=0.05)
-    profiler.start_memory()
-
-    profiler.start_phase(PerfProfiler.PHASE_PLAN)
-    ... detect + plan + trim ...
-    profiler.stop_phase(PerfProfiler.PHASE_PLAN)
-
-    profiler.start_phase(PerfProfiler.PHASE_FORWARD)
-    ... model forward ...
-    profiler.stop_phase(PerfProfiler.PHASE_FORWARD)
-
-    profiler.stop_memory()
-
-    profiler.save("/path/to/perf_results")
-    print(profiler.summary())
+    scope = ProfilerScope.create_if_enabled(step_id=0)
+    if scope is None:
+        ...  # profiling disabled — all call sites are no-ops
+    with scope:
+        scope.begin_micro_batch(0)
+        scope.start_phase(PerfProfiler.PHASE_FORWARD)
+        ... model forward ...
+        scope.stop_phase(PerfProfiler.PHASE_FORWARD)
+        scope.end_micro_batch()
+    # artifacts written under {perf_dir}/step_0/ on exit
 
 Activation: set ``PREFIX_SHARING_PERF_DIR`` to the output directory.  The legacy
 ``PREFIX_SHARING_PERF_PROFILE=1`` switch remains supported and uses
@@ -119,24 +114,6 @@ class PerfProfiler:
     @property
     def stopwatch(self) -> Stopwatch | None:
         return self._stopwatch
-
-    # -- memory ----------------------------------------------------
-
-    def start_memory(self) -> None:
-        """Begin background HBM sampling."""
-        if self._memory_monitor is not None:
-            self._memory_monitor.start()
-
-    def stop_memory(self) -> None:
-        """Stop background HBM sampling and join the thread."""
-        if self._memory_monitor is not None:
-            self._memory_monitor.stop()
-
-    def snapshot_memory(self) -> MemorySnapshot | None:
-        """One-shot memory query (does not start sampling loop)."""
-        if self._memory_monitor is not None:
-            return self._memory_monitor.snapshot()
-        return None
 
     # -- timing ----------------------------------------------------
 
@@ -260,20 +237,6 @@ class PerfProfiler:
     def __exit__(self, *args: Any) -> None:
         _profiler_context.reset(self._context_token)
 
-    @staticmethod
-    def create_if_enabled(
-        memory_interval: float = 0.05,
-    ) -> PerfProfiler | None:
-        """Factory: return a PerfProfiler when profiling is enabled.
-
-        Enabled via ``PREFIX_SHARING_PERF_PROFILE=1`` or by setting
-        ``PREFIX_SHARING_PERF_DIR``.  Otherwise return ``None`` — callers
-        can use ``if profiler:`` guards throughout.
-        """
-        if _profiling_enabled():
-            return PerfProfiler(memory_interval=memory_interval, enabled=True)
-        return None
-
 
 # ────────────────────────────────────────────────────────────────
 # v2.0 — ProfilerScope: three-level (step → mini-batch → micro-batch)
@@ -303,9 +266,9 @@ class MicroBatchSnapshot:
 class ProfilerScope:
     """Context manager bounding one profiled step (``with`` block).
 
-    Replaces the v1.0 implicit ``start_memory``/``stop_memory``/``save``
-    lifecycle: memory sampling starts on ``__enter__`` and artifacts are
-    written under ``{perf_dir}/step_{step_id}/`` on ``__exit__``.
+    Memory sampling starts on ``__enter__`` and artifacts are written under
+    ``{perf_dir}/step_{step_id}/`` on ``__exit__``; no explicit
+    ``start_memory``/``stop_memory`` calls are needed at call sites.
 
     Hierarchy (markers are inserted at the actual verl call sites):
       - step:        ``__enter__`` / ``__exit__``        (engine_workers.train_mini_batch / infer_batch)
@@ -389,6 +352,7 @@ class ProfilerScope:
     def begin_minibatch(self, mini_batch_idx: int) -> None:
         self._current_mb_idx = mini_batch_idx
         self._minibatch_phases.setdefault(mini_batch_idx, {})
+        self._monitor.set_batch_idx(mini_batch_idx, -1)
 
     def end_minibatch(self) -> None:
         pass  # mini-batch stats are aggregated at save time
@@ -397,6 +361,7 @@ class ProfilerScope:
         self._stopwatch.reset()
         self._per_layer = {}
         self._sample_cursor = len(self._monitor._samples)
+        self._monitor.set_batch_idx(max(self._current_mb_idx, 0), micro_batch_idx)
         self._current_snapshot = MicroBatchSnapshot(
             step_id=self.step_id,
             # logp scopes have no explicit begin_minibatch → default to 0
@@ -423,6 +388,7 @@ class ProfilerScope:
         snap.per_layer = self._per_layer
         self._snapshots.append(snap)
         self._current_snapshot = None
+        self._monitor.set_batch_idx(max(self._current_mb_idx, 0), -1)
 
     # ── phase timing (same surface as PerfProfiler) ──────────────
 
@@ -447,18 +413,6 @@ class ProfilerScope:
         per_layer = self._per_layer.setdefault(layer_id, {})
         per_layer[phase] = per_layer.get(phase, 0.0) + elapsed_s
 
-    # ── memory lifecycle is scope-managed; keep the v1.0 method
-    # surface so existing call sites (forward_step.py) are no-ops. ──
-
-    def start_memory(self) -> None:
-        pass
-
-    def stop_memory(self) -> None:
-        pass
-
-    def snapshot_memory(self) -> MemorySnapshot:
-        return self._monitor.snapshot()
-
     # ── ContextVar access ────────────────────────────────────────
 
     @staticmethod
@@ -481,16 +435,16 @@ class ProfilerScope:
 
         Configuration via env:
           - ``PREFIX_SHARING_PERF_DIR`` — output root (default ``./perf_results``)
-          - ``PREFIX_SHARING_PERF_MEMORY_INTERVAL`` — sampling interval s (default 0.05)
+          - ``PREFIX_SHARING_PERF_MEMORY_INTERVAL`` — sampling interval s (default 0.005)
           - ``PREFIX_SHARING_PERF_PER_LAYER`` — ``0`` disables per-layer attention timing
         """
         if not _profiling_enabled():
             return None
         perf_dir = perf_dir or os.environ.get("PREFIX_SHARING_PERF_DIR", "./perf_results")
         try:
-            interval = float(os.environ.get("PREFIX_SHARING_PERF_MEMORY_INTERVAL", "0.05"))
+            interval = float(os.environ.get("PREFIX_SHARING_PERF_MEMORY_INTERVAL", "0.005"))
         except ValueError:
-            interval = 0.05
+            interval = 0.005
         per_layer = os.environ.get("PREFIX_SHARING_PERF_PER_LAYER", "1").strip() not in ("0", "false", "False")
         return ProfilerScope(
             perf_dir,
@@ -610,6 +564,18 @@ class ProfilerScope:
         }
 
     def _build_summary(self) -> dict:
+        # Pre-aggregate memory samples by (mini_batch_idx, micro_batch_idx)
+        # in a single pass so per-micro-batch avg memory is O(samples), not
+        # O(snaps × samples).
+        mb_mem: dict[tuple[int, int], dict[str, list[float]]] = {}
+        for s in self._monitor._samples:
+            bucket = mb_mem.setdefault(
+                (s.mini_batch_idx, s.micro_batch_idx),
+                {"allocated": [], "reserved": []},
+            )
+            bucket["allocated"].append(s.allocated_gb)
+            bucket["reserved"].append(s.reserved_gb)
+
         mini_batch_stats = []
         mb_indices = sorted({s.mini_batch_idx for s in self._snapshots} | set(self._minibatch_phases))
         for mb_idx in mb_indices:
@@ -622,11 +588,24 @@ class ProfilerScope:
             mb_phases = {
                 p: round(v * 1e3, 3) for p, v in self._minibatch_phases.get(mb_idx, {}).items()
             }
+            micro_batch_memory: dict[str, Any] = {}
+            for snap in snaps:
+                bucket = mb_mem.get((mb_idx, snap.micro_batch_idx))
+                alloc = bucket["allocated"] if bucket else []
+                reserved = bucket["reserved"] if bucket else []
+                micro_batch_memory[str(snap.micro_batch_idx)] = {
+                    "peak_allocated_gib": round(snap.memory_peak_allocated_gb, 3),
+                    "peak_reserved_gib": round(snap.memory_peak_reserved_gb, 3),
+                    "avg_allocated_gib": round(sum(alloc) / len(alloc), 3) if alloc else 0.0,
+                    "avg_reserved_gib": round(sum(reserved) / len(reserved), 3) if reserved else 0.0,
+                    "num_samples": len(alloc),
+                }
             mini_batch_stats.append({
                 "mini_batch_idx": mb_idx,
                 "num_micro_batches": len(snaps),
                 "micro_batch_timing": timing_stats,
                 "minibatch_phase_ms": mb_phases,
+                "micro_batch_memory": micro_batch_memory,
             })
 
         # phase → layer_id → per-micro-batch durations (s)
@@ -651,6 +630,15 @@ class ProfilerScope:
                 totals_list = [
                     round(sum(layer_map.get(lid, [])) * 1e3, 3) for lid in range(global_num_layers)
                 ]
+                # Per-layer average across micro-batches: total / record count.
+                # Unlike total_ms_per_layer, this is invariant to the number of
+                # micro-batches, so it is directly comparable across runs with
+                # different batch layouts.
+                avg_per_layer: dict[str, float] = {}
+                for lid in range(global_num_layers):
+                    samples_l = layer_map.get(lid, [])
+                    cnt = len(samples_l)
+                    avg_per_layer[str(lid)] = round(sum(samples_l) * 1e3 / cnt, 3) if cnt else 0.0
                 min_lid = min(range(global_num_layers), key=lambda lid: totals_list[lid])
                 max_lid = max(range(global_num_layers), key=lambda lid: totals_list[lid])
                 phase_stats[phase] = {
@@ -658,6 +646,7 @@ class ProfilerScope:
                     "total_ms_per_layer": {
                         str(lid): totals_list[lid] for lid in range(global_num_layers)
                     },
+                    "total_avg_ms_per_layer": avg_per_layer,
                     "avg_layer_ms": round(sum(totals_list) / global_num_layers, 3),
                     "min_layer": {"layer_id": min_lid, "total_ms": totals_list[min_lid]},
                     "max_layer": {"layer_id": max_lid, "total_ms": totals_list[max_lid]},

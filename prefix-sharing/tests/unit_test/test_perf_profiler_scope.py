@@ -135,13 +135,26 @@ def test_micro_batch_aggregation_and_csv(perf_dir):
     assert kv_stats["num_layers"] == 2
     # layer0: 0.001s x 2 micro-batches = 2ms; layer1: 0.003s x 2 = 6ms
     assert kv_stats["total_ms_per_layer"] == {"0": 2.0, "1": 6.0}
+    assert kv_stats["total_avg_ms_per_layer"] == {"0": 1.0, "1": 3.0}
     assert kv_stats["avg_layer_ms"] == 4.0
     assert kv_stats["min_layer"] == {"layer_id": 0, "total_ms": 2.0}
     assert kv_stats["max_layer"] == {"layer_id": 1, "total_ms": 6.0}
     comp_stats = pl["phases"]["attn.comp"]
     # layer0: 0.002s x 2 = 4ms; layer1: no samples = 0
     assert comp_stats["total_ms_per_layer"] == {"0": 4.0, "1": 0.0}
+    assert comp_stats["total_avg_ms_per_layer"] == {"0": 2.0, "1": 0.0}
     assert comp_stats["max_layer"]["layer_id"] == 0
+
+    # ── micro_batch_memory (per-micro-batch peak + avg) ──
+    mb_stat = summary["mini_batch_stats"][0]
+    mbm = mb_stat["micro_batch_memory"]
+    assert set(mbm.keys()) == {"0", "1"}
+    for key in ("0", "1"):
+        entry = mbm[key]
+        assert set(entry.keys()) == {
+            "peak_allocated_gib", "peak_reserved_gib",
+            "avg_allocated_gib", "avg_reserved_gib", "num_samples",
+        }
 
 
 def test_per_layer_phase_name_detection_v2():
@@ -213,3 +226,35 @@ def test_exception_inside_scope_still_saves(perf_dir):
             raise RuntimeError("boom")
     assert ProfilerScope.current() is None
     assert os.path.exists(os.path.join(perf_dir, "step_0", "summary_train.rank0.json"))
+
+
+def test_memory_snapshot_carries_batch_idx():
+    """MemoryMonitor.snapshot() reflects the current mini/micro-batch index."""
+    from prefix_sharing.tools.training_monitor import MemoryMonitor
+
+    mon = MemoryMonitor(interval=0.01)
+    snap = mon.snapshot()
+    assert snap.mini_batch_idx == -1
+    assert snap.micro_batch_idx == -1
+    mon.set_batch_idx(2, 3)
+    snap = mon.snapshot()
+    assert snap.mini_batch_idx == 2
+    assert snap.micro_batch_idx == 3
+
+
+def test_memory_trace_csv_tags_batch_idx(tmp_path):
+    """memory_trace CSV carries mini/micro-batch columns for per-micro-batch analysis."""
+    from prefix_sharing.tools.training_monitor import MemoryMonitor, MemorySnapshot
+
+    mon = MemoryMonitor(interval=0.01)
+    mon._samples = [
+        MemorySnapshot(1.0, 1.5, 2.0, mini_batch_idx=0, micro_batch_idx=0),
+        MemorySnapshot(2.0, 1.6, 2.0, mini_batch_idx=0, micro_batch_idx=-1),
+    ]
+    path = str(tmp_path / "memory_trace.csv")
+    mon.save_to_csv(path)
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["timestamp", "mini_batch_idx", "micro_batch_idx", "allocated_gb", "reserved_gb"]
+    assert rows[1] == ["1.0", "0", "0", "1.5", "2.0"]
+    assert rows[2] == ["2.0", "0", "-1", "1.6", "2.0"]
