@@ -21,26 +21,17 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         from prefix_sharing.tools.perf_profiler import PerfProfiler
         from prefix_sharing.tools.perf_profiler import ProfilerScope
 
-        # [PS-perf] start — profiler selection ——————————————
-        # v2.0: prefer the active step-level ProfilerScope (entered in verl
-        # engine_workers train_mini_batch / infer_batch); fall back to a
-        # per-engine legacy PerfProfiler created once and reused across
-        # old_logp + training calls.
-        perf_profiler = ProfilerScope.current()
-        if perf_profiler is None:
-            if not hasattr(self, '_ps_perf'):
-                self._ps_perf = PerfProfiler.create_if_enabled()
-            perf_profiler = self._ps_perf
-        # [PS-perf] end ————————————————————————————————————
-
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
             import os as _os_diag_off
 
             # [PS-perf] start — OFF forward ——————————————
+            # Memory sampling is started/stopped by the step-level ProfilerScope
+            # (entered in train_mini_batch / infer_batch); here we only time the
+            # forward phase.
+            perf_profiler = ProfilerScope.current()
             if perf_profiler is not None:
-                perf_profiler.start_memory()
                 _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
                 perf_profiler.start_phase(_fwd_phase)
             # [PS-perf] end ————————————————————————————————
@@ -63,7 +54,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             # [PS-perf] start — OFF forward stop ——————————
             if perf_profiler is not None:
                 perf_profiler.stop_phase(_fwd_phase)
-                # memory stopped + saved in forward_backward_batch (verl)
             # [PS-perf] end —————————————————————————————————
             return result
 
@@ -168,8 +158,7 @@ def _forward_step_with_engine_prepare(
     # [PS-perf] start — plan ——————————————————
     from prefix_sharing.tools.perf_profiler import PerfProfiler
     from prefix_sharing.tools.perf_profiler import ProfilerScope
-    # v2.0: prefer the active ProfilerScope; legacy per-engine profiler as fallback.
-    profiler = ProfilerScope.current() or getattr(self, '_ps_perf', None)
+    profiler = ProfilerScope.current()
 
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
@@ -252,7 +241,6 @@ def _forward_step_with_engine_prepare(
     with autocast_ctx:
         # [PS-perf] start — fwd —————————————————————
         if profiler is not None:
-            profiler.start_memory()
             _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
             profiler.start_phase(_fwd_phase)
         raw_output = self.module(**model_inputs, use_cache=False)
@@ -380,10 +368,8 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
 
     # [PS-perf] start — OFF engine fwd ——————————————————
     from prefix_sharing.tools.perf_profiler import ProfilerScope as _ProfilerScope
-    # v2.0: prefer the active ProfilerScope; legacy per-engine profiler as fallback.
-    _perf = _ProfilerScope.current() or getattr(self, '_ps_perf', None)
+    _perf = _ProfilerScope.current()
     if _perf is not None:
-        _perf.start_memory()
         _fwd_phase = _perf.PHASE_FORWARD_OLD if forward_only else _perf.PHASE_FORWARD
         _perf.start_phase(_fwd_phase)
 
@@ -391,7 +377,6 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         raw_output = self.module(**model_inputs, use_cache=False)
         if _perf is not None:
             _perf.stop_phase(_fwd_phase)
-            # memory stopped + saved in forward_backward_batch (verl)
     # [PS-perf] end ———————————————————————————————————————
         import os as _os_logits_off
         if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
