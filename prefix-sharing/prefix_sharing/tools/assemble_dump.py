@@ -137,9 +137,10 @@ def _merge_dp_1d(shards: list[tuple[int, str]], adjust_offsets: bool = False
     # For non-offset-adjusted: simple concat
     if not adjust_offsets:
         return torch.cat(tensors, dim=0)
-    # For offset-adjusted: first shard includes head, rest had head stripped
-    concatenated = torch.cat([tensors[0]] + [t[1:] for t in tensors[1:]], dim=0) if len(tensors) > 1 else tensors[0]
-    return concatenated
+    # For offset-adjusted: first shard includes head, rest had their head
+    # stripped at append time (tensor[1:]), so a plain concat reconstructs
+    # the full cumulative sequence.
+    return torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
 
 
 def _merge_dp_per_layer_dict(shards: list[tuple[int, str]]) -> dict | None:
@@ -288,8 +289,16 @@ def assemble(input_dir: str, output_dir: str) -> None:
             torch.save(merged, os.path.join(output_dir, filename))
             print(f"  [merge] {filename} ← {pp_size} stage(s), {len(merged)} layers")
 
-    # ── TP logits concat ──────────────────────────────────────────
-    if scopes.get("logits", "") == "tp_vocab" and tp_size > 1:
+    # ── logits: DP shard merge (token axis) takes precedence over TP concat ──
+    dp_shards = _collect_dp_shards(input_dir, "logits")
+    if len(dp_shards) > 1:
+        # DP-sharded logits (logits_dp{r}.pt, pure FSDP): concat on dim 0
+        # (token axis) to reconstruct the full packed logits.
+        tensors = [torch.load(fp, weights_only=True) for _, fp in dp_shards]
+        full = torch.cat(tensors, dim=0)
+        torch.save(full, os.path.join(output_dir, "logits.pt"))
+        print(f"  [merge] logits.pt ← {len(dp_shards)} dp shards, shape {list(full.shape)}")
+    elif scopes.get("logits", "") == "tp_vocab" and tp_size > 1:
         shards = []
         for t in range(tp_size):
             src = os.path.join(input_dir, f"logits_tp{t}.pt")
