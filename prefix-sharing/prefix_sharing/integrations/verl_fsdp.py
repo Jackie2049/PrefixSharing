@@ -68,13 +68,19 @@ class PrefixSharingFSDPAttentionRuntime:
 
         plan = ctx.prefix_sharing_plan
         # [PS-perf] start — attn.pack ———————————————————————
+        _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_ATTN_PACK)
+        if _per_layer_ok:
+            profiler.start_phase(f"attn.pack.l{self.layer_id}")
         # [PS-perf] end ——————————————————————————————————————
         packed_query = _pack_dense_qkv(query, plan)
         packed_key = _pack_dense_qkv(key, plan)
         packed_value = _pack_dense_qkv(value, plan)
         # [PS-perf] start — attn.pack stop ——————————————————
+        if _per_layer_ok:
+            _pack_elapsed = profiler.stop_phase(f"attn.pack.l{self.layer_id}")
+            profiler.record_per_layer(self.layer_id, PerfProfiler.PHASE_ATTN_PACK, _pack_elapsed)
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_ATTN_PACK)
         # [PS-perf] end ——————————————————————————————————————
@@ -89,9 +95,14 @@ class PrefixSharingFSDPAttentionRuntime:
         # [PS-perf] start — attn.unpack —————————————————————
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_ATTN_UNPACK)
+        if _per_layer_ok:
+            profiler.start_phase(f"attn.unpack.l{self.layer_id}")
         # [PS-perf] end ——————————————————————————————————————
         dense_output = _scatter_packed_output_to_dense(packed_output, query, plan)
         # [PS-perf] start — attn.unpack stop ————————————————
+        if _per_layer_ok:
+            _unpack_elapsed = profiler.stop_phase(f"attn.unpack.l{self.layer_id}")
+            profiler.record_per_layer(self.layer_id, PerfProfiler.PHASE_ATTN_UNPACK, _unpack_elapsed)
         if profiler is not None:
             profiler.stop_phase(PerfProfiler.PHASE_ATTN_UNPACK)
         # [PS-perf] end ——————————————————————————————————————

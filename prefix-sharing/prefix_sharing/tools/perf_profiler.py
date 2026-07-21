@@ -33,6 +33,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -52,7 +53,7 @@ _profiler_context: ContextVar[Any] = ContextVar(
     default=None,
 )
 
-_PER_LAYER_NAME_SUFFIX = (".kv.l", ".comp.l")
+_PER_LAYER_NAME_RE = re.compile(r"\.l\d+$")
 
 
 class PerfProfiler:
@@ -76,6 +77,7 @@ class PerfProfiler:
     PHASE_LOSS = "loss"               # loss function computation
     PHASE_UPDATE = "update"           # optimizer step (mini-batch level)
     PHASE_ATTN_OFF = "attn.off"       # original HF attention compute (OFF / baseline)
+    PHASE_ATTN_ON = "attn.on"         # PS attention end-to-end = pack+kv+comp+unpack
 
     def __init__(
         self,
@@ -266,8 +268,8 @@ class PerfProfiler:
 
 
 def _is_per_layer_phase(name: str) -> bool:
-    """True for per-layer phase names like ``attn.kv.l3`` / ``attn.comp.l12``."""
-    return any(tag in name for tag in _PER_LAYER_NAME_SUFFIX)
+    """True for per-layer phase names like ``attn.kv.l3`` / ``attn.off.l12``."""
+    return _PER_LAYER_NAME_RE.search(name) is not None
 
 
 @dataclass
@@ -313,6 +315,7 @@ class ProfilerScope:
     PHASE_LOSS = PerfProfiler.PHASE_LOSS
     PHASE_UPDATE = PerfProfiler.PHASE_UPDATE
     PHASE_ATTN_OFF = PerfProfiler.PHASE_ATTN_OFF
+    PHASE_ATTN_ON = PerfProfiler.PHASE_ATTN_ON
 
     def __init__(
         self,
@@ -512,6 +515,7 @@ class ProfilerScope:
             PerfProfiler.PHASE_ATTN_KV,
             PerfProfiler.PHASE_ATTN_COMPUTE,
             PerfProfiler.PHASE_ATTN_UNPACK,
+            PerfProfiler.PHASE_ATTN_ON,
             PerfProfiler.PHASE_ATTN_OFF,
             PerfProfiler.PHASE_BACKWARD,
             PerfProfiler.PHASE_RESTORE,
@@ -610,31 +614,50 @@ class ProfilerScope:
                 "minibatch_phase_ms": mb_phases,
             })
 
-        layer_kv: dict[int, float] = {}
-        layer_comp: dict[int, float] = {}
+        # phase → layer_id → per-micro-batch durations (s)
+        phase_layer_samples: dict[str, dict[int, list[float]]] = {}
         for snap in self._snapshots:
             for layer_id, phases in snap.per_layer.items():
-                layer_kv[layer_id] = layer_kv.get(layer_id, 0.0) + phases.get(PerfProfiler.PHASE_ATTN_KV, 0.0)
-                layer_comp[layer_id] = layer_comp.get(layer_id, 0.0) + phases.get(PerfProfiler.PHASE_ATTN_COMPUTE, 0.0)
+                for phase, elapsed in phases.items():
+                    phase_layer_samples.setdefault(phase, {}).setdefault(layer_id, []).append(elapsed)
+
         per_layer_summary: dict[str, Any] = {}
-        if layer_kv or layer_comp:
-            num_layers = max(set(layer_kv) | set(layer_comp)) + 1
-            kv_totals = [round(layer_kv.get(i, 0.0) * 1e3, 3) for i in range(num_layers)]
-            comp_totals = [round(layer_comp.get(i, 0.0) * 1e3, 3) for i in range(num_layers)]
-            slowest_kv = max(layer_kv, key=layer_kv.get) if layer_kv else None
-            slowest_comp = max(layer_comp, key=layer_comp.get) if layer_comp else None
-            per_layer_summary = {
-                "total_kv_ms": kv_totals,
-                "total_comp_ms": comp_totals,
-                "slowest_kv_layer": (
-                    {"layer_id": slowest_kv, "total_ms": round(layer_kv[slowest_kv] * 1e3, 3)}
-                    if slowest_kv is not None else None
-                ),
-                "slowest_comp_layer": (
-                    {"layer_id": slowest_comp, "total_ms": round(layer_comp[slowest_comp] * 1e3, 3)}
-                    if slowest_comp is not None else None
-                ),
-            }
+        if phase_layer_samples:
+            phase_stats: dict[str, Any] = {}
+            for phase, layer_map in sorted(phase_layer_samples.items()):
+                num_layers = max(layer_map) + 1
+                per_layer_rows = []
+                for lid in range(num_layers):
+                    samples = layer_map.get(lid, [])
+                    if samples:
+                        ms = [s * 1e3 for s in samples]
+                        per_layer_rows.append({
+                            "layer_id": lid,
+                            "count": len(samples),
+                            "total_ms": round(sum(ms), 3),
+                            "avg_ms": round(sum(ms) / len(ms), 3),
+                            "min_ms": round(min(ms), 3),
+                            "max_ms": round(max(ms), 3),
+                        })
+                    else:
+                        per_layer_rows.append({
+                            "layer_id": lid,
+                            "count": 0,
+                            "total_ms": 0.0,
+                            "avg_ms": 0.0,
+                            "min_ms": 0.0,
+                            "max_ms": 0.0,
+                        })
+                totals = {lid: sum(vals) for lid, vals in layer_map.items()}
+                slowest = max(totals, key=totals.get)
+                phase_stats[phase] = {
+                    "per_layer": per_layer_rows,
+                    "slowest_layer": {
+                        "layer_id": slowest,
+                        "total_ms": round(totals[slowest] * 1e3, 3),
+                    },
+                }
+            per_layer_summary = {"phases": phase_stats}
 
         memory_summary = self._monitor.summary()
         return {

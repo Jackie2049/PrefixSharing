@@ -119,9 +119,24 @@ def test_micro_batch_aggregation_and_csv(perf_dir):
     assert set(mb["micro_batch_timing"]["fwd"]) >= {"min_ms", "avg_ms", "max_ms", "p50_ms", "p99_ms"}
     assert "update" in mb["minibatch_phase_ms"]
     pl = summary["per_layer_attention_summary"]
-    assert len(pl["total_kv_ms"]) == 2  # layers 0..1
-    assert pl["slowest_kv_layer"]["layer_id"] == 1
-    assert pl["slowest_comp_layer"]["layer_id"] == 0
+    # per-phase stats with avg/min/max
+    kv_stats = pl["phases"]["attn.kv"]
+    assert len(kv_stats["per_layer"]) == 2  # layers 0..1
+    l0 = kv_stats["per_layer"][0]
+    assert l0["count"] == 2  # 2 micro-batches
+    assert l0["avg_ms"] == round(l0["total_ms"] / 2, 3)
+    assert l0["min_ms"] <= l0["avg_ms"] <= l0["max_ms"]
+    assert kv_stats["slowest_layer"]["layer_id"] == 1
+    comp_stats = pl["phases"]["attn.comp"]
+    assert comp_stats["slowest_layer"]["layer_id"] == 0
+
+
+def test_per_layer_phase_name_detection_v2():
+    """attn.on / attn.off per-layer names are also detected and excluded from timing."""
+    assert _is_per_layer_phase("attn.on.l0")
+    assert _is_per_layer_phase("attn.off.l23")
+    assert not _is_per_layer_phase("attn.on")
+    assert not _is_per_layer_phase("attn.off")
 
 
 def test_per_layer_disabled(perf_dir):

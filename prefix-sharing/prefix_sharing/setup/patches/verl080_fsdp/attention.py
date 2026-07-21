@@ -95,13 +95,20 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
         # ── OFF path: no prefix sharing context → transparent passthrough ──
         if ctx is None:
-            # [PS-perf] start — OFF attention timing —————————————
+            # [PS-perf] start — OFF attention timing (cross-layer + per-layer) —
             profiler = PerfProfiler.current()
+            _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
+            _off_layer_id = int(getattr(module, "layer_idx", 0) or 0)
             if profiler is not None:
                 profiler.start_phase(PerfProfiler.PHASE_ATTN_OFF)
+            if _per_layer_ok:
+                profiler.start_phase(f"attn.off.l{_off_layer_id}")
             try:
                 result = original_fn(module, query, key, value, attention_mask, *args, **kwargs)
             finally:
+                if _per_layer_ok:
+                    _off_elapsed = profiler.stop_phase(f"attn.off.l{_off_layer_id}")
+                    profiler.record_per_layer(_off_layer_id, PerfProfiler.PHASE_ATTN_OFF, _off_elapsed)
                 if profiler is not None:
                     profiler.stop_phase(PerfProfiler.PHASE_ATTN_OFF)
             # [PS-perf] end ——————————————————————————————————————
@@ -129,10 +136,23 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         # runtime.forward() 内部读 ContextVar；AC recompute 时 ContextVar
         # 可能已过期，但 ctx 来自 module._ps_ctx 仍然有效。临时注入 ContextVar。
         _ctxvar_token = _current_context.set(ctx)
+        # [PS-perf] start — ON attention timing (attn.on = pack+kv+comp+unpack) —
+        profiler = PerfProfiler.current()
+        _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
+        if profiler is not None:
+            profiler.start_phase(PerfProfiler.PHASE_ATTN_ON)
+        if _per_layer_ok:
+            profiler.start_phase(f"attn.on.l{layer_id}")
         try:
             output_ld = runtime.forward(None, query_ld, key_ld, value_ld)
         finally:
+            if _per_layer_ok:
+                _on_elapsed = profiler.stop_phase(f"attn.on.l{layer_id}")
+                profiler.record_per_layer(layer_id, PerfProfiler.PHASE_ATTN_ON, _on_elapsed)
+            if profiler is not None:
+                profiler.stop_phase(PerfProfiler.PHASE_ATTN_ON)
             _current_context.reset(_ctxvar_token)
+        # [PS-perf] end ————————————————————————————————————————
 
         # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
         if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
