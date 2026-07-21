@@ -623,39 +623,29 @@ class ProfilerScope:
 
         per_layer_summary: dict[str, Any] = {}
         if phase_layer_samples:
+            # Use a global layer range across all phases so that
+            # total_ms_per_layer rows are aligned (a phase missing a layer
+            # contributes 0.0 for that layer).
+            global_num_layers = max(
+                lid for layer_map in phase_layer_samples.values() for lid in layer_map
+            ) + 1
             phase_stats: dict[str, Any] = {}
             for phase, layer_map in sorted(phase_layer_samples.items()):
-                num_layers = max(layer_map) + 1
-                per_layer_rows = []
-                for lid in range(num_layers):
-                    samples = layer_map.get(lid, [])
-                    if samples:
-                        ms = [s * 1e3 for s in samples]
-                        per_layer_rows.append({
-                            "layer_id": lid,
-                            "count": len(samples),
-                            "total_ms": round(sum(ms), 3),
-                            "avg_ms": round(sum(ms) / len(ms), 3),
-                            "min_ms": round(min(ms), 3),
-                            "max_ms": round(max(ms), 3),
-                        })
-                    else:
-                        per_layer_rows.append({
-                            "layer_id": lid,
-                            "count": 0,
-                            "total_ms": 0.0,
-                            "avg_ms": 0.0,
-                            "min_ms": 0.0,
-                            "max_ms": 0.0,
-                        })
-                totals = {lid: sum(vals) for lid, vals in layer_map.items()}
-                slowest = max(totals, key=totals.get)
+                # Per-layer total within the step (sum across micro-batches),
+                # then statistics ACROSS layers (avg/min/max over the layer axis).
+                totals_list = [
+                    round(sum(layer_map.get(lid, [])) * 1e3, 3) for lid in range(global_num_layers)
+                ]
+                min_lid = min(range(global_num_layers), key=lambda lid: totals_list[lid])
+                max_lid = max(range(global_num_layers), key=lambda lid: totals_list[lid])
                 phase_stats[phase] = {
-                    "per_layer": per_layer_rows,
-                    "slowest_layer": {
-                        "layer_id": slowest,
-                        "total_ms": round(totals[slowest] * 1e3, 3),
+                    "num_layers": global_num_layers,
+                    "total_ms_per_layer": {
+                        str(lid): totals_list[lid] for lid in range(global_num_layers)
                     },
+                    "avg_layer_ms": round(sum(totals_list) / global_num_layers, 3),
+                    "min_layer": {"layer_id": min_lid, "total_ms": totals_list[min_lid]},
+                    "max_layer": {"layer_id": max_lid, "total_ms": totals_list[max_lid]},
                 }
             per_layer_summary = {"phases": phase_stats}
 

@@ -33,7 +33,7 @@ def test_per_layer_phase_name_detection():
     assert not _is_per_layer_phase("ps.plan")
 
 
-def test_create_if_enabled_disabled_by_default(perf_dir, monkeypatch):
+def test_create_if_enabled_disabled_by_default(monkeypatch):
     monkeypatch.delenv("PREFIX_SHARING_PERF_PROFILE", raising=False)
     assert ProfilerScope.create_if_enabled(0) is None
 
@@ -51,6 +51,7 @@ def test_create_if_enabled_reads_env(perf_dir, monkeypatch):
 
     monkeypatch.setenv("PREFIX_SHARING_PERF_PER_LAYER", "0")
     scope = ProfilerScope.create_if_enabled(0)
+    assert scope is not None
     assert scope.per_layer_enabled is False
 
 
@@ -119,16 +120,18 @@ def test_micro_batch_aggregation_and_csv(perf_dir):
     assert set(mb["micro_batch_timing"]["fwd"]) >= {"min_ms", "avg_ms", "max_ms", "p50_ms", "p99_ms"}
     assert "update" in mb["minibatch_phase_ms"]
     pl = summary["per_layer_attention_summary"]
-    # per-phase stats with avg/min/max
+    # cross-layer statistics: avg/min/max over the layer axis
     kv_stats = pl["phases"]["attn.kv"]
-    assert len(kv_stats["per_layer"]) == 2  # layers 0..1
-    l0 = kv_stats["per_layer"][0]
-    assert l0["count"] == 2  # 2 micro-batches
-    assert l0["avg_ms"] == round(l0["total_ms"] / 2, 3)
-    assert l0["min_ms"] <= l0["avg_ms"] <= l0["max_ms"]
-    assert kv_stats["slowest_layer"]["layer_id"] == 1
+    assert kv_stats["num_layers"] == 2
+    # layer0: 0.001s x 2 micro-batches = 2ms; layer1: 0.003s x 2 = 6ms
+    assert kv_stats["total_ms_per_layer"] == {"0": 2.0, "1": 6.0}
+    assert kv_stats["avg_layer_ms"] == 4.0
+    assert kv_stats["min_layer"] == {"layer_id": 0, "total_ms": 2.0}
+    assert kv_stats["max_layer"] == {"layer_id": 1, "total_ms": 6.0}
     comp_stats = pl["phases"]["attn.comp"]
-    assert comp_stats["slowest_layer"]["layer_id"] == 0
+    # layer0: 0.002s x 2 = 4ms; layer1: no samples = 0
+    assert comp_stats["total_ms_per_layer"] == {"0": 4.0, "1": 0.0}
+    assert comp_stats["max_layer"]["layer_id"] == 0
 
 
 def test_per_layer_phase_name_detection_v2():
