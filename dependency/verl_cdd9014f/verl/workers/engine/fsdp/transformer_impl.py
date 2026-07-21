@@ -629,45 +629,15 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        # [PS-perf] start — profiler scope accessor ————————————
-        # v2.0: timing is driven by the step-level ProfilerScope entered in
-        # engine_workers (train_mini_batch / infer_batch).  Falls back to the
-        # legacy per-engine PerfProfiler when no scope is active.
-        try:
-            from prefix_sharing.tools.perf_profiler import ProfilerScope as _PSProfilerScope
-            _ps_scope = _PSProfilerScope.current()
-        except Exception:
-            _ps_scope = None
-        # [PS-perf] end ————————————————————————————————————————
-
-        for _ps_micro_idx, micro_batch in enumerate(micro_batches):
-            # [PS-perf] start — micro-batch begin ———————————————
-            if _ps_scope is not None:
-                _ps_scope.begin_micro_batch(_ps_micro_idx, forward_only=forward_only)
-            # [PS-perf] end ————————————————————————————————————
+        for micro_batch in micro_batches:
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
-                    # [PS-perf] start — backward begin/end ——————————
-                    if _ps_scope is not None:
-                        _ps_scope.start_phase(_ps_scope.PHASE_BACKWARD)
-                    try:
-                        if scaler is not None:
-                            scaler.scale(loss).backward()
-                        else:
-                            loss.backward()
-                    finally:
-                        if _ps_scope is not None and _ps_scope.is_phase_active(_ps_scope.PHASE_BACKWARD):
-                            _ps_scope.stop_phase(_ps_scope.PHASE_BACKWARD)
-                    # [PS-perf] end ———————————————————————————————
-
-            # [PS-perf] start — micro-batch end —————————————————
-            # After backward so the bwd sample and the memory peak at
-            # backward end are both included in this micro-batch snapshot.
-            if _ps_scope is not None:
-                _ps_scope.end_micro_batch()
-            # [PS-perf] end ————————————————————————————————————
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
             output_lst.append(meta_info)
 

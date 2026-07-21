@@ -269,26 +269,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             dataloader_kwargs=dataloader_kwargs,
         )
 
-        # [PS-perf] start — step scope ————————————————————————
-        # One train_mini_batch call == one training step.  The scope id is a
-        # per-engine counter so the old_logp scope (infer_batch, kind="logp")
-        # issued before this call lands in the same step_{n}/ directory.
-        _ps_scope = None
-        try:
-            from prefix_sharing.tools.perf_profiler import ProfilerScope as _PSProfilerScope
-
-            _ps_scope = _PSProfilerScope.create_if_enabled(
-                getattr(self.engine, "_ps_step_counter", 0), kind="train"
-            )
-        except Exception:
-            _ps_scope = None
-        # [PS-perf] end ———————————————————————————————————————
-
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None),
-            # [PS-perf] step scope enter/exit (nullcontext when profiling off)
-            _ps_scope if _ps_scope is not None else nullcontext(),
         ):
             # update
             output_lst = []
@@ -315,15 +298,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
-                # [PS-perf] start — mini-batch begin ————————————————
-                if _ps_scope is not None:
-                    _ps_scope.begin_minibatch(batch_idx)
-                # [PS-perf] end —————————————————————————————————————
                 actor_output = self.train_batch(mini_batch_td)
-                # [PS-perf] start — mini-batch end ——————————————————
-                if _ps_scope is not None:
-                    _ps_scope.end_minibatch()
-                # [PS-perf] end —————————————————————————————————————
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -344,10 +319,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             else:
                 output = None
 
-        # [PS-perf] start — step counter advance ————————————————
-        if _ps_scope is not None:
-            self.engine._ps_step_counter = getattr(self.engine, "_ps_step_counter", 0) + 1
-        # [PS-perf] end ————————————————————————————————————————
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -430,27 +401,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None
 
-        # [PS-perf] start — logp step scope ————————————————————
-        # old_logp runs in this separate RPC before the training step; the
-        # scope reuses the current per-engine step counter (incremented by
-        # train_mini_batch) so its rows land in the same step_{n}/ directory
-        # with kind="logp".
-        _ps_scope = None
-        try:
-            from prefix_sharing.tools.perf_profiler import ProfilerScope as _PSProfilerScope
-
-            _ps_scope = _PSProfilerScope.create_if_enabled(
-                getattr(self.engine, "_ps_step_counter", 0), kind="logp"
-            )
-        except Exception:
-            _ps_scope = None
-        # [PS-perf] end ———————————————————————————————————————
-
         with (
             self.engine.eval_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="eval_batch", logger=None) as timer,
-            # [PS-perf] logp scope enter/exit (nullcontext when profiling off)
-            _ps_scope if _ps_scope is not None else nullcontext(),
         ):
             adapter_ctx = self.engine.disable_adapter() if no_lora_adapter else nullcontext()
             with adapter_ctx:
