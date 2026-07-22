@@ -9,6 +9,7 @@ PrefixSharing runtime，并在输出阶段做 interior / prefix-last restore。
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -18,43 +19,40 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
         from prefix_sharing.core.config import PrefixSharingConfig
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
-        from prefix_sharing.tools.perf_profiler import PerfProfiler
-        from prefix_sharing.tools.perf_profiler import ProfilerScope
+        from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
-            import os as _os_diag_off
+            # Memory sampling is managed by the step-level ProfilerScope; this
+            # path records only the model-forward phase.
+            profiler = ProfilerScope.current()
+            if profiler is not None:
+                forward_phase = (
+                    PerfProfiler.PHASE_FORWARD_OLD
+                    if forward_only
+                    else PerfProfiler.PHASE_FORWARD
+                )
+                profiler.start_phase(forward_phase)
 
-            # [PS-perf] start — OFF forward ——————————————
-            # Memory sampling is started/stopped by the step-level ProfilerScope
-            # (entered in train_mini_batch / infer_batch); here we only time the
-            # forward phase.
-            perf_profiler = ProfilerScope.current()
-            if perf_profiler is not None:
-                _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
-                perf_profiler.start_phase(_fwd_phase)
-            # [PS-perf] end ————————————————————————————————
-
-            # 普通 disabled 路径必须完全透传原生 forward_step；只有诊断模式
-            # 才走等价展开路径，以便拿到 raw logits / 2D logp 做 OFF baseline dump。
+            # Without diagnostics this path must delegate directly to verl.
+            # Diagnostics use the equivalent native flow to expose OFF-baseline
+            # raw logits and 2D log probabilities.
             if (
-                _os_diag_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+                os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
                 and hasattr(self, "prepare_model_inputs")
                 and hasattr(self, "prepare_model_outputs")
             ):
                 result = _call_original_like_engine(self, micro_batch, loss_function, forward_only)
                 from prefix_sharing.tools.diagnostic_dump import dump_fsdp_baseline_verl080
 
-                _os_diag_tag = "train" if self.module.training else "old"
-                dump_fsdp_baseline_verl080(micro_batch, result, _os_diag_tag)
+                diagnostic_tag = "train" if self.module.training else "old"
+                dump_fsdp_baseline_verl080(micro_batch, result, diagnostic_tag)
             else:
                 result = original_forward_step(self, micro_batch, loss_function, forward_only)
 
-            # [PS-perf] start — OFF forward stop ——————————
-            if perf_profiler is not None:
-                perf_profiler.stop_phase(_fwd_phase)
-            # [PS-perf] end —————————————————————————————————
+            if profiler is not None:
+                profiler.stop_phase(forward_phase)
             return result
 
         if hasattr(micro_batch, "to"):
@@ -155,14 +153,11 @@ def _forward_step_with_engine_prepare(
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
 
-    # [PS-perf] start — plan ——————————————————
-    from prefix_sharing.tools.perf_profiler import PerfProfiler
-    from prefix_sharing.tools.perf_profiler import ProfilerScope
-    profiler = ProfilerScope.current()
+    from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
+    profiler = ProfilerScope.current()
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
-    # [PS-perf] end ———————————————————————————
 
     trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
         micro_batch,
@@ -184,18 +179,20 @@ def _forward_step_with_engine_prepare(
         },
     )
     if profiler is not None:
-        profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # CPU overhead: detect+plan+trim
-    # [PS-perf] end ———————————————————————————
+        profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
 
     if ps_state is None:
         return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
 
-    import os as _os_diag
-    if _os_diag.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
 
-        _diag_tag = "train" if self.module.training else "old"
-        dump_fsdp_on_metadata_verl080(micro_batch, ps_state.prefix_sharing_plan, _diag_tag)
+        diagnostic_tag = "train" if self.module.training else "old"
+        dump_fsdp_on_metadata_verl080(
+            micro_batch,
+            ps_state.prefix_sharing_plan,
+            diagnostic_tag,
+        )
 
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
@@ -211,47 +208,49 @@ def _forward_step_with_engine_prepare(
 
     # Set _ps_ctx on every attention module so the attention patch reads
     # the context from the module itself rather than ContextVar (compatible
-    # with activation‑checkpointing recompute, which bypasses the context
+    # with activation-checkpointing recompute, which bypasses the context
     # manager that set the ContextVar).
-    for _mod in self.module.modules():
-        if hasattr(_mod, 'layer_idx') and hasattr(_mod, 'q_proj'):
-            _mod._ps_ctx = ctx
+    for attention_module in self.module.modules():
+        if hasattr(attention_module, "layer_idx") and hasattr(attention_module, "q_proj"):
+            attention_module._ps_ctx = ctx
 
-    # ##### [PS-diag] gradient dump hooks ######
+    # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
-    # ##### [PS-diag] end #####
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
-        """Fire after backward: reset ContextVar, close store, audit, remove attrs."""
+        """Release PS state and diagnostic hooks after backward completes."""
         ctx_cleanup()
-        for _m in self.module.modules():
+        for module in self.module.modules():
             try:
-                del _m._ps_ctx
+                del module._ps_ctx
             except AttributeError:
                 pass
-            # 清理梯度 dump 的 hook handle
-            _gh = getattr(_m, '_ps_grad_handles', None)
-            if _gh is not None:
-                for _h in _gh:
-                    _h.remove()
-                _m._ps_grad_handles = None
+
+            grad_hook_handles = getattr(module, "_ps_grad_handles", None)
+            if grad_hook_handles is not None:
+                for grad_hook_handle in grad_hook_handles:
+                    grad_hook_handle.remove()
+                module._ps_grad_handles = None
 
     self.module.register_full_backward_hook(_cleanup_ps_ctx)
 
     with autocast_ctx:
-        # [PS-perf] start — fwd —————————————————————
         if profiler is not None:
-            _fwd_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
-            profiler.start_phase(_fwd_phase)
+            forward_phase = (
+                PerfProfiler.PHASE_FORWARD_OLD
+                if forward_only
+                else PerfProfiler.PHASE_FORWARD
+            )
+            profiler.start_phase(forward_phase)
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
-            profiler.stop_phase(_fwd_phase)
-        # [PS-perf] end ——————————————————————————————
-        import os as _os_logits_on
-        if _os_logits_on.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
+            profiler.stop_phase(forward_phase)
+
+        if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump import _get_dp_size, dump_raw_logits_verl080
 
             dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
+
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -259,26 +258,23 @@ def _forward_step_with_engine_prepare(
             micro_batch=trimmed_micro_batch,
             logits_processor_func=loss_function,
         )
-        # [PS-perf] start — restore ———————————————
+
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
         model_output = _restore_engine_model_output(model_output)
         if profiler is not None:
-            profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU overhead: restore
-        # [PS-perf] end ——————————————————————————————
+            profiler.stop_phase(PerfProfiler.PHASE_RESTORE)  # CPU-side output restoration.
 
-        import os as _os_diag2
-        if _os_diag2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import dump_fsdp_model_output_2d_verl080
 
             dump_fsdp_model_output_2d_verl080(
                 model_output,
                 list(ps_state.prefix_sharing_plan.original_lengths),
-                _diag_tag,
+                diagnostic_tag,
             )
 
         if loss_function is not None:
-            # [PS-perf] start — loss —————————————————
             if profiler is not None:
                 profiler.start_phase(PerfProfiler.PHASE_LOSS)
             loss, metrics = loss_function(
@@ -288,7 +284,6 @@ def _forward_step_with_engine_prepare(
             )
             if profiler is not None:
                 profiler.stop_phase(PerfProfiler.PHASE_LOSS)
-            # [PS-perf] end ———————————————————————————
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
@@ -302,38 +297,45 @@ def _forward_step_with_engine_prepare(
 
 
 def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
-    """在每个 attention module 上注册 register_full_backward_hook，捕获梯度。
+    """Register attention-gradient dump hooks for diagnostic backward passes.
 
-    AC (use_reentrant=False) 兼容——hook 挂在 module 对象上，recompute 时不重复注册。
-    forward_only=True（old_logp）时跳过——无反向，无需注册。
+    Hooks are attached to module objects so activation-checkpoint recomputation
+    does not register duplicates. Forward-only (old-logp) calls do not need
+    backward hooks.
     """
-    import os as _os_grad
-    if _os_grad.environ.get("PREFIX_SHARING_DIAG_DUMP") is None:
+    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is None:
         return
     if forward_only:
         return
-    _num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
-    if _num_layers == 0:
+
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
+    if num_layers == 0:
         return
-    for _mod in model.modules():
-        if hasattr(_mod, 'layer_idx') and hasattr(_mod, 'q_proj'):
-            _ln = int(_mod.layer_idx) + 1
-            _old_handles = getattr(_mod, '_ps_grad_handles', None)
-            if _old_handles is not None:
-                for _h in _old_handles:
-                    _h.remove()
-                _old_handles.clear()
-            else:
-                _mod._ps_grad_handles = []
 
-            def _make_grad_hook(layer_number: int):
-                def _grad_hook(_m, _gi, grad_output):
-                    from prefix_sharing.tools.diagnostic_dump import dump_attn_grad_verl080
-                    dump_attn_grad_verl080(grad_output[0], layer_number, _num_layers)
-                return _grad_hook
+    for attention_module in model.modules():
+        if not (hasattr(attention_module, "layer_idx") and hasattr(attention_module, "q_proj")):
+            continue
 
-            _mod._ps_grad_handles.append(
-                _mod.register_full_backward_hook(_make_grad_hook(_ln)))
+        layer_number = int(attention_module.layer_idx) + 1
+        existing_grad_hook_handles = getattr(attention_module, "_ps_grad_handles", None)
+        if existing_grad_hook_handles is not None:
+            for grad_hook_handle in existing_grad_hook_handles:
+                grad_hook_handle.remove()
+            existing_grad_hook_handles.clear()
+        else:
+            attention_module._ps_grad_handles = []
+
+        def _make_grad_hook(layer_number: int):
+            def _grad_hook(_module, _grad_input, grad_output):
+                from prefix_sharing.tools.diagnostic_dump import dump_attn_grad_verl080
+
+                dump_attn_grad_verl080(grad_output[0], layer_number, num_layers)
+
+            return _grad_hook
+
+        attention_module._ps_grad_handles.append(
+            attention_module.register_full_backward_hook(_make_grad_hook(layer_number))
+        )
 
 
 def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool) -> Any:
@@ -362,27 +364,30 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
         if autocast_dtype == torch.float32
         else torch.autocast(device_type=device_name, dtype=autocast_dtype)
     )
-    # ##### [PS-diag] gradient dump hooks (OFF baseline) ######
+    # Register diagnostic gradient hooks for the OFF baseline when enabled.
     _register_grad_dump_hooks(self.module, forward_only)
-    # ##### [PS-diag] end #####
 
-    # [PS-perf] start — OFF engine fwd ——————————————————
-    from prefix_sharing.tools.perf_profiler import ProfilerScope as _ProfilerScope
-    _perf = _ProfilerScope.current()
-    if _perf is not None:
-        _fwd_phase = _perf.PHASE_FORWARD_OLD if forward_only else _perf.PHASE_FORWARD
-        _perf.start_phase(_fwd_phase)
+    from prefix_sharing.tools.perf_profiler import ProfilerScope
+
+    profiler = ProfilerScope.current()
+    if profiler is not None:
+        forward_phase = (
+            profiler.PHASE_FORWARD_OLD
+            if forward_only
+            else profiler.PHASE_FORWARD
+        )
+        profiler.start_phase(forward_phase)
 
     with autocast_ctx:
         raw_output = self.module(**model_inputs, use_cache=False)
-        if _perf is not None:
-            _perf.stop_phase(_fwd_phase)
-    # [PS-perf] end ———————————————————————————————————————
-        import os as _os_logits_off
-        if _os_logits_off.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            from prefix_sharing.tools.diagnostic_dump import dump_raw_logits_verl080, _get_dp_size
+        if profiler is not None:
+            profiler.stop_phase(forward_phase)
+
+        if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump import _get_dp_size, dump_raw_logits_verl080
 
             dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
+
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
@@ -399,7 +404,12 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=_infer_output_device(model_output))
             metrics = {}
-        return loss, {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
+
+        return loss, {
+            "model_output": model_output,
+            "loss": loss.detach().item(),
+            "metrics": metrics,
+        }
 
 
 def _save_prefix_last_logits_from_raw_output(raw_output: Any) -> None:
