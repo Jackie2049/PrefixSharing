@@ -93,18 +93,32 @@ def _cached_parallel_info() -> Any:
     return _PARALLEL_INFO_CACHE
 
 
+def _is_megatron_parallel(parallel_info: Any) -> bool:
+    """True only when Megatron TP/PP is actually in use (tp_size>1 or pp_size>1).
+
+    ``get_megatron_parallel_info()`` returns a default object (tp=1, pp=1) even
+    when Megatron mpu is not initialized (e.g. pure FSDP), because the megatron
+    package is importable.  A plain ``is not None`` check would therefore wrongly
+    classify FSDP as Megatron and force dp_size=1.
+    """
+    return (
+        parallel_info is not None
+        and (getattr(parallel_info, "tp_size", 1) > 1
+             or getattr(parallel_info, "pp_size", 1) > 1)
+    )
+
+
 def _get_dp_rank() -> int:
     """Return DP (data parallel) rank for FSDP / pure DP scenarios.
 
-    When Megatron parallel_info is available (TP/PP), rank 0 under each TP group
-    is treated as dp_rank 0 (only one writer per shard). When distributed is
-    initialized but no Megatron info exists (pure FSDP), use torch.distributed rank.
+    Only real Megatron TP/PP parallelism (tp_size>1 or pp_size>1) is treated as
+    Megatron; pure DP (FSDP, or Megatron with tp=pp=1) uses torch.distributed rank.
     """
     global _DP_RANK_CACHE
     if _DP_RANK_CACHE is not None:
         return _DP_RANK_CACHE
     parallel_info = _cached_parallel_info()
-    if parallel_info is not None and parallel_info.tp_rank == 0:
+    if _is_megatron_parallel(parallel_info) and parallel_info.tp_rank == 0:
         _DP_RANK_CACHE = 0
     elif torch.distributed.is_initialized():
         _DP_RANK_CACHE = torch.distributed.get_rank()
@@ -119,8 +133,8 @@ def _get_dp_size() -> int:
     if _DP_SIZE_CACHE is not None:
         return _DP_SIZE_CACHE
     parallel_info = _cached_parallel_info()
-    if parallel_info is not None:
-        _DP_SIZE_CACHE = 1  # Megatron: DP data not shard-visible here
+    if _is_megatron_parallel(parallel_info):
+        _DP_SIZE_CACHE = 1  # Megatron TP/PP: DP data not shard-visible here
     elif torch.distributed.is_initialized():
         _DP_SIZE_CACHE = torch.distributed.get_world_size()
     else:
