@@ -4,6 +4,7 @@ import json
 import os
 
 import torch
+import pytest
 
 from prefix_sharing.tools.assemble_dump import assemble
 
@@ -25,21 +26,33 @@ def _write_manifest(dir_path: str, *, tp: int = 1, pp: int = 1, dp: int = 1) -> 
 
 
 def test_dp_logits_concat(tmp_path):
-    """DP>1: logits_dp{r}.pt merged into logits.pt on the token axis (dim 0)."""
+    """DP packed logits [1, N_rank, V] merge on the token axis (dim 1)."""
     raw = tmp_path / "raw"
     out = tmp_path / "out"
     _write_manifest(str(raw), dp=2)
 
-    log0 = torch.randn(5, 8)
-    log1 = torch.randn(3, 8)
+    log0 = torch.randn(1, 5, 8)
+    log1 = torch.randn(1, 3, 8)
     torch.save(log0, str(raw / "logits_dp0.pt"))
     torch.save(log1, str(raw / "logits_dp1.pt"))
 
     assemble(str(raw), str(out))
 
     merged = torch.load(str(out / "logits.pt"), weights_only=True)
-    assert merged.shape == (8, 8)
-    assert torch.allclose(merged, torch.cat([log0, log1], dim=0))
+    assert merged.shape == (1, 8, 8)
+    assert torch.allclose(merged, torch.cat([log0, log1], dim=1))
+
+
+def test_dp_logits_rejects_non_packed_shape(tmp_path):
+    """DP logits must preserve the single-card [1, N, V] dump contract."""
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    _write_manifest(str(raw), dp=2)
+    torch.save(torch.randn(5, 8), str(raw / "logits_dp0.pt"))
+    torch.save(torch.randn(3, 8), str(raw / "logits_dp1.pt"))
+
+    with pytest.raises(ValueError, match=r"must have shape \[1, N, V\]"):
+        assemble(str(raw), str(out))
 
 
 def test_single_card_fast_path(tmp_path):
@@ -85,8 +98,8 @@ def test_dp_nested_per_layer_dict_merge(tmp_path):
     }
     grad0 = {1: torch.randn(3, 2, 4)}
     grad1 = {1: torch.randn(5, 2, 4)}
-    logits0 = torch.randn(3, 8)
-    logits1 = torch.randn(5, 8)
+    logits0 = torch.randn(1, 3, 8)
+    logits1 = torch.randn(1, 5, 8)
     torch.save(rank0, str(raw / "rope_postqk_dp0.pt"))
     torch.save(rank1, str(raw / "rope_postqk_dp1.pt"))
     torch.save(grad0, str(raw / "attn_grads_dp0.pt"))
@@ -105,7 +118,7 @@ def test_dp_nested_per_layer_dict_merge(tmp_path):
     merged_grads = torch.load(str(out / "attn_grads.pt"), weights_only=True)
     assert torch.allclose(merged_grads[1], torch.cat([grad0[1], grad1[1]], dim=0))
     merged_logits = torch.load(str(out / "logits.pt"), weights_only=True)
-    assert torch.allclose(merged_logits, torch.cat([logits0, logits1], dim=0))
+    assert torch.allclose(merged_logits, torch.cat([logits0, logits1], dim=1))
 
 
 def test_dp_cu_seqlens_offset_adjust(tmp_path):
