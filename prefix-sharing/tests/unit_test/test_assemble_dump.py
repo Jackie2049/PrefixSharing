@@ -70,6 +70,44 @@ def test_tp_logits_concat(tmp_path):
     assert merged.shape == (4, 12)
 
 
+def test_dp_nested_per_layer_dict_merge(tmp_path):
+    """Nested values merge recursively without blocking later DP artifacts."""
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    _write_manifest(str(raw), dp=2)
+    rank0 = {
+        1: {"query": torch.randn(3, 2, 4), "key": torch.randn(3, 2, 4), "positions": None},
+        2: {"query": torch.randn(3, 2, 4), "key": torch.randn(3, 2, 4), "positions": None},
+    }
+    rank1 = {
+        1: {"query": torch.randn(5, 2, 4), "key": torch.randn(5, 2, 4), "positions": None},
+        2: {"query": torch.randn(5, 2, 4), "key": torch.randn(5, 2, 4), "positions": None},
+    }
+    grad0 = {1: torch.randn(3, 2, 4)}
+    grad1 = {1: torch.randn(5, 2, 4)}
+    logits0 = torch.randn(3, 8)
+    logits1 = torch.randn(5, 8)
+    torch.save(rank0, str(raw / "rope_postqk_dp0.pt"))
+    torch.save(rank1, str(raw / "rope_postqk_dp1.pt"))
+    torch.save(grad0, str(raw / "attn_grads_dp0.pt"))
+    torch.save(grad1, str(raw / "attn_grads_dp1.pt"))
+    torch.save(logits0, str(raw / "logits_dp0.pt"))
+    torch.save(logits1, str(raw / "logits_dp1.pt"))
+
+    assemble(str(raw), str(out))
+
+    merged = torch.load(str(out / "rope_postqk.pt"), weights_only=True)
+    assert merged[1]["query"].shape == (8, 2, 4)
+    assert merged[1]["key"].shape == (8, 2, 4)
+    assert merged[1]["positions"] is None
+    assert torch.allclose(merged[2]["query"], torch.cat([rank0[2]["query"], rank1[2]["query"]], dim=0))
+
+    merged_grads = torch.load(str(out / "attn_grads.pt"), weights_only=True)
+    assert torch.allclose(merged_grads[1], torch.cat([grad0[1], grad1[1]], dim=0))
+    merged_logits = torch.load(str(out / "logits.pt"), weights_only=True)
+    assert torch.allclose(merged_logits, torch.cat([logits0, logits1], dim=0))
+
+
 def test_dp_cu_seqlens_offset_adjust(tmp_path):
     """DP cu_seqlens: per-rank [0,...] concatenated with cumulative offset.
 

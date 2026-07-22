@@ -143,20 +143,49 @@ def _merge_dp_1d(shards: list[tuple[int, str]], adjust_offsets: bool = False
     return torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
 
 
+def _merge_dp_values(values: list[Any]) -> Any:
+    """Recursively merge one logical value from multiple DP ranks.
+
+    Per-layer diagnostic files are not uniform: ``attn_outputs`` and
+    ``attn_grads`` map layer -> Tensor, while ``rope_postqk`` and
+    ``expanded_kv`` map layer -> {name: Tensor | None}.  Tensor leaves are
+    concatenated on the token axis (dim 0); nested dictionaries are merged
+    recursively.
+    """
+    non_none = [value for value in values if value is not None]
+    if not non_none:
+        return None
+    first = non_none[0]
+    if isinstance(first, torch.Tensor):
+        if len(non_none) != len(values):
+            raise ValueError("DP shards disagree on optional tensor presence")
+        return torch.cat(non_none, dim=0)
+    if isinstance(first, dict):
+        keys = set().union(*(value.keys() for value in non_none))
+        return {
+            key: _merge_dp_values([value.get(key) for value in values])
+            for key in keys
+        }
+    if all(value == first for value in non_none):
+        return first
+    raise TypeError(f"Unsupported or inconsistent DP-sharded value type: {type(first).__name__}")
+
+
 def _merge_dp_per_layer_dict(shards: list[tuple[int, str]]) -> dict | None:
-    """Merge DP-sharded per-layer dicts {layer: [T_rank, ...]} → concat each layer."""
-    merged: dict[int, Any] = {}
+    """Merge DP-sharded per-layer dicts recursively along the token axis."""
+    by_layer: dict[int, list[Any]] = {}
     for _, filepath in shards:
         layer_dict = torch.load(filepath, weights_only=True)
         if not isinstance(layer_dict, dict):
             continue
-        for layer_idx, tensor in layer_dict.items():
-            if layer_idx not in merged:
-                merged[layer_idx] = []
-            merged[layer_idx].append(tensor)
-    if not merged:
+        for layer_idx, value in layer_dict.items():
+            by_layer.setdefault(layer_idx, []).append(value)
+    if not by_layer:
         return None
-    return {layer_idx: torch.cat(tensors, dim=0) for layer_idx, tensors in merged.items()}
+    return {
+        layer_idx: _merge_dp_values(values)
+        for layer_idx, values in by_layer.items()
+    }
 
 
 def _collect_dp_tag_files(input_dir: str, prefix: str
