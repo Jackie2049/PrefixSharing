@@ -6,6 +6,7 @@ Patch 目标：
 3. vocab_parallel_log_probs_from_logits  → 自动 logprob restore
 4. no_padding_2_padding                  → PS 物理裁剪后修正序列长度
    (module-level + 所有 from...import 引用)
+5. main_ppo.run_ppo                      → fixed rollout + synthetic prefix injection
 
 所有业务逻辑由 integrations 层处理，本 patch set 只负责 thin wrapper 编排。
 """
@@ -15,14 +16,9 @@ from .forward_step import patch_verl_forward_step
 from .attention import patch_megatron_attention
 from .vocab_logprobs import patch_megatron_vocab
 from .nopadding import patch_no_padding_2_padding
+from .fit_hooks import create_run_ppo_patch
 
-# no_padding_2_padding 被 3 个模块用 from...import 直接引用：
-#   verl.workers.utils.padding           — 原定义模块
-#   verl.workers.utils.losses            — ppo_loss 内调用
-#   verl.trainer.distillation.losses     — distillation 内调用
-#   verl.trainer.ppo.ray_trainer         — trainer 侧调用
-# from...import 创建的是模块级属性，setattr 可以更新。
-# 必须对每个引用模块都 patch，否则该模块的局部引用仍指向原函数。
+# no_padding_2_padding 被 4 个模块用 from...import 直接引用
 _NOPADDING_PATCH_MODULES = [
     "verl.workers.utils.padding",
     "verl.workers.utils.losses",
@@ -63,6 +59,12 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
+    ),
+    PatchSpec(
+        module_name="verl.trainer.main_ppo",
+        target_getter=lambda mod: (mod, "run_ppo"),
+        patch_factory=create_run_ppo_patch,
+        description="run_ppo → fixed rollout + synthetic prefix injection (after init_workers)",
     ),
 ] + [
     PatchSpec(
