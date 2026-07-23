@@ -31,11 +31,9 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         *,
         inference_params=None,
     ):
-        # 优先 module 属性（AC recompute 兼容），回退 ContextVar
-        ctx = getattr(self, '_ps_ctx', None)
-        if ctx is None:
-            from prefix_sharing.integrations.context import current_prefix_sharing_context
-            ctx = current_prefix_sharing_context()
+        from prefix_sharing.integrations.context import current_prefix_sharing_context
+
+        ctx = current_prefix_sharing_context()
         if ctx is None:
             # ── normal path: 调用原始 forward ──
             _result = original_forward(
@@ -101,42 +99,35 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         from prefix_sharing.integrations.megatron_runtime import (
             prefix_attention,
         )
-        from prefix_sharing.integrations.context import _current_context
 
-        # prefix_attention 内部读 ContextVar；AC recompute 时 ContextVar
-        # 可能已过期，但 ctx 来自 self._ps_ctx 仍然有效。临时注入 ContextVar。
-        _ctxvar_token = _current_context.set(ctx)
-        try:
-            result = prefix_attention(
-                self,
-                query,
-                key,
-                value,
-                attention_mask,
-                rotary_pos_emb,
-                packed_seq_params,
-            )
-            if result is not None:
-                return result
+        result = prefix_attention(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+        )
+        if result is not None:
+            return result
 
-            # fallback: should not reach here if context is active,
-            # but return original forward as safety net
-            return original_forward(
-                self,
-                hidden_states,
-                attention_mask,
-                key_value_states=key_value_states,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                inference_params=inference_params,
-            )
-        finally:
-            _current_context.reset(_ctxvar_token)
+        # fallback: should not reach here if context is active,
+        # but return original forward as safety net
+        return original_forward(
+            self,
+            hidden_states,
+            attention_mask,
+            key_value_states=key_value_states,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+        )
 
     return patched_forward
