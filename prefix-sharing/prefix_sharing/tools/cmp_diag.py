@@ -184,6 +184,15 @@ def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
     return attn_dict.get(layer) if isinstance(attn_dict, dict) else None
 
 
+def _load_attn_grad(dir_path: str, layer: int) -> torch.Tensor | None:
+    """加载单层 attn_grad（attn_grads.pt = dict {layer: tensor}）。"""
+    filepath = os.path.join(dir_path, "attn_grads.pt")
+    if not os.path.exists(filepath):
+        return None
+    grad_dict = torch.load(filepath, weights_only=True)
+    return grad_dict.get(layer) if isinstance(grad_dict, dict) else None
+
+
 def _get_num_layers(dir_path: str) -> int:
     filepath = os.path.join(dir_path, "attn_outputs.pt")
     if not os.path.exists(filepath):
@@ -353,6 +362,52 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
         except ValueError as exc:
             results[layer_idx] = {"error": str(exc)}
     return CheckResult(name="attn_per_layer", passed=True,
+                       metrics={"layers": results})
+
+
+def cmp_attn_grads(dir_on: str, dir_off: str,
+                     layer: int | None) -> CheckResult | None:
+    """attn_grads per-layer cosine (suffix alignment, same as attn_output).
+
+    Single-layer mode (layer given): returns cos for that layer.
+    Full-layer mode: aggregates all layers.
+    """
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+
+    if layer is not None:
+        on_tensor = _load_attn_grad(dir_on, layer)
+        off_tensor = _load_attn_grad(dir_off, layer)
+        if on_tensor is None or off_tensor is None:
+            return None
+        needs_alignment = align_mask is not None and on_tensor.shape[0] != off_tensor.shape[0]
+        try:
+            layer_metrics = _cos_for_layer(on_tensor, off_tensor, align_mask if needs_alignment else None)
+        except ValueError as exc:
+            return CheckResult(name=f"attn_grad_L{layer}", passed=False,
+                               metrics={"error": str(exc)})
+        layer_metrics["layer"] = layer
+        return CheckResult(name=f"attn_grad_L{layer}",
+                           passed=layer_metrics["cos_avg"] > _COS_AVG_PASS
+                           and layer_metrics["cos_min"] > _COS_MIN_PASS, metrics=layer_metrics)
+
+    filepath_on = os.path.join(dir_on, "attn_grads.pt")
+    filepath_off = os.path.join(dir_off, "attn_grads.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
+        return None
+    grad_dict_on = torch.load(filepath_on, weights_only=True)
+    grad_dict_off = torch.load(filepath_off, weights_only=True)
+    if not isinstance(grad_dict_on, dict) or not isinstance(grad_dict_off, dict):
+        return None
+
+    results = {}
+    for layer_idx in sorted(set(grad_dict_on.keys()) & set(grad_dict_off.keys())):
+        on_tensor, off_tensor = grad_dict_on[layer_idx], grad_dict_off[layer_idx]
+        needs_alignment = align_mask is not None and on_tensor.shape[0] != off_tensor.shape[0]
+        try:
+            results[layer_idx] = _cos_for_layer(on_tensor, off_tensor, align_mask if needs_alignment else None)
+        except ValueError as exc:
+            results[layer_idx] = {"error": str(exc)}
+    return CheckResult(name="attn_grad_per_layer", passed=True,
                        metrics={"layers": results})
 
 
@@ -1176,6 +1231,7 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
         f"attention_mask_{tag}.pt",
         "logits.pt",
         "attn_outputs.pt",
+        "attn_grads.pt",
         "rope_postqk.pt",
         "rope_preqk.pt",
         "rope_freqs.pt",
@@ -1243,7 +1299,8 @@ def _print_rope_freqs(check_result: CheckResult):
 
 
 def _print_per_layer(check_result: CheckResult):
-    print(_SEP_SINGLE + "\n  [attn_output]  Per-Layer Cosine Similarity")
+    label = check_result.name.replace("_per_layer", "").replace("_", " ")
+    print(_SEP_SINGLE + f"\n  [{label}]  Per-Layer Cosine Similarity")
     print(_SEP_SINGLE)
     layers = check_result.metrics.get("layers")
     if isinstance(layers, dict):
@@ -1560,6 +1617,12 @@ def main():
 
     # ── packed: attention_output per-layer cos ──
     check_result = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
+    if check_result:
+        all_results.append(check_result)
+        _print_per_layer(check_result)
+
+    # ── packed: attn_grad per-layer cos ──
+    check_result = cmp_attn_grads(args.dir_on, args.dir_off, args.layer)
     if check_result:
         all_results.append(check_result)
         _print_per_layer(check_result)

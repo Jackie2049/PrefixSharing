@@ -170,24 +170,57 @@ def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
     print(f"[FixedRollout] Patched generate_sequences for capture → {json_path}")
 
 
-def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: int = 8):
+def patch_fixed_rollout(rollout_obj: Any, json_path: str):
     """Monkey-patch ``generate_sequences`` on *rollout_obj* to return fixed data.
 
     Args:
         rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
                       (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
         json_path: Absolute path to the JSON file.
-        num_workers: Number of agent loop workers (default 8). The fixed data
-            will be auto-padded to a multiple of this value.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    n = len(fixed_data)
-    remainder = n % num_workers
-    if remainder != 0:
-        pad_size = num_workers - remainder
-        fixed_data.padding(pad_size, "last")
-        print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
+    # Extract batch to a plain dict so we can manipulate it freely
+    # (same pattern as prefix-0501 inject_baseline_synthetic).
+    batch = dict(fixed_data.batch)
+    meta_info = dict(fixed_data.meta_info)
+    n_orig = len(fixed_data)
+
+    import torch as _torch
+    import numpy as _np
+
+    # ── 1. Select first N sequences ──
+    _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "0"))
+    if _num_seq > 0 and n_orig > _num_seq:
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key][:_num_seq]
+        n_orig = _num_seq
+        print(f"[FixedRollout] Selected {_num_seq} sequences")
+
+    # ── 2. Randomize reward scores (debug only) ──
+    _torch.manual_seed(42)
+    for _key in ("token_level_rewards", "rm_scores"):
+        _rm = batch.get(_key)
+        if _rm is not None:
+            _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
+
+    # ── 3. Stack (tile dim-0) ──
+    _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
+    if _stack > 1:
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key].repeat(_stack, *([1] * (batch[_key].dim() - 1)))
+        n_orig *= _stack
+        print(f"[FixedRollout] Stacked batch x{_stack}: {n_orig} sequences")
+
+    # ── 4. Rebuild DataProto (non_tensors built fresh like prefix-0501) ──
+    from verl.protocol import DataProto
+    fixed_data = DataProto.from_dict(
+        batch,
+        non_tensors={"multi_modal_inputs": _np.array([{}] * n_orig, dtype=object)},
+    )
+    fixed_data.meta_info = meta_info
 
     def _patched(batch, **kwargs):
         print("[FixedRollout] Returning fixed rollout data, skipping generation.")

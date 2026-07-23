@@ -93,18 +93,32 @@ def _cached_parallel_info() -> Any:
     return _PARALLEL_INFO_CACHE
 
 
+def _is_megatron_parallel(parallel_info: Any) -> bool:
+    """True only when Megatron TP/PP is actually in use (tp_size>1 or pp_size>1).
+
+    ``get_megatron_parallel_info()`` returns a default object (tp=1, pp=1) even
+    when Megatron mpu is not initialized (e.g. pure FSDP), because the megatron
+    package is importable.  A plain ``is not None`` check would therefore wrongly
+    classify FSDP as Megatron and force dp_size=1.
+    """
+    return (
+        parallel_info is not None
+        and (getattr(parallel_info, "tp_size", 1) > 1
+             or getattr(parallel_info, "pp_size", 1) > 1)
+    )
+
+
 def _get_dp_rank() -> int:
     """Return DP (data parallel) rank for FSDP / pure DP scenarios.
 
-    When Megatron parallel_info is available (TP/PP), rank 0 under each TP group
-    is treated as dp_rank 0 (only one writer per shard). When distributed is
-    initialized but no Megatron info exists (pure FSDP), use torch.distributed rank.
+    Only real Megatron TP/PP parallelism (tp_size>1 or pp_size>1) is treated as
+    Megatron; pure DP (FSDP, or Megatron with tp=pp=1) uses torch.distributed rank.
     """
     global _DP_RANK_CACHE
     if _DP_RANK_CACHE is not None:
         return _DP_RANK_CACHE
     parallel_info = _cached_parallel_info()
-    if parallel_info is not None and parallel_info.tp_rank == 0:
+    if _is_megatron_parallel(parallel_info) and parallel_info.tp_rank == 0:
         _DP_RANK_CACHE = 0
     elif torch.distributed.is_initialized():
         _DP_RANK_CACHE = torch.distributed.get_rank()
@@ -119,8 +133,8 @@ def _get_dp_size() -> int:
     if _DP_SIZE_CACHE is not None:
         return _DP_SIZE_CACHE
     parallel_info = _cached_parallel_info()
-    if parallel_info is not None:
-        _DP_SIZE_CACHE = 1  # Megatron: DP data not shard-visible here
+    if _is_megatron_parallel(parallel_info):
+        _DP_SIZE_CACHE = 1  # Megatron TP/PP: DP data not shard-visible here
     elif torch.distributed.is_initialized():
         _DP_SIZE_CACHE = torch.distributed.get_world_size()
     else:
@@ -317,15 +331,16 @@ def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
 
 
 def _flush_rope_buffer(dump_dir: str) -> None:
-    """Write accumulated rope_postqk dict to disk and clear buffer."""
+    """Write accumulated rope_postqk dict to disk and clear buffer. DP-aware."""
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
-    if not _should_write_for_scope("pp_stage"):
+    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         _ROPE_BUFFER = None
         return
     try:
-        filename = f"rope_postqk{_pp_suffix()}.pt"
+        filename = f"rope_postqk{_pp_suffix()}{_dp_suffix()}.pt"
         torch.save(_ROPE_BUFFER, os.path.join(dump_dir, filename))
         _log.warning("%s saved (%d layers)", filename, len(_ROPE_BUFFER))
         _ROPE_BUFFER = None
@@ -334,14 +349,15 @@ def _flush_rope_buffer(dump_dir: str) -> None:
 
 
 def _flush_dict_buffer(filename: str, buffer: dict, dump_dir: str) -> None:
-    """rank0 torch.save a dict buffer. PP-aware gating + suffix."""
-    if not _should_write_for_scope("pp_stage"):
+    """torch.save a dict buffer. PP + DP-aware gating and suffix."""
+    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         return
     try:
         stem, separator, extension = filename.rpartition(".")
-        pp_suffix_str = _pp_suffix()
-        pp_filename = f"{stem}{pp_suffix_str}{separator}{extension}" if separator else f"{filename}{pp_suffix_str}"
-        torch.save(buffer, os.path.join(dump_dir, pp_filename))
+        suffix = f"{_pp_suffix()}{_dp_suffix()}"
+        suffixed_filename = f"{stem}{suffix}{separator}{extension}" if separator else f"{filename}{suffix}"
+        torch.save(buffer, os.path.join(dump_dir, suffixed_filename))
     except Exception as exc:
         print(f"[PS-diag] {filename} save failed: {exc}", flush=True)
 
@@ -522,11 +538,16 @@ def dump_rope_postqk_verl080(layer_number: int,
                              num_layers: int,
                              positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE Q/K. Auto-flush to rope_postqk.pt."""
+    global _ROPE_BUFFER
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
     _add_to_rope_buffer(layer_number, rotated_query, rotated_key, positions)
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _ROPE_BUFFER is None or len(_ROPE_BUFFER) < num_layers:
+            _ROPE_BUFFER = None
+            return
         _flush_rope_buffer(dump_dir)
 
 
@@ -570,6 +591,10 @@ def dump_expanded_kv_on(layer_number: int, expanded_key: torch.Tensor,
         "value": expanded_value.detach().cpu().clone(),
     }
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _EXPANDED_KV_BUFFER is None or len(_EXPANDED_KV_BUFFER) < num_layers:
+            _EXPANDED_KV_BUFFER = None
+            return
         _flush_dict_buffer("expanded_kv.pt", _EXPANDED_KV_BUFFER, dump_dir)
         _EXPANDED_KV_BUFFER = None
 
@@ -609,6 +634,10 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
         _BUILD_KV_INPUT_V_BUFFER = {}
     _BUILD_KV_INPUT_V_BUFFER[layer_number] = value.detach().cpu().clone()
     if layer_number == _stage_last_layer(num_layers):
+        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        if _BUILD_KV_INPUT_V_BUFFER is None or len(_BUILD_KV_INPUT_V_BUFFER) < num_layers:
+            _BUILD_KV_INPUT_V_BUFFER = None
+            return
         _flush_dict_buffer("build_kv_input_v.pt", _BUILD_KV_INPUT_V_BUFFER, dump_dir)
         _BUILD_KV_INPUT_V_BUFFER = None
 
@@ -921,6 +950,10 @@ def dump_fsdp_attn_output(
     _FSDP_ATTN_BUFFER[layer_number] = output_2d
 
     if layer_number == num_layers:
+        # 防止训练结束后的残余 forward 只用最后 1 层覆盖正确文件
+        if len(_FSDP_ATTN_BUFFER) < num_layers:
+            _FSDP_ATTN_BUFFER.clear()
+            return
         if _get_dp_size() > 1:
             filename = f"attn_outputs_dp{_get_dp_rank()}.pt"
         else:
@@ -930,6 +963,72 @@ def dump_fsdp_attn_output(
             filename = "attn_outputs.pt"
         _torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, filename))
         _FSDP_ATTN_BUFFER.clear()
+
+
+
+# ============================================================
+#  FSDP per-layer attn_output gradient dump (backward hook)
+# ============================================================
+
+_ATTN_GRAD_BUFFER: dict[int, torch.Tensor] = {}
+
+
+def dump_attn_grad_verl080(
+    grad: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+) -> None:
+    """Accumulate one layer's attn_output gradient. Auto-flush to attn_grads.pt.
+
+    Called from the register_hook on each layer's attn_output during backward.
+    *grad* shape matches the forward output ([B, L, H, D] or [N, H, D]),
+    reshaped to [N, H*D] packed format matching dump_fsdp_attn_output.
+
+    Args:
+        grad: Gradient w.r.t. attention output tensor.
+        layer_number: 1-based layer index.
+        num_layers: Total number of layers in the model.
+    """
+    import torch as _torch
+
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if not hasattr(grad, 'dim') or grad.dim() < 3:
+        return
+    if num_layers == 0:
+        return
+
+    # grad_output[0] 来自 module.register_full_backward_hook，是 post-o_proj
+    # 的 [B, L, hidden]，只有一个尾部维度是 hidden dim。对比 dump_fsdp_attn_output
+    # 的 pre-o_proj [B, L, H, D] 需要 shape[-2]*shape[-1]。
+    if grad.dim() == 4:
+        hidden_dim = grad.shape[-1] * grad.shape[-2]
+    else:
+        hidden_dim = grad.shape[-1]
+    grad_2d = grad.reshape(-1, hidden_dim).detach().cpu().contiguous()
+
+    global _ATTN_GRAD_BUFFER
+    # 注意：backward 时 hook 按 layer 逆序触发（24→23→...→1）。
+    # 最高层最先触发 = 清旧 buffer；最低层最后触发 = flush。
+    if layer_number == num_layers:
+        _ATTN_GRAD_BUFFER.clear()
+    _ATTN_GRAD_BUFFER[layer_number] = grad_2d
+
+    if layer_number == 1:
+        # 所有层的 grad 已收集完毕
+        if len(_ATTN_GRAD_BUFFER) < num_layers:
+            _ATTN_GRAD_BUFFER.clear()
+            return
+        if _get_dp_size() > 1:
+            filename = f'attn_grads_dp{_get_dp_rank()}.pt'
+        else:
+            if not _rank0_only():
+                _ATTN_GRAD_BUFFER.clear()
+                return
+            filename = 'attn_grads.pt'
+        _torch.save(_ATTN_GRAD_BUFFER, os.path.join(dump_dir, filename))
+        _ATTN_GRAD_BUFFER.clear()
 
 
 # ════════════════════════════════════════════════════════════════

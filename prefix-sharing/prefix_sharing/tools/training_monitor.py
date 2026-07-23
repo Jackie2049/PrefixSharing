@@ -135,6 +135,8 @@ class MemorySnapshot:
     timestamp: float
     allocated_gb: float  # memory_allocated()  – tensor 占用
     reserved_gb: float   # memory_reserved()  – 分配器保留（含缓存）
+    mini_batch_idx: int = -1   # -1 = outside any mini/micro-batch window
+    micro_batch_idx: int = -1  # -1 = outside a micro-batch (e.g. optimizer update)
 
 
 class MemoryMonitor:
@@ -168,6 +170,10 @@ class MemoryMonitor:
         self._running = False
         self._thread: threading.Thread | None = None
         self.device_type = self._resolve_device(device_type)
+        # Written from the main thread, read by the sampling thread.
+        # Python attribute read/write is atomic under the GIL, so no lock.
+        self._current_mini_batch = -1
+        self._current_micro_batch = -1
 
     # ------------------------------------------------------------------
     # public
@@ -189,6 +195,16 @@ class MemoryMonitor:
     def snapshot(self) -> MemorySnapshot:
         """One-shot query of all memory metrics without starting the thread."""
         return self._sample_once()
+
+    def set_batch_idx(self, mini_batch_idx: int, micro_batch_idx: int) -> None:
+        """Tag subsequent samples with the current mini/micro-batch index.
+
+        Called from the main thread; the sampling thread reads these values
+        when producing each ``MemorySnapshot``.  ``-1`` marks samples taken
+        outside any micro-batch (e.g. during optimizer update).
+        """
+        self._current_mini_batch = mini_batch_idx
+        self._current_micro_batch = micro_batch_idx
 
     # -- per-metric peaks -------------------------------------------------
 
@@ -227,7 +243,8 @@ class MemoryMonitor:
     def save_to_csv(self, path: str) -> None:
         """Save all memory samples to a CSV file (no log output).
 
-        Columns: ``timestamp``, ``allocated_gb``, ``reserved_gb``.
+        Columns: ``timestamp``, ``mini_batch_idx``, ``micro_batch_idx``,
+        ``allocated_gb``, ``reserved_gb``.
 
         Args:
             path: Output CSV file path.
@@ -236,9 +253,9 @@ class MemoryMonitor:
             raise RuntimeError("[MemoryMonitor] No samples to save. Did you forget to call start()/stop()?")
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "allocated_gb", "reserved_gb"])
+            writer.writerow(["timestamp", "mini_batch_idx", "micro_batch_idx", "allocated_gb", "reserved_gb"])
             for s in self._samples:
-                writer.writerow([s.timestamp, s.allocated_gb, s.reserved_gb])
+                writer.writerow([s.timestamp, s.mini_batch_idx, s.micro_batch_idx, s.allocated_gb, s.reserved_gb])
         print(f"[MemoryMonitor] Saved {len(self._samples)} samples to {path}")
 
     # ------------------------------------------------------------------
@@ -269,12 +286,18 @@ class MemoryMonitor:
             allocated = _torch.cuda.memory_allocated()
             reserved = _torch.cuda.memory_reserved()
         else:
-            return MemorySnapshot(time.time(), 0.0, 0.0)
+            return MemorySnapshot(
+                time.time(), 0.0, 0.0,
+                mini_batch_idx=self._current_mini_batch,
+                micro_batch_idx=self._current_micro_batch,
+            )
 
         return MemorySnapshot(
             timestamp=time.time(),
             allocated_gb=allocated / (1024**3),
             reserved_gb=reserved / (1024**3),
+            mini_batch_idx=self._current_mini_batch,
+            micro_batch_idx=self._current_micro_batch,
         )
 
     def _sample_loop(self) -> None:

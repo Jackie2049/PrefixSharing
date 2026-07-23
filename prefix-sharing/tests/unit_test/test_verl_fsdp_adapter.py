@@ -574,7 +574,7 @@ def test_transformers_attention_patch_passthrough_and_runtime_layout(monkeypatch
     runtime_calls = []
 
     class FakeRuntime:
-        def __init__(self, *, layer_id):
+        def __init__(self, *, layer_id, num_layers=0):
             self.layer_id = layer_id
 
         def forward(self, attn_func, query_ld, key_ld, value_ld):
