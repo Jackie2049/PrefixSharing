@@ -137,6 +137,7 @@ class MemorySnapshot:
     reserved_gb: float   # memory_reserved()  – 分配器保留（含缓存）
     mini_batch_idx: int = -1   # -1 = outside any mini/micro-batch window
     micro_batch_idx: int = -1  # -1 = outside a micro-batch (e.g. optimizer update)
+    phase: str = ""          # optional attention phase tag (e.g. "attn.on")
 
 
 class MemoryMonitor:
@@ -174,6 +175,7 @@ class MemoryMonitor:
         # Python attribute read/write is atomic under the GIL, so no lock.
         self._current_mini_batch = -1
         self._current_micro_batch = -1
+        self._current_phase = ""
 
     # ------------------------------------------------------------------
     # public
@@ -205,6 +207,15 @@ class MemoryMonitor:
         """
         self._current_mini_batch = mini_batch_idx
         self._current_micro_batch = micro_batch_idx
+
+    def set_phase(self, phase: str) -> None:
+        """Tag subsequent samples with an attention phase name.
+
+        Empty string clears the tag.  Used to mark the background samples that
+        fall inside ``attn.on`` / ``attn.off`` so they can be aggregated
+        separately from the global micro-batch memory trace.
+        """
+        self._current_phase = phase
 
     # -- per-metric peaks -------------------------------------------------
 
@@ -244,7 +255,7 @@ class MemoryMonitor:
         """Save all memory samples to a CSV file (no log output).
 
         Columns: ``timestamp``, ``mini_batch_idx``, ``micro_batch_idx``,
-        ``allocated_gb``, ``reserved_gb``.
+        ``phase``, ``allocated_gb``, ``reserved_gb``.
 
         Args:
             path: Output CSV file path.
@@ -253,9 +264,9 @@ class MemoryMonitor:
             raise RuntimeError("[MemoryMonitor] No samples to save. Did you forget to call start()/stop()?")
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "mini_batch_idx", "micro_batch_idx", "allocated_gb", "reserved_gb"])
+            writer.writerow(["timestamp", "mini_batch_idx", "micro_batch_idx", "phase", "allocated_gb", "reserved_gb"])
             for s in self._samples:
-                writer.writerow([s.timestamp, s.mini_batch_idx, s.micro_batch_idx, s.allocated_gb, s.reserved_gb])
+                writer.writerow([s.timestamp, s.mini_batch_idx, s.micro_batch_idx, s.phase, s.allocated_gb, s.reserved_gb])
         print(f"[MemoryMonitor] Saved {len(self._samples)} samples to {path}")
 
     # ------------------------------------------------------------------
@@ -298,6 +309,7 @@ class MemoryMonitor:
             reserved_gb=reserved / (1024**3),
             mini_batch_idx=self._current_mini_batch,
             micro_batch_idx=self._current_micro_batch,
+            phase=self._current_phase,
         )
 
     def _sample_loop(self) -> None:
