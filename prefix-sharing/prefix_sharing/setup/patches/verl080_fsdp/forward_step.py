@@ -216,10 +216,23 @@ def _forward_step_with_engine_prepare(
 
     # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
-    _register_weight_grad_dump_hook(self.module, diagnostic_tag, forward_only)
+
+    weight_grad_dump_done: list[bool] = [False]
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
-        """Release PS state and diagnostic hooks after backward completes."""
+        """Release PS state, dump weight gradients, and remove diagnostic hooks."""
+        print(f"[cleanup_hook] firing tag={diagnostic_tag} forward_only={forward_only}", flush=True)
+        if (
+            os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+            and not forward_only
+            and not weight_grad_dump_done[0]
+        ):
+            from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
+
+            print(f"[cleanup_hook] dumping weight grads tag={diagnostic_tag}", flush=True)
+            dump_weight_grads_verl080(self.module, diagnostic_tag)
+            weight_grad_dump_done[0] = True
+
         ctx_cleanup()
         for module in self.module.modules():
             try:
@@ -339,35 +352,6 @@ def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
         )
 
 
-def _register_weight_grad_dump_hook(model: Any, tag: str, forward_only: bool) -> None:
-    """Register a one-shot full-backward hook to dump all weight gradients.
-
-    The hook fires after ``loss.backward()`` completes, saves every parameter's
-    ``.grad`` tensor, and then removes itself.  When DP sharding is used, each
-    rank writes its own local shard so ON vs OFF comparisons stay rank-local.
-    """
-    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is None:
-        print("[weight_grad_hook] skip: PREFIX_SHARING_DIAG_DUMP not set", flush=True)
-        return
-    if forward_only:
-        print("[weight_grad_hook] skip: forward_only=True", flush=True)
-        return
-
-    handle_container: list[Any | None] = [None]
-
-    def _hook(_module: Any, _grad_input: Any, _grad_output: Any) -> None:
-        print(f"[weight_grad_hook] firing tag={tag}", flush=True)
-        from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
-
-        dump_weight_grads_verl080(model, tag)
-        if handle_container[0] is not None:
-            handle_container[0].remove()
-            handle_container[0] = None
-
-    handle_container[0] = model.register_full_backward_hook(_hook)
-    print(f"[weight_grad_hook] registered tag={tag}", flush=True)
-
-
 def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool) -> Any:
     # No sharing detected after planning. Delegate to the original engine
     # implementation shape by calling the unpatched method through the closure
@@ -397,7 +381,31 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     # Register diagnostic gradient hooks for the OFF baseline when enabled.
     _register_grad_dump_hooks(self.module, forward_only)
     diagnostic_tag = "train" if self.module.training else "old"
-    _register_weight_grad_dump_hook(self.module, diagnostic_tag, forward_only)
+
+    weight_grad_dump_done_off: list[bool] = [False]
+
+    def _cleanup_off(_module, _grad_input, _grad_output):
+        """Dump weight gradients and remove diagnostic hooks after backward."""
+        print(f"[cleanup_hook_off] firing tag={diagnostic_tag} forward_only={forward_only}", flush=True)
+        if (
+            os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+            and not forward_only
+            and not weight_grad_dump_done_off[0]
+        ):
+            from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
+
+            print(f"[cleanup_hook_off] dumping weight grads tag={diagnostic_tag}", flush=True)
+            dump_weight_grads_verl080(self.module, diagnostic_tag)
+            weight_grad_dump_done_off[0] = True
+
+        for module in self.module.modules():
+            grad_hook_handles = getattr(module, "_ps_grad_handles", None)
+            if grad_hook_handles is not None:
+                for grad_hook_handle in grad_hook_handles:
+                    grad_hook_handle.remove()
+                module._ps_grad_handles = None
+
+    self.module.register_full_backward_hook(_cleanup_off)
 
     from prefix_sharing.tools.perf_profiler import ProfilerScope
 
