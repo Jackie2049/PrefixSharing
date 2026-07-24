@@ -10,7 +10,7 @@ PrefixSharing runtime，并在输出阶段做 interior / prefix-last restore。
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
@@ -217,36 +217,10 @@ def _forward_step_with_engine_prepare(
     # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
 
-    weight_grad_dump_done: list[bool] = [False]
-
-    def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
-        """Release PS state, dump weight gradients, and remove diagnostic hooks."""
-        print(f"[cleanup_hook] firing tag={diagnostic_tag} forward_only={forward_only}", flush=True)
-        if (
-            os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
-            and not forward_only
-            and not weight_grad_dump_done[0]
-        ):
-            from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
-
-            print(f"[cleanup_hook] dumping weight grads tag={diagnostic_tag}", flush=True)
-            dump_weight_grads_verl080(self.module, diagnostic_tag)
-            weight_grad_dump_done[0] = True
-
-        ctx_cleanup()
-        for module in self.module.modules():
-            try:
-                del module._ps_ctx
-            except AttributeError:
-                pass
-
-            grad_hook_handles = getattr(module, "_ps_grad_handles", None)
-            if grad_hook_handles is not None:
-                for grad_hook_handle in grad_hook_handles:
-                    grad_hook_handle.remove()
-                module._ps_grad_handles = None
-
-    self.module.register_full_backward_hook(_cleanup_ps_ctx)
+    # Attach cleanup callback so the forward_backward_batch wrapper can release
+    # PrefixSharing state after backward.  The root full-backward hook is
+    # unreliable here because ``self.module`` returns a CausalLMOutput dataclass.
+    self.module._ps_ctx_cleanup = ctx_cleanup
 
     with autocast_ctx:
         if profiler is not None:
@@ -380,32 +354,6 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     )
     # Register diagnostic gradient hooks for the OFF baseline when enabled.
     _register_grad_dump_hooks(self.module, forward_only)
-    diagnostic_tag = "train" if self.module.training else "old"
-
-    weight_grad_dump_done_off: list[bool] = [False]
-
-    def _cleanup_off(_module, _grad_input, _grad_output):
-        """Dump weight gradients and remove diagnostic hooks after backward."""
-        print(f"[cleanup_hook_off] firing tag={diagnostic_tag} forward_only={forward_only}", flush=True)
-        if (
-            os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
-            and not forward_only
-            and not weight_grad_dump_done_off[0]
-        ):
-            from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
-
-            print(f"[cleanup_hook_off] dumping weight grads tag={diagnostic_tag}", flush=True)
-            dump_weight_grads_verl080(self.module, diagnostic_tag)
-            weight_grad_dump_done_off[0] = True
-
-        for module in self.module.modules():
-            grad_hook_handles = getattr(module, "_ps_grad_handles", None)
-            if grad_hook_handles is not None:
-                for grad_hook_handle in grad_hook_handles:
-                    grad_hook_handle.remove()
-                module._ps_grad_handles = None
-
-    self.module.register_full_backward_hook(_cleanup_off)
 
     from prefix_sharing.tools.perf_profiler import ProfilerScope
 
@@ -552,3 +500,53 @@ def _read_temperature(micro_batch: Any) -> float:
         return float(value)
     except Exception:
         return 1.0
+
+
+def patch_forward_backward_batch_for_diag_dump(
+    original_forward_backward_batch: Callable,
+) -> Callable:
+    """Wrap FSDPEngine.forward_backward_batch to dump weight gradients after backward.
+
+    The root ``self.module`` returns a ``CausalLMOutputWithPast`` dataclass, so
+    ``register_full_backward_hook`` on it does not fire reliably.  We instead
+    hook the train loop directly: after ``forward_backward_batch`` returns,
+    all micro-batches have already done ``loss.backward()``, so parameter
+    gradients are ready.
+    """
+
+    def wrapped(self: Any, data: Any, loss_function: Any, forward_only: bool = False) -> Any:
+        result = original_forward_backward_batch(self, data, loss_function, forward_only)
+
+        if not forward_only and os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            tag = "train" if self.module.training else "old"
+            print(
+                f"[diag_dump] forward_backward_batch done tag={tag}; "
+                "dumping weight grads and cleaning up hooks",
+                flush=True,
+            )
+            from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
+
+            dump_weight_grads_verl080(self.module, tag)
+
+            # Clean up PrefixSharing context if the root backward hook did not fire.
+            ctx_cleanup = getattr(self.module, "_ps_ctx_cleanup", None)
+            if ctx_cleanup is not None:
+                ctx_cleanup()
+                delattr(self.module, "_ps_ctx_cleanup")
+
+            # Remove per-layer attention gradient hooks.
+            for module in self.module.modules():
+                try:
+                    del module._ps_ctx
+                except AttributeError:
+                    pass
+
+                grad_hook_handles = getattr(module, "_ps_grad_handles", None)
+                if grad_hook_handles is not None:
+                    for grad_hook_handle in grad_hook_handles:
+                        grad_hook_handle.remove()
+                    module._ps_grad_handles = None
+
+        return result
+
+    return wrapped
