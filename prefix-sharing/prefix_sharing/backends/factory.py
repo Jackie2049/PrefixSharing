@@ -28,12 +28,16 @@ def get_backend_instance(
     if config.backend == "flash_atten_gpu":
         from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
         return GpuFlashAttentionBackend()
-    
+
+    if config.backend == "flex_atten_gpu":
+        from prefix_sharing.backends.flex_atten_gpu import GpuFlexAttentionBackend
+        return GpuFlexAttentionBackend()
+
     if config.backend == "flash_atten_npu":
         from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
         return NpuFlashAttentionBackend()
-    
+
     raise ValueError(
         f"Unknown backend '{config.backend}'. "
-        f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"
+        f"Supported: torch_ref, flash_atten_gpu, flex_atten_gpu, flash_atten_npu"
     )

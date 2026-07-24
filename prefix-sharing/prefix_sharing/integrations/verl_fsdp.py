@@ -385,16 +385,26 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
-    expanded_key, expanded_value = ctx.attention_backend.build_kv(
-        packed_key,
-        packed_value,
-        ctx.store,
-        plan,
-        packed_batch_layout=ctx.packed_batch_layout,
-        layer_id=layer_id,
-        tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
-        stats=ctx.stats,
+    # Backends that express prefix visibility via an attention mask (e.g.
+    # FlexAttention + BlockMask) declare requires_kv_expansion=False and
+    # receive the unexpanded packed K/V directly — no build_kv copy loop,
+    # no store traffic, and gradients flow straight back to packed k/v.
+    requires_kv_expansion = getattr(
+        ctx.attention_backend.capabilities, "requires_kv_expansion", True
     )
+    if requires_kv_expansion:
+        expanded_key, expanded_value = ctx.attention_backend.build_kv(
+            packed_key,
+            packed_value,
+            ctx.store,
+            plan,
+            packed_batch_layout=ctx.packed_batch_layout,
+            layer_id=layer_id,
+            tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
+            stats=ctx.stats,
+        )
+    else:
+        expanded_key, expanded_value = packed_key, packed_value
     # [PS-perf] start — per-layer KV stop ——————————————————
     if _per_layer_ok:
         _kv_elapsed = profiler.stop_phase(f"attn.kv.l{layer_id}")
@@ -404,7 +414,14 @@ def _run_packed_attention_runtime(
         profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
 
     # ##### [PS-diag] per-layer dump: expanded_kv (ON only) ######
-    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+    # Skipped for mask-based backends (requires_kv_expansion=False): there is
+    # no physically expanded KV to dump — packed k/v already went out above
+    # via dump_build_kv_input_v_on / dump_rope_postqk_verl080.
+    if (
+        _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+        and num_layers > 0
+        and requires_kv_expansion
+    ):
         from prefix_sharing.tools.diagnostic_dump import dump_expanded_kv_on
         dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
     # ##### [PS-diag] end #####

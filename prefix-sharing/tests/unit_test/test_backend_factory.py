@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from prefix_sharing.backends.factory import get_backend_instance
+from prefix_sharing.backends.flex_atten_gpu import GpuFlexAttentionBackend
 from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
 from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
@@ -24,6 +25,15 @@ def test_factory_flash_atten_gpu() -> None:
     assert isinstance(backend, GpuFlashAttentionBackend)
     assert backend.capabilities.name == "flash_atten_gpu"
     assert backend.capabilities.supports_flash_attention
+
+
+def test_factory_flex_atten_gpu() -> None:
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flex_atten_gpu")
+    backend = get_backend_instance(config)
+    assert isinstance(backend, GpuFlexAttentionBackend)
+    assert backend.capabilities.name == "flex_atten_gpu"
+    assert backend.capabilities.supports_flash_attention
+    assert backend.capabilities.requires_kv_expansion is False
 
 
 def test_factory_flash_atten_npu():
@@ -62,7 +72,7 @@ def test_config_validates_backends() -> None:
 
 
 def test_config_accepts_supported_backends():
-    for name in ("torch_ref", "flash_atten_gpu", "flash_atten_npu"):
+    for name in ("torch_ref", "flash_atten_gpu", "flex_atten_gpu", "flash_atten_npu"):
         cfg = PrefixSharingConfig(enable_prefix_sharing=True, backend=name)
         cfg.validate()  # should not raise
         

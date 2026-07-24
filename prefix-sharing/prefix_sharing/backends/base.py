@@ -23,6 +23,12 @@ class BackendCapabilities:
     supports_flash_attention: bool = False
     supports_gated_attention: bool = False
     supports_deltanet_state_reuse: bool = False
+    requires_kv_expansion: bool = True
+    """Whether integrations must call ``build_kv`` to physically expand prefix
+    KV before ``attention``.  Backends that express prefix visibility through
+    an attention mask (e.g. FlexAttention with a BlockMask) set this to
+    ``False`` so integrations pass the unexpanded packed K/V straight to
+    ``attention`` and skip the build_kv copy loop entirely."""
 
 
 class PrefixAttentionBackend(Protocol):
