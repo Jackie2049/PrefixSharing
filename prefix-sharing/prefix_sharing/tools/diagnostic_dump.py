@@ -1051,7 +1051,10 @@ def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
 
     dump_dir = _get_dump_dir()
     if dump_dir is None:
+        print("[dump_weight_grads] PREFIX_SHARING_DIAG_DUMP not set, skip", flush=True)
         return
+
+    print(f"[dump_weight_grads] tag={tag} dir={dump_dir}", flush=True)
 
     grad_dict: dict[str, _torch.Tensor] = {}
     missing_grad_count = 0
@@ -1074,18 +1077,17 @@ def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
                 grad = grad.to_local()
             grad_dict[name] = grad.detach().cpu()
         except Exception as exc:
+            print(f"[dump_weight_grads] extract failed {name}: {exc}", flush=True)
             _log.warning("weight grad %s extract failed: %s", name, exc)
 
-    _log.warning(
-        "dump_weight_grads(tag=%s): total_params=%d grad_missing=%d dumped=%d",
-        tag,
-        total_param_count,
-        missing_grad_count,
-        len(grad_dict),
+    print(
+        f"[dump_weight_grads] tag={tag} total={total_param_count} "
+        f"missing={missing_grad_count} dumped={len(grad_dict)}",
+        flush=True,
     )
 
     if not grad_dict:
-        _log.warning("no weight gradients found; skip dump")
+        print("[dump_weight_grads] no weight gradients found; skip dump", flush=True)
         return
 
     if _get_dp_size() > 1:
@@ -1096,9 +1098,12 @@ def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
         filename = f"weight_grads_{tag}.pt"
 
     try:
-        _torch.save(grad_dict, os.path.join(dump_dir, filename))
+        save_path = os.path.join(dump_dir, filename)
+        _torch.save(grad_dict, save_path)
+        print(f"[dump_weight_grads] saved {save_path} ({len(grad_dict)} params)", flush=True)
         _log.warning("%s saved (%d params)", filename, len(grad_dict))
     except Exception as exc:
+        print(f"[dump_weight_grads] save failed {filename}: {exc}", flush=True)
         _log.warning("%s save failed: %s", filename, exc)
 
 

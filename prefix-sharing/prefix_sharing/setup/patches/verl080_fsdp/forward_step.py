@@ -347,13 +347,16 @@ def _register_weight_grad_dump_hook(model: Any, tag: str, forward_only: bool) ->
     rank writes its own local shard so ON vs OFF comparisons stay rank-local.
     """
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is None:
+        print("[weight_grad_hook] skip: PREFIX_SHARING_DIAG_DUMP not set", flush=True)
         return
     if forward_only:
+        print("[weight_grad_hook] skip: forward_only=True", flush=True)
         return
 
     handle_container: list[Any | None] = [None]
 
     def _hook(_module: Any, _grad_input: Any, _grad_output: Any) -> None:
+        print(f"[weight_grad_hook] firing tag={tag}", flush=True)
         from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
 
         dump_weight_grads_verl080(model, tag)
@@ -362,6 +365,7 @@ def _register_weight_grad_dump_hook(model: Any, tag: str, forward_only: bool) ->
             handle_container[0] = None
 
     handle_container[0] = model.register_full_backward_hook(_hook)
+    print(f"[weight_grad_hook] registered tag={tag}", flush=True)
 
 
 def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool) -> Any:
