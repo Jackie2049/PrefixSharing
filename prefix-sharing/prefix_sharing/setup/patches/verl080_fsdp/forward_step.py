@@ -216,6 +216,7 @@ def _forward_step_with_engine_prepare(
 
     # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
+    _register_weight_grad_dump_hook(self.module, diagnostic_tag, forward_only)
 
     def _cleanup_ps_ctx(_module, _grad_input, _grad_output):
         """Release PS state and diagnostic hooks after backward completes."""
@@ -338,6 +339,31 @@ def _register_grad_dump_hooks(model: Any, forward_only: bool) -> None:
         )
 
 
+def _register_weight_grad_dump_hook(model: Any, tag: str, forward_only: bool) -> None:
+    """Register a one-shot full-backward hook to dump all weight gradients.
+
+    The hook fires after ``loss.backward()`` completes, saves every parameter's
+    ``.grad`` tensor, and then removes itself.  When DP sharding is used, each
+    rank writes its own local shard so ON vs OFF comparisons stay rank-local.
+    """
+    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is None:
+        return
+    if forward_only:
+        return
+
+    handle_container: list[Any | None] = [None]
+
+    def _hook(_module: Any, _grad_input: Any, _grad_output: Any) -> None:
+        from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
+
+        dump_weight_grads_verl080(model, tag)
+        if handle_container[0] is not None:
+            handle_container[0].remove()
+            handle_container[0] = None
+
+    handle_container[0] = model.register_full_backward_hook(_hook)
+
+
 def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool) -> Any:
     # No sharing detected after planning. Delegate to the original engine
     # implementation shape by calling the unpatched method through the closure
@@ -366,6 +392,8 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     )
     # Register diagnostic gradient hooks for the OFF baseline when enabled.
     _register_grad_dump_hooks(self.module, forward_only)
+    diagnostic_tag = "train" if self.module.training else "old"
+    _register_weight_grad_dump_hook(self.module, diagnostic_tag, forward_only)
 
     from prefix_sharing.tools.perf_profiler import ProfilerScope
 

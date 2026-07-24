@@ -1031,6 +1031,60 @@ def dump_attn_grad_verl080(
         _ATTN_GRAD_BUFFER.clear()
 
 
+# ============================================================
+#  FSDP model weight gradient dump
+# ============================================================
+
+
+def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
+    """Dump every parameter's ``.grad`` tensor for ON/OFF gradient comparison.
+
+    Works with FSDP-sharded gradients: each DP rank writes its own local shard
+    as ``weight_grads_{tag}_dp{r}.pt``.  In non-FSDP / single-rank mode only
+    rank 0 writes ``weight_grads_{tag}.pt``.
+
+    Args:
+        model: The model whose ``named_parameters()`` will be iterated.
+        tag: Distinguishes training vs old-logp dumps, e.g. ``"train"``.
+    """
+    import torch as _torch
+
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+
+    grad_dict: dict[str, _torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        try:
+            # FSDP / DTensor sharded gradient → local shard
+            if hasattr(grad, "_local_tensor"):
+                grad = grad._local_tensor
+            elif hasattr(grad, "to_local"):
+                grad = grad.to_local()
+            grad_dict[name] = grad.detach().cpu()
+        except Exception as exc:
+            _log.warning("weight grad %s extract failed: %s", name, exc)
+
+    if not grad_dict:
+        return
+
+    if _get_dp_size() > 1:
+        filename = f"weight_grads_{tag}_dp{_get_dp_rank()}.pt"
+    else:
+        if not _rank0_only():
+            return
+        filename = f"weight_grads_{tag}.pt"
+
+    try:
+        _torch.save(grad_dict, os.path.join(dump_dir, filename))
+        _log.warning("%s saved (%d params)", filename, len(grad_dict))
+    except Exception as exc:
+        _log.warning("%s save failed: %s", filename, exc)
+
+
 # ════════════════════════════════════════════════════════════════
 #  Backward-compatible aliases for Megatron path callers
 # ════════════════════════════════════════════════════════════════
