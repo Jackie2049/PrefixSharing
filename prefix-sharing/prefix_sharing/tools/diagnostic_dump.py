@@ -1054,9 +1054,17 @@ def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
         return
 
     grad_dict: dict[str, _torch.Tensor] = {}
+    missing_grad_count = 0
+    total_param_count = 0
     for name, param in model.named_parameters():
+        total_param_count += 1
         grad = getattr(param, "grad", None)
+        # Some training frameworks (e.g. verl FSDP with main_grad) store the
+        # full-precision gradient in ``param.main_grad`` instead of ``grad``.
         if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None:
+            missing_grad_count += 1
             continue
         try:
             # FSDP / DTensor sharded gradient → local shard
@@ -1068,7 +1076,16 @@ def dump_weight_grads_verl080(model: Any, tag: str = "train") -> None:
         except Exception as exc:
             _log.warning("weight grad %s extract failed: %s", name, exc)
 
+    _log.warning(
+        "dump_weight_grads(tag=%s): total_params=%d grad_missing=%d dumped=%d",
+        tag,
+        total_param_count,
+        missing_grad_count,
+        len(grad_dict),
+    )
+
     if not grad_dict:
+        _log.warning("no weight gradients found; skip dump")
         return
 
     if _get_dp_size() > 1:
