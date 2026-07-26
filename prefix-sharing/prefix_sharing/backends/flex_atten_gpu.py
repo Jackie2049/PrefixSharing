@@ -34,20 +34,54 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
 
-# Allow overriding FlexAttention tile sizes via env var, e.g.
-# PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE=64,64
-_FLEX_ATTN_BLOCK_SIZE = os.environ.get("PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE", "")
-_FLEX_ATTN_KERNEL_OPTIONS: dict[str, Any] | None = None
-if _FLEX_ATTN_BLOCK_SIZE:
+def _flex_attn_env_options() -> tuple[dict[str, Any] | None, tuple[int, int] | None]:
+    """Parse optional FlexAttention kernel / BlockMask overrides from env.
+
+    When ``PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE`` is set, we keep the flex_attention
+    kernel tile size and the BlockMask block size in sync.  A mismatch between
+    these two is a common cause of illegal memory accesses.
+
+    Returns:
+        ``(kernel_options, block_mask_block_size)``.  If the env var is unset or
+        invalid, both entries are ``None`` and the backend uses PyTorch defaults.
+    """
+    block_size_env = os.environ.get("PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE", "")
+    if not block_size_env:
+        return None, None
+
     try:
-        _block_m, _block_n = _FLEX_ATTN_BLOCK_SIZE.split(",")
-        _FLEX_ATTN_KERNEL_OPTIONS = {
-            "BLOCK_M": int(_block_m),
-            "BLOCK_N": int(_block_n),
-            "num_stages": 2,
-        }
+        block_m, block_n = block_size_env.split(",")
+        block_m_i = int(block_m)
+        block_n_i = int(block_n)
     except Exception:
-        _FLEX_ATTN_KERNEL_OPTIONS = None
+        print(
+            f"[flex_atten_gpu] ignoring invalid PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE="
+            f"{block_size_env!r}; expected M,N",
+            flush=True,
+        )
+        return None, None
+
+    num_stages = 2
+    try:
+        num_stages = int(os.environ.get("PREFIX_SHARING_FLEX_ATTN_NUM_STAGES", "2"))
+    except Exception:
+        num_stages = 2
+
+    kernel_options = {
+        "BLOCK_M": block_m_i,
+        "BLOCK_N": block_n_i,
+        "BLOCK_M1": block_m_i,
+        "BLOCK_N1": block_n_i,
+        "BLOCK_M2": block_m_i,
+        "BLOCK_N2": block_n_i,
+        "num_stages": num_stages,
+    }
+    print(
+        f"[flex_atten_gpu] override kernel_options/block_size: "
+        f"BLOCK_M={block_m_i}, BLOCK_N={block_n_i}, num_stages={num_stages}",
+        flush=True,
+    )
+    return kernel_options, (block_m_i, block_n_i)
 
 
 @lru_cache(maxsize=None)
@@ -187,15 +221,17 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
         Hkv = k.shape[1]
 
         # FlexAttention uses (B, H, S, D); packed THD becomes (1, H, T, D).
-        q = q.permute(1, 0, 2).unsqueeze(0)          # (1, Hq, T, D)
-        k = k.permute(1, 0, 2).unsqueeze(0)          # (1, Hkv, T, D)
-        v = v.permute(1, 0, 2).unsqueeze(0)          # (1, Hkv, T, D)
+        q = q.permute(1, 0, 2).unsqueeze(0).contiguous()          # (1, Hq, T, D)
+        k = k.permute(1, 0, 2).unsqueeze(0).contiguous()          # (1, Hkv, T, D)
+        v = v.permute(1, 0, 2).unsqueeze(0).contiguous()          # (1, Hkv, T, D)
 
         flex_module = _import_flex_attention()
+        kernel_options, block_size = _flex_attn_env_options()
         block_mask = get_or_create_block_mask(
             prefix_sharing_plan,
             device=q.device,
             cache=self._block_mask_cache,
+            block_size=block_size,
         )
 
         if self._compiled_flex_attention is None:
@@ -210,7 +246,7 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
             block_mask=block_mask,
             enable_gqa=True,
             scale=kwargs.get("softmax_scale", None),
-            kernel_options=_FLEX_ATTN_KERNEL_OPTIONS,
+            kernel_options=kernel_options,
         )
 
         # Back to packed THD: (1, H, T, D) -> (T, H, D).
