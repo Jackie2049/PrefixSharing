@@ -34,20 +34,22 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
 
-def _flex_attn_env_options() -> tuple[dict[str, Any] | None, tuple[int, int] | None]:
-    """Parse optional FlexAttention kernel / BlockMask overrides from env.
+def _flex_attn_env_options() -> dict[str, Any] | None:
+    """Parse optional FlexAttention kernel tile overrides from env.
 
-    When ``PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE`` is set, we keep the flex_attention
-    kernel tile size and the BlockMask block size in sync.  A mismatch between
-    these two is a common cause of illegal memory accesses.
+    ``PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE`` only controls the attention kernel
+    tile size via ``kernel_options`` (``BLOCK_M/BLOCK_N`` and the backward
+    ``BLOCK_M1/N1/M2/N2``).  The ``BlockMask`` is left at PyTorch's default
+    ``BLOCK_SIZE=128`` because Inductor requires the mask block size to be
+    divisible by the autotune config's tile sizes; shrinking the mask block
+    size without controlling those configs triggers illegal memory accesses.
 
     Returns:
-        ``(kernel_options, block_mask_block_size)``.  If the env var is unset or
-        invalid, both entries are ``None`` and the backend uses PyTorch defaults.
+        ``kernel_options`` if the env var is set and valid, otherwise ``None``.
     """
     block_size_env = os.environ.get("PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE", "")
     if not block_size_env:
-        return None, None
+        return None
 
     try:
         block_m, block_n = block_size_env.split(",")
@@ -59,7 +61,7 @@ def _flex_attn_env_options() -> tuple[dict[str, Any] | None, tuple[int, int] | N
             f"{block_size_env!r}; expected M,N",
             flush=True,
         )
-        return None, None
+        return None
 
     num_stages = 2
     try:
@@ -77,11 +79,11 @@ def _flex_attn_env_options() -> tuple[dict[str, Any] | None, tuple[int, int] | N
         "num_stages": num_stages,
     }
     print(
-        f"[flex_atten_gpu] override kernel_options/block_size: "
+        f"[flex_atten_gpu] override kernel_options: "
         f"BLOCK_M={block_m_i}, BLOCK_N={block_n_i}, num_stages={num_stages}",
         flush=True,
     )
-    return kernel_options, (block_m_i, block_n_i)
+    return kernel_options
 
 
 @lru_cache(maxsize=None)
@@ -226,12 +228,16 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
         v = v.permute(1, 0, 2).unsqueeze(0).contiguous()          # (1, Hkv, T, D)
 
         flex_module = _import_flex_attention()
-        kernel_options, block_size = _flex_attn_env_options()
+        kernel_options = _flex_attn_env_options()
+        # Keep BlockMask at its default block size (128).  flex_attention's
+        # kernel tile sizes must divide the mask block size; passing a custom
+        # block_size here without controlling create_block_mask's internal
+        # BLOCK_M/BLOCK_N triggers "Q and KV block size must be divisible by
+        # BLOCK_M and BLOCK_N" errors.
         block_mask = get_or_create_block_mask(
             prefix_sharing_plan,
             device=q.device,
             cache=self._block_mask_cache,
-            block_size=block_size,
         )
 
         if self._compiled_flex_attention is None:
