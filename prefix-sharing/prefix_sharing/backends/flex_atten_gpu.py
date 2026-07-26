@@ -21,6 +21,7 @@ and permuted to ``(1, H, T, D)`` for FlexAttention (single batch dim).
 from __future__ import annotations
 
 import inspect
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -31,6 +32,22 @@ from prefix_sharing.backends.prefix_block_mask import get_or_create_block_mask
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
+
+
+# Allow overriding FlexAttention tile sizes via env var, e.g.
+# PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE=64,64
+_FLEX_ATTN_BLOCK_SIZE = os.environ.get("PREFIX_SHARING_FLEX_ATTN_BLOCK_SIZE", "")
+_FLEX_ATTN_KERNEL_OPTIONS: dict[str, Any] | None = None
+if _FLEX_ATTN_BLOCK_SIZE:
+    try:
+        _block_m, _block_n = _FLEX_ATTN_BLOCK_SIZE.split(",")
+        _FLEX_ATTN_KERNEL_OPTIONS = {
+            "BLOCK_M": int(_block_m),
+            "BLOCK_N": int(_block_n),
+            "num_stages": 2,
+        }
+    except Exception:
+        _FLEX_ATTN_KERNEL_OPTIONS = None
 
 
 @lru_cache(maxsize=None)
@@ -193,6 +210,7 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
             block_mask=block_mask,
             enable_gqa=True,
             scale=kwargs.get("softmax_scale", None),
+            kernel_options=_FLEX_ATTN_KERNEL_OPTIONS,
         )
 
         # Back to packed THD: (1, H, T, D) -> (T, H, D).
