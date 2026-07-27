@@ -22,12 +22,12 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     # computation graph, causing the saved-tensor count mismatch detected by
     # these methods.  The recomputed values are numerically correct — the count
     # difference is benign.  Bypass both checks so ON-path training completes.
-    import torch.utils.checkpoint as _cp
+    import torch.utils.checkpoint as _ckpt
     # Apply once, globally.
     if not getattr(patch_fsdp_forward_step, "_cp_patched", False):
-        _cp._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
-        if hasattr(_cp, "_internal_assert"):
-            _cp._internal_assert = lambda *a, **kw: None
+        _ckpt._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
+        if hasattr(_ckpt, "_internal_assert"):
+            _ckpt._internal_assert = lambda *a, **kw: None
         patch_fsdp_forward_step._cp_patched = True
 
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
