@@ -296,19 +296,14 @@ def test_get_cp_group_returns_none_without_pg_collection():
 
 
 def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
-    """patch 始终尝试安装，本地无 verl/Megatron 时安全回退。
-
-    环境变量不影响是否安装 patch——无论 ENABLE_PREFIX_SHARING 未设置、
-    设为 0 还是 1，_auto_install_patches() 都尝试 setup.install()。
-    本地环境无 verl/Megatron 时 IncompatibleEnvironment 被捕获，
-    _patch_handle 保持 None，不影响训练。
-    """
+    """patch 始终尝试安装，环境兼容时（verl/Megatron 存在）应成功安装。"""
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    # 本地没有 verl/Megatron，版本不兼容，应安全回退
-    assert prefix_sharing._patch_handle is None
+    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    assert prefix_sharing._patch_handle is not None
+    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -317,7 +312,9 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    assert prefix_sharing._patch_handle is None
+    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    assert prefix_sharing._patch_handle is not None
+    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -326,5 +323,5 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    assert prefix_sharing._patch_handle is None
-    assert prefix_sharing._patch_handle is None
+    assert prefix_sharing._patch_handle is not None
+    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7

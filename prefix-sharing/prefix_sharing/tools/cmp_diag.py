@@ -361,7 +361,10 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
             results[layer_idx] = _cos_for_layer(on_tensor, off_tensor, align_mask if needs_alignment else None)
         except ValueError as exc:
             results[layer_idx] = {"error": str(exc)}
-    return CheckResult(name="attn_per_layer", passed=True,
+    return CheckResult(name="attn_per_layer",
+                       passed=all(r.get("cos_avg", 0) > _COS_AVG_PASS
+                                  and r.get("cos_min", 0) > _COS_MIN_PASS
+                                  for r in results.values()),
                        metrics={"layers": results})
 
 

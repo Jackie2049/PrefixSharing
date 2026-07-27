@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from prefix_sharing.tools.cmp_diag import cmp_attn_layer
+from prefix_sharing.tools.cmp_diag import cmp_attn_layer, cmp_attn_grads, cmp_attn_kv
 from prefix_sharing import diagnostics
 
 

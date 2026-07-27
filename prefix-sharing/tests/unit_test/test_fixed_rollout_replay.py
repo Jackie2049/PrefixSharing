@@ -83,7 +83,7 @@ def test_fixed_rollout_skips_validation_and_replays_training_output(monkeypatch)
     monkeypatch.setattr(inject_fixed_rollout, "_load_json_to_dataproto", lambda _path: fixed_data)
 
     rollout_manager = _FakeRolloutManager()
-    inject_fixed_rollout.patch_fixed_rollout(rollout_manager, "unused.json", num_workers=1)
+    inject_fixed_rollout.patch_fixed_rollout(rollout_manager, "unused.json")
 
     validation_output = rollout_manager.generate_sequences(_request(validate=True))
     assert validation_output.batch["input_ids"].tolist() == [[1, 2]]

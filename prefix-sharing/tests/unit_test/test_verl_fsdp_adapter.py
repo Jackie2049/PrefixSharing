@@ -624,6 +624,7 @@ def test_verl080_fsdp_forward_step_patch_allows_remove_padding_config_without_en
     assert output["loss"] == pytest.approx(float(loss.detach().item()))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA (Triton attention in FSDP forward_step)")
 def test_verl080_fsdp_forward_step_patch_runs_native_nested_prepare_outputs_path():
     if not hasattr(torch, "nested"):
         pytest.skip("torch.nested is unavailable")
