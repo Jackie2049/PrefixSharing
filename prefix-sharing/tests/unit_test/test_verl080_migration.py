@@ -303,7 +303,7 @@ def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7
+    assert len(prefix_sharing._patch_handle._specs) == 7
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -314,7 +314,7 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7
+    assert len(prefix_sharing._patch_handle._specs) == 7
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -324,4 +324,4 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import prefix_sharing
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is not None
-    assert prefix_sharing._patch_handle.patch_set_sizes[0] == 7
+    assert len(prefix_sharing._patch_handle._specs) == 7
