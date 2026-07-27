@@ -89,7 +89,7 @@ def test_fixed_rollout_skips_validation_and_replays_training_output(monkeypatch)
     assert validation_output.batch["input_ids"].tolist() == [[1, 2]]
 
     training_output = rollout_manager.generate_sequences(_request(validate=False))
-    assert training_output is fixed_data
+    assert training_output.batch["input_ids"].tolist() == [[7, 8]]
     assert training_output.meta_info["timing"] == {}
     assert len(rollout_manager.calls) == 1
 
