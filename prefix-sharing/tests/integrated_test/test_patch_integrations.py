@@ -3,8 +3,6 @@ import pytest
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 from prefix_sharing.setup.logged_patch import LoggedPatchManager
-
-
 class Target:
     def method(self):
         return "original"
@@ -53,11 +51,11 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
 
     patch_set = _load_patch_set("verl080_fsdp")
 
-    assert len(patch_set) == 2
+    assert len(patch_set) == 6
     assert patch_set[0].module_name == "verl.workers.engine.fsdp.transformer_impl"
     assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
-    assert patch_set[1].module_name == "transformers.modeling_utils"
-    assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
+    assert patch_set[1].module_name == "verl.trainer.ppo.ray_trainer"
+    assert "RayPPOTrainer.fit" in patch_set[1].description
 
 
 

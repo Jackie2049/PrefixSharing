@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.observability import PrefixSharingStats
@@ -132,13 +132,44 @@ def prefix_sharing_runtime_context(
 
     store = PrefixAttentionStore()
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
-    token = _current_context.set(ctx)
+    ctxvar_token = _current_context.set(ctx)
     try:
         yield ctx
     finally:
-        _current_context.reset(token)
+        _current_context.reset(ctxvar_token)
         _log_prefix_sharing_audit(ctx)
         ctx.store.close()
+
+
+def create_prefix_sharing_context(
+    prefix_sharing_runtime_state: Any,
+) -> tuple[PrefixSharingRuntimeContext, Callable[[], None]]:
+    """Create a PS context whose lifetime is managed by the caller.
+
+    Unlike the ``with``-based ``prefix_sharing_runtime_context``, the returned
+    context **survives across ``loss.backward()``** — the store is kept open and
+    the ContextVar is left set until the caller invokes the returned cleanup
+    function.  This is required for activation‑checkpointing compatibility: AC
+    recompute runs inside ``backward()`` and reads the PS context from
+    ``module._ps_ctx`` (set independently by the caller), while the store must
+    still contain the per‑layer KV populated during the first forward.
+
+    Returns:
+        (ctx, cleanup):
+            *ctx* — fully initialised ``PrefixSharingRuntimeContext``.
+            *cleanup* — callable ``() -> None`` that resets the ContextVar,
+            writes the audit log, and closes the KV store.
+    """
+    store = PrefixAttentionStore()
+    ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
+    ctxvar_token = _current_context.set(ctx)
+
+    def cleanup() -> None:
+        _current_context.reset(ctxvar_token)
+        _log_prefix_sharing_audit(ctx)
+        ctx.store.close()
+
+    return ctx, cleanup
 
 
 def _log_prefix_sharing_audit(ctx: PrefixSharingRuntimeContext) -> None:

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -138,28 +138,26 @@ def _load_json_to_dataproto(json_path: str):
 
 
 def _save_dataproto_to_json(data: Any, json_path: str) -> None:
-    """Save replay-relevant rollout tensors as a JSON fixture."""
-    outputs = {}
-    for key in (
-        "input_ids",
-        "attention_mask",
-        "position_ids",
-        "responses",
-        "prompts",
-        "response_mask",
-        "token_level_rewards",
-        "rm_scores",
-        "rollout_log_probs",
-    ):
-        if key not in data.batch:
-            continue
-        tensor = data.batch[key]
-        outputs[key] = tensor.float().cpu().tolist() if tensor.dtype == torch.float32 else tensor.long().cpu().tolist()
+    """Save a DataProto's batch tensors as a JSON file for replay."""
+    import numpy as np
 
+    batch = data.batch
+    outputs = {}
+    for key in ("input_ids", "attention_mask", "position_ids",
+                "responses", "prompts", "response_mask",
+                "token_level_rewards", "rm_scores", "rollout_log_probs"):
+        if key in batch:
+            tensor = batch[key]
+            if tensor.dtype == torch.float32:
+                outputs[key] = tensor.float().cpu().tolist()
+            else:
+                outputs[key] = tensor.long().cpu().tolist()
+
+    record = {"outputs": outputs}
     os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
-    with open(json_path, "w", encoding="utf-8") as file:
-        json.dump({"outputs": outputs}, file)
-    print(f"[FixedRollout] Captured rollout with {len(data)} samples -> {json_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    print(f"[FixedRollout] Captured rollout with {len(data)} samples → {json_path}")
 
 
 def _is_validation_rollout(batch: Any) -> bool:
@@ -167,47 +165,77 @@ def _is_validation_rollout(batch: Any) -> bool:
 
 
 def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
-    """Capture the first training rollout while leaving validation untouched.
+    """Intercept ``generate_sequences`` on *rollout_obj*, capture first training rollout as JSON.
 
     A normal PS=OFF run both creates the baseline dump and captures rollout
     output. Replaying it in the PS=ON run avoids a third PS=OFF replay run.
+    Validation rollouts are left untouched.
     """
-    original_generate_sequences = rollout_obj.generate_sequences
-    captured = False
+    original_fn = rollout_obj.generate_sequences
+    captured = [False]
 
-    def capture_training_rollout(batch: Any, **kwargs: Any) -> Any:
-        nonlocal captured
-        result = original_generate_sequences(batch, **kwargs)
-        if not captured and not _is_validation_rollout(batch):
+    def _capturing_patch(batch, **kwargs):
+        result = original_fn(batch, **kwargs)
+        if not captured[0] and not _is_validation_rollout(batch):
             _save_dataproto_to_json(result, json_path)
-            captured = True
-            rollout_obj.generate_sequences = original_generate_sequences
-            print("[FixedRollout] Capture complete; restored generate_sequences.")
+            captured[0] = True
+            rollout_obj.generate_sequences = original_fn
+            print("[FixedRollout] Capture complete — generate_sequences restored.")
         return result
 
-    rollout_obj.generate_sequences = capture_training_rollout
-    print(f"[FixedRollout] Capture enabled -> {json_path}")
+    rollout_obj.generate_sequences = _capturing_patch
+    print(f"[FixedRollout] Patched generate_sequences for capture → {json_path}")
 
 
-def patch_fixed_rollout(rollout_obj: Any, json_path: str, num_workers: Optional[int] = None) -> None:
-    """Inject fixed rollout data for training calls and preserve validation calls.
+def patch_fixed_rollout(rollout_obj: Any, json_path: str):
+    """Monkey-patch ``generate_sequences`` on *rollout_obj* to return fixed data.
 
     Args:
-        rollout_obj: Object exposing ``generate_sequences``.
+        rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
+                     (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
         json_path: Absolute path to the JSON file.
-        num_workers: Optional legacy padding divisor for manually prepared JSON.
-            Captured fixtures should leave this unset because their original
-            batch size is already valid for the rollout path that produced it.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    if num_workers is not None:
-        n = len(fixed_data)
-        remainder = n % num_workers
-        if remainder != 0:
-            pad_size = num_workers - remainder
-            fixed_data.padding(pad_size, "last")
-            print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
+    batch = dict(fixed_data.batch)
+    meta_info = dict(fixed_data.meta_info)
+    n_orig = len(fixed_data)
+
+    import torch as _torch
+    import numpy as _np
+
+    # ── 1. Select first N sequences ──
+    _num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", "0"))
+    if _num_seq > 0 and n_orig > _num_seq:
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key][:_num_seq]
+        n_orig = _num_seq
+        print(f"[FixedRollout] Selected {_num_seq} sequences")
+
+    # ── 2. Randomize reward scores (debug only) ──
+    _torch.manual_seed(42)
+    for _key in ("token_level_rewards", "rm_scores"):
+        _rm = batch.get(_key)
+        if _rm is not None:
+            _rm[...] = _torch.randint(0, 2, _rm.shape, dtype=_rm.dtype)
+
+    # ── 3. Stack (tile dim-0) ──
+    _stack = int(os.environ.get("PREFIX_SHARING_BASELINE_STACK", "1"))
+    if _stack > 1:
+        for _key in batch:
+            if isinstance(batch[_key], _torch.Tensor) and batch[_key].shape[0] == n_orig:
+                batch[_key] = batch[_key].repeat(_stack, *([1] * (batch[_key].dim() - 1)))
+        n_orig *= _stack
+        print(f"[FixedRollout] Stacked batch x{_stack}: {n_orig} sequences")
+
+    # ── 4. Rebuild DataProto ──
+    from verl.protocol import DataProto
+    fixed_data = DataProto.from_dict(
+        batch,
+        non_tensors={"multi_modal_inputs": _np.array([{}] * n_orig, dtype=object)},
+    )
+    fixed_data.meta_info = meta_info
 
     original_generate_sequences = rollout_obj.generate_sequences
 

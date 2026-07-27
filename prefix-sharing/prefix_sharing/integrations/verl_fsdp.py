@@ -46,6 +46,10 @@ class PrefixSharingFSDPAttentionRuntime:
             raise RuntimeError("PrefixSharingFSDPAttentionRuntime requires active prefix_sharing_runtime_context")
         if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
             raise RuntimeError("PrefixSharing FSDP attention runtime currently expects dense [B, L, H, D] Q/K/V")
+        # [PS-perf] start — profiler accessor ————————————————
+        from prefix_sharing.tools.perf_profiler import PerfProfiler
+        profiler = PerfProfiler.current()
+        # [PS-perf] end ——————————————————————————————————————
         if query.shape[0] == 1 and key.shape[0] == 1 and value.shape[0] == 1:
             packed_query = query.squeeze(0)
             packed_key = key.squeeze(0)
@@ -63,9 +67,23 @@ class PrefixSharingFSDPAttentionRuntime:
             raise RuntimeError("query, key, and value must share dense batch/sequence dimensions")
 
         plan = ctx.prefix_sharing_plan
+        # [PS-perf] start — attn.pack ———————————————————————
+        _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
+        if profiler is not None:
+            profiler.start_phase(PerfProfiler.PHASE_ATTN_PACK)
+        if _per_layer_ok:
+            profiler.start_phase(f"attn.pack.l{self.layer_id}")
+        # [PS-perf] end ——————————————————————————————————————
         packed_query = _pack_dense_qkv(query, plan)
         packed_key = _pack_dense_qkv(key, plan)
         packed_value = _pack_dense_qkv(value, plan)
+        # [PS-perf] start — attn.pack stop ——————————————————
+        if _per_layer_ok:
+            _pack_elapsed = profiler.stop_phase(f"attn.pack.l{self.layer_id}")
+            profiler.record_per_layer(self.layer_id, PerfProfiler.PHASE_ATTN_PACK, _pack_elapsed)
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_ATTN_PACK)
+        # [PS-perf] end ——————————————————————————————————————
         packed_output = _run_packed_attention_runtime(
             ctx,
             packed_query,
@@ -74,7 +92,21 @@ class PrefixSharingFSDPAttentionRuntime:
             layer_id=self.layer_id,
             num_layers=self.num_layers,
         )
-        return _scatter_packed_output_to_dense(packed_output, query, plan)
+        # [PS-perf] start — attn.unpack —————————————————————
+        if profiler is not None:
+            profiler.start_phase(PerfProfiler.PHASE_ATTN_UNPACK)
+        if _per_layer_ok:
+            profiler.start_phase(f"attn.unpack.l{self.layer_id}")
+        # [PS-perf] end ——————————————————————————————————————
+        dense_output = _scatter_packed_output_to_dense(packed_output, query, plan)
+        # [PS-perf] start — attn.unpack stop ————————————————
+        if _per_layer_ok:
+            _unpack_elapsed = profiler.stop_phase(f"attn.unpack.l{self.layer_id}")
+            profiler.record_per_layer(self.layer_id, PerfProfiler.PHASE_ATTN_UNPACK, _unpack_elapsed)
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_ATTN_UNPACK)
+        # [PS-perf] end ——————————————————————————————————————
+        return dense_output
 
 
 def forward_prefix_sharing_fsdp_micro_batch(
@@ -330,7 +362,31 @@ def _run_packed_attention_runtime(
     layer_id: int,
     num_layers: int = 0,
 ) -> Any:
+    from prefix_sharing.tools.perf_profiler import PerfProfiler
+
     plan = ctx.prefix_sharing_plan
+    profiler = PerfProfiler.current()
+    layer_number = layer_id + 1
+    # [PS-perf] start — per-layer gating ———————————————————
+    # Per-layer timing only when the active profiler supports it
+    # (ProfilerScope with PREFIX_SHARING_PERF_PER_LAYER != 0).
+    _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
+    # [PS-perf] end ————————————————————————————————————————
+
+    # ##### [PS-diag] per-layer dump: build_kv_input_v + rope_postqk ######
+    import os as _ps_dump_env
+    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+        from prefix_sharing.tools.diagnostic_dump import dump_build_kv_input_v_on, dump_rope_postqk_verl080
+        dump_build_kv_input_v_on(layer_number, packed_value, num_layers)
+        dump_rope_postqk_verl080(layer_number, packed_query, packed_key, num_layers)
+    # ##### [PS-diag] end #####
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_KV)
+    # [PS-perf] start — per-layer KV ———————————————————————
+    if _per_layer_ok:
+        profiler.start_phase(f"attn.kv.l{layer_id}")
+    # [PS-perf] end ————————————————————————————————————————
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
         packed_key,
         packed_value,
@@ -341,21 +397,42 @@ def _run_packed_attention_runtime(
         tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
         stats=ctx.stats,
     )
-    if num_layers and diagnostic_dump_enabled():
-        dump_fsdp_expanded_kv(
-            expanded_key,
-            expanded_value,
-            layer_id=layer_id,
-            num_layers=num_layers,
-        )
-    return ctx.attention_backend.attention(
+    # [PS-perf] start — per-layer KV stop ——————————————————
+    if _per_layer_ok:
+        _kv_elapsed = profiler.stop_phase(f"attn.kv.l{layer_id}")
+        profiler.record_per_layer(layer_id, PerfProfiler.PHASE_ATTN_KV, _kv_elapsed)
+    # [PS-perf] end ————————————————————————————————————————
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
+
+    # ##### [PS-diag] per-layer dump: expanded_kv (ON only) ######
+    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+        from prefix_sharing.tools.diagnostic_dump import dump_expanded_kv_on
+        dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
+    # ##### [PS-diag] end #####
+
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
+    # [PS-perf] start — per-layer compute ——————————————————
+    if _per_layer_ok:
+        profiler.start_phase(f"attn.comp.l{layer_id}")
+    # [PS-perf] end ————————————————————————————————————————
+    output = ctx.attention_backend.attention(
         packed_query,
         expanded_key,
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
     )
+    # [PS-perf] start — per-layer compute stop —————————————
+    if _per_layer_ok:
+        _comp_elapsed = profiler.stop_phase(f"attn.comp.l{layer_id}")
+        profiler.record_per_layer(layer_id, PerfProfiler.PHASE_ATTN_COMPUTE, _comp_elapsed)
+    # [PS-perf] end ————————————————————————————————————————
+    if profiler is not None:
+        profiler.stop_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
 
+    return output
 
 def _call_fsdp_model(
     model: Any,

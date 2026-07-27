@@ -14,7 +14,7 @@ from prefix_sharing.integrations.verl_fsdp import (
     restore_prefix_sharing_outputs_2d,
 )
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
-from prefix_sharing.setup.patches.verl080_fsdp.attention import patch_transformers_attention
+from prefix_sharing.setup.patches.verl080_fsdp.attention import create_attention_wrapper
 from prefix_sharing.setup.patches.verl080_fsdp.forward_step import patch_fsdp_forward_step
 
 
@@ -458,36 +458,19 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
     assert grad[provider_prefix_ids].abs().sum() > 0
 
 
-def test_verl080_fsdp_attention_patch_falls_through_without_context():
-    from prefix_sharing.setup.logged_patch import LoggedPatchManager
-    from prefix_sharing.setup.patches.verl080_fsdp.attention import (
-        install_prefix_sharing_attention_wrappers,
-    )
+def test_verl_fsdp_attention_patch_installs():
+    transformers_modeling_utils = pytest.importorskip("transformers.modeling_utils")
+    registry = transformers_modeling_utils.ALL_ATTENTION_FUNCTIONS
+    supported = {"flash_attention_2", "flash_attention_3", "sdpa", "flex_attention"}
+    available = [k for k in supported if k in registry]
+    if not available:
+        pytest.skip("no supported attention function available in registry")
+    test_key = available[0]
 
-    class AttentionFunctions(dict):
-        pass
-
-    def original_attention(module, query, key, value, attention_mask, *args, **kwargs):
-        return ("original", module, query, key, value, attention_mask, args, kwargs)
-
-    attention_functions = AttentionFunctions({"eager": original_attention})
-    manager = LoggedPatchManager()
-    install_prefix_sharing_attention_wrappers(attention_functions, manager)
-    patched_attention = attention_functions["eager"]
-    result = patched_attention("module", "query", "key", "value", "mask", "arg", kw="value")
-
-    assert result == (
-        "original",
-        "module",
-        "query",
-        "key",
-        "value",
-        "mask",
-        ("arg",),
-        {"kw": "value"},
-    )
-    manager.handle().disable()
-    assert attention_functions["eager"] is original_attention
+    original = registry[test_key]
+    from prefix_sharing.setup.patches.verl080_fsdp.attention import install_attention_patch
+    install_attention_patch()
+    assert registry[test_key] is not original  # function was replaced by wrapper
 
 
 def test_verl080_fsdp_forward_step_patch_runs_prefix_sharing_path():
@@ -574,17 +557,7 @@ def test_transformers_attention_patch_passthrough_and_runtime_layout(monkeypatch
         calls.append(("original", query.shape, key.shape, value.shape, attention_mask))
         return query.transpose(1, 2), "weights"
 
-    class AttentionFunctions(dict):
-        pass
-
-    from prefix_sharing.setup.logged_patch import LoggedPatchManager
-    from prefix_sharing.setup.patches.verl080_fsdp.attention import (
-        install_prefix_sharing_attention_wrappers,
-    )
-
-    attention_functions = AttentionFunctions({"eager": original_attention})
-    install_prefix_sharing_attention_wrappers(attention_functions, LoggedPatchManager())
-    patched_attention = attention_functions["eager"]
+    patched_attention = create_attention_wrapper(original_attention)
 
     query = torch.randn(2, 4, 3, 5)
     key = torch.randn(2, 2, 3, 5)
