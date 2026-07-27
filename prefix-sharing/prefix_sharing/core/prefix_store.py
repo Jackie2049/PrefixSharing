@@ -13,9 +13,8 @@ Core Responsibilities:
        ``micro_batch_id``, ``layer_id``, ``sample_idx_in_batch``, and
        ``tp_rank`` so micro-batches, layers, and tensor-parallel ranks do not
        collide.
-    2. **Preserve typed mixer history**: store attention KV and Gated DeltaNet
-       state as different entry types while sharing lifecycle and isolation
-       mechanics.
+    2. **Preserve attention KV history**: store logical attention K/V tensors
+       while sharing lifecycle and isolation mechanics.
     3. **Lifecycle management**: ``clear`` / ``close`` bound the cache to one
        runtime context; after ``close``, ``store`` and ``load`` raise.
 
@@ -23,8 +22,6 @@ Key Concepts:
     - Attention entry: K/V written when a row is not a reuser, keyed by its
       batch index; reuser entries concatenate provider prefix K/V with suffix
       K/V for transitive reuse in deeper layers.
-    - DeltaNet entry: recurrent/conv state for Qwen3.5 GatedDeltaNet prefix
-      history; real integrations can map this to engine cache params.
     - ``prefix_len`` on :class:`StoredAttentionKV`: metadata for how much of the
       stored tensor counts as prefix when slicing; backends use it with per-row
       ``prefix_lens`` from batch metadata.
@@ -33,9 +30,7 @@ Key Components:
     - :class:`PrefixActivationSlotId`: Immutable identifier for one reusable prefix activation.
     - :class:`PrefixActivationStore`: Shared lifecycle and isolation rules for prefix activation stores.
     - :class:`StoredAttentionKV`: Attention K/V tensors plus logical prefix length.
-    - :class:`StoredDeltanetState`: Qwen3.5 Gated DeltaNet prefix state.
     - :class:`PrefixAttentionStore`: Typed store for attention K/V entries.
-    - :class:`PrefixDeltanetStore`: Typed store for Gated DeltaNet entries.
 
 Design Principles:
     - **Never detach**: cached tensors must retain the autograd graph so gradients
@@ -53,7 +48,6 @@ from typing import Any
 
 
 PREFIX_STATE_TYPE_ATTENTION_KV = "attention_kv"
-PREFIX_STATE_TYPE_DELTANET_STATE = "deltanet_state"
 
 
 @dataclass(frozen=True)
@@ -75,23 +69,6 @@ class StoredAttentionKV:
     key_tensor: Any
     value_tensor: Any
     prefix_len: int
-
-
-@dataclass(frozen=True)
-class StoredDeltanetState:
-    """Stored Qwen3.5 GatedDeltaNet prefix state.
-
-    The reference backend currently uses ``recurrent_state`` as a state
-    trajectory to verify prefix-boundary reuse and autograd. Real Qwen3.5
-    integrations also need the causal convolution state to continue suffix
-    computation without recomputing the prefix, so ``conv_state`` is modeled
-    here as part of the same DeltaNet history rather than as a separate unused
-    store category.
-    """
-
-    recurrent_state: Any
-    prefix_len: int
-    conv_state: Any | None = None
 
 
 class PrefixActivationStore:
@@ -169,42 +146,4 @@ class PrefixAttentionStore(PrefixActivationStore):
         entry = self.load_entry(slot_id)
         if not isinstance(entry, StoredAttentionKV):
             raise TypeError(f"stored prefix state is not attention KV for {slot_id}")
-        return entry
-
-
-class PrefixDeltanetStore(PrefixActivationStore):
-    """Typed store for Qwen3.5 Gated DeltaNet prefix activation state.
-
-    Its resumable history includes recurrent state and, for causal convolution
-    continuation, conv state. Future mixer histories should add their own typed
-    store/entry rather than reusing this DeltaNet-specific wrapper.
-    """
-
-    def store(
-        self,
-        slot_id: PrefixActivationSlotId,
-        *,
-        recurrent_state: Any,
-        prefix_len: int,
-        conv_state: Any | None = None,
-        overwrite: bool = False,
-    ) -> None:
-        if slot_id.prefix_state_type != PREFIX_STATE_TYPE_DELTANET_STATE:
-            raise ValueError("PrefixDeltanetStore requires prefix_state_type='deltanet_state'")
-        if prefix_len < 0:
-            raise ValueError("prefix_len must be >= 0")
-        self.store_entry(
-            slot_id,
-            entry=StoredDeltanetState(
-                recurrent_state=recurrent_state,
-                prefix_len=prefix_len,
-                conv_state=conv_state,
-            ),
-            overwrite=overwrite,
-        )
-
-    def load(self, slot_id: PrefixActivationSlotId) -> StoredDeltanetState:
-        entry = self.load_entry(slot_id)
-        if not isinstance(entry, StoredDeltanetState):
-            raise TypeError(f"stored prefix state is not DeltaNet state for {slot_id}")
         return entry

@@ -23,8 +23,9 @@ class PatchSpec:
     """一个待安装的 patch 规格。"""
 
     module_name: str          # 目标模块全限定名
-    target_getter: Callable   # (module) → (target_obj, attr_name)
-    patch_factory: Callable   # (original) → patched
+    target_getter: Callable | None = None  # (module) → (target_obj, attr_name)
+    patch_factory: Callable | None = None   # (original) → patched
+    installer: Callable | None = None       # (module, LoggedPatchManager) → None
     description: str = ""     # 人类可读描述
     eager: bool = False       # 为 True 时，install 阶段直接 importlib.import_module
                               # 强制加载目标模块并立即 patch，不走 import hook。
@@ -40,11 +41,19 @@ class PatchRegistry:
 
     @classmethod
     def register(cls, spec: PatchSpec) -> None:
+        key = _spec_key(spec)
+        if any(_spec_key(existing) == key for existing in cls._specs):
+            return
         cls._specs.append(spec)
 
     @classmethod
     def install_all(cls) -> PatchHandle:
-        """应用所有已注册的 patch。
+        """应用所有已注册的 patch。"""
+        return cls.install_specs(cls._specs)
+
+    @classmethod
+    def install_specs(cls, specs: list[PatchSpec]) -> PatchHandle:
+        """应用给定 patch specs，不污染全局注册表。
 
         三种情况：
         1. 模块已加载且目标可解析 → 立即 patch
@@ -54,12 +63,20 @@ class PatchRegistry:
         所有 pending 最终统一由 import hook 处理。
         import hook 在模块加载完成后才尝试解析目标，确保类定义已完成。
         """
+        specs = _dedupe_specs(specs)
         shared_records: list[PatchRecord] = []
         mgr = LoggedPatchManager(shared_records)
         pending: list[PatchSpec] = []
 
-        for spec in cls._specs:
+        for spec in specs:
             module = sys.modules.get(spec.module_name)
+            if module is not None and spec.eager:
+                # 模块存在但可能还未触发 @property 等动态属性（如
+                # transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS）。
+                # 不一定需要 import_module，但 try-patch 可能因 target 尚
+                # 不存在而进入 pending，依赖 import hook 后续激活。
+                # import hook 对已 loaded 模块有效（属性注册后立即重试）。
+                pass  # 直接走 try-patch -> AttributeError -> pending -> hook
             if module is None and spec.eager:
                 # Lazy-load 目标模块（如 verl FSDP engine），立即 patch，避免依赖
                 # import hook 在万级 import 中等不到目标。
@@ -78,16 +95,28 @@ class PatchRegistry:
                     module = None
             if module is not None:
                 try:
-                    target_obj, attr_name = spec.target_getter(module)
-                    original = getattr(target_obj, attr_name)
-                    patched = spec.patch_factory(original)
-                    mgr.patch_attr(target_obj, attr_name, patched)
+                    _apply_spec(spec, module, mgr)
                     print(
                         f"[PS] Immediately patched {spec.description} (module already loaded)"
                     )
                 except (AttributeError, KeyError):
                     # 模块已加载但目标不存在——
                     # 可能是模块正在 import 中，类定义尚未完成。
+                    # 也可能是 @property / 内部 class 尚未被访问过（如
+                    # transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS）。
+                    # 对 eager spec 尝试重新导入模块以触发 @property 初始化：
+                    if spec.eager:
+                        try:
+                            import importlib
+                            module = importlib.import_module(spec.module_name)
+                            _apply_spec(spec, module, mgr)
+                            print(
+                                f"[PS] Eager-retry patched {spec.description} "
+                                f"(re-import to trigger @property)"
+                            )
+                            continue
+                        except (AttributeError, KeyError, Exception):
+                            pass
                     # 加入 pending，等模块完全加载后再 patch。
                     pending.append(spec)
                     print(
@@ -97,12 +126,39 @@ class PatchRegistry:
             else:
                 pending.append(spec)
 
-        handle = PatchHandle(shared_records, specs=list(cls._specs))
+        handle = PatchHandle(shared_records, specs=list(specs))
 
         if pending:
             _activate_import_hook(pending, shared_records)
 
         return handle
+
+
+def _spec_key(spec: PatchSpec) -> tuple[str, str]:
+    return spec.module_name, spec.description
+
+
+def _apply_spec(spec: PatchSpec, module: object, manager: LoggedPatchManager) -> None:
+    if spec.installer is not None:
+        spec.installer(module, manager)
+        return
+    if spec.target_getter is None or spec.patch_factory is None:
+        raise AttributeError(f"PatchSpec {spec.description!r} has no installer or attribute patch")
+    target_obj, attr_name = spec.target_getter(module)
+    original = getattr(target_obj, attr_name)
+    manager.patch_attr(target_obj, attr_name, spec.patch_factory(original))
+
+
+def _dedupe_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
+    seen: set[tuple[str, str]] = set()
+    result: list[PatchSpec] = []
+    for spec in specs:
+        key = _spec_key(spec)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(spec)
+    return result
 
 
 _original_import = None
@@ -160,18 +216,7 @@ def _activate_import_hook(
             actual_module = sys.modules[name]
 
             try:
-                target_obj, attr_name = spec.target_getter(actual_module)
-                original = getattr(target_obj, attr_name)
-                patched = spec.patch_factory(original)
-                setattr(target_obj, attr_name, patched)
-                shared_records.append(
-                    PatchRecord(
-                        target=target_obj,
-                        attr_name=attr_name,
-                        original=original,
-                        replacement=patched,
-                    )
-                )
+                _apply_spec(spec, actual_module, LoggedPatchManager(shared_records))
                 print(
                     f"[PS] Auto-patched {spec.description} on import of {name}"
                 )

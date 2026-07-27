@@ -16,6 +16,7 @@ def test_factory_torch_ref() -> None:
     backend = get_backend_instance(config)
     assert isinstance(backend, TorchReferenceBackend)
     assert backend.capabilities.name == "torch_ref"
+    assert not hasattr(backend.capabilities, "supports_deltanet_state_reuse")
 
 
 def test_factory_flash_atten_gpu() -> None:
@@ -65,4 +66,15 @@ def test_config_accepts_supported_backends():
     for name in ("torch_ref", "flash_atten_gpu", "flash_atten_npu"):
         cfg = PrefixSharingConfig(enable_prefix_sharing=True, backend=name)
         cfg.validate()  # should not raise
-        
+
+
+def test_backend_public_api_is_attention_only():
+    import prefix_sharing.backends as backends
+    import prefix_sharing.backends.base as base
+
+    assert hasattr(backends, "PrefixAttentionBackend")
+    assert hasattr(base, "PrefixAttentionBackend")
+
+    assert not hasattr(backends, "PrefixDeltanetBackend")
+    assert not hasattr(base, "PrefixDeltanetBackend")
+    assert "PrefixDeltanetBackend" not in backends.__all__

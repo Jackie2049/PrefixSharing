@@ -1,9 +1,9 @@
-"""Inject fixed rollout data from a JSON file, replacing generate_sequences output.
+"""Capture or inject fixed rollout data at a trainer rollout boundary.
 
-Usage in ray_trainer.py's fit() method, right before the training loop:
+The patch receives the concrete rollout object used by the trainer:
 
     from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
-    patch_fixed_rollout(self, json_path="/path/to/your_data.json")
+    patch_fixed_rollout(self.async_rollout_manager, json_path="/path/to/your_data.json")
 
 The JSON format expected:
 {
@@ -21,11 +21,30 @@ The JSON format expected:
 }
 """
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Any
 
 import torch
+
+
+def read_rollout_replay_paths() -> tuple[str | None, str | None]:
+    """Read capture/replay env vars and reject an ambiguous trainer setup.
+
+    The two modes wrap the same ``generate_sequences`` boundary.  Installing
+    both wrappers makes the effective behavior depend on wrapper order, so a
+    run must choose exactly one mode.
+    """
+    capture_path = os.environ.get("PREFIX_SHARING_CAPTURE_ROLLOUT", "").strip() or None
+    fixed_path = os.environ.get("PREFIX_SHARING_FIXED_ROLLOUT", "").strip() or None
+    if capture_path and fixed_path:
+        raise ValueError(
+            "PREFIX_SHARING_CAPTURE_ROLLOUT and PREFIX_SHARING_FIXED_ROLLOUT "
+            "are mutually exclusive"
+        )
+    return capture_path, fixed_path
 
 
 def _load_json_to_dataproto(json_path: str):
@@ -118,7 +137,7 @@ def _load_json_to_dataproto(json_path: str):
     return data
 
 
-def _save_dataproto_to_json(data, json_path: str) -> None:
+def _save_dataproto_to_json(data: Any, json_path: str) -> None:
     """Save a DataProto's batch tensors as a JSON file for replay."""
     import numpy as np
 
@@ -141,27 +160,25 @@ def _save_dataproto_to_json(data, json_path: str) -> None:
     print(f"[FixedRollout] Captured rollout with {len(data)} samples → {json_path}")
 
 
+def _is_validation_rollout(batch: Any) -> bool:
+    return bool(getattr(batch, "meta_info", {}).get("validate", False))
+
+
 def patch_capture_rollout(rollout_obj: Any, json_path: str) -> None:
-    """Intercept ``generate_sequences`` on *rollout_obj*, capture first call output as JSON.
+    """Intercept ``generate_sequences`` on *rollout_obj*, capture first training rollout as JSON.
 
-    After the first capture, the original ``generate_sequences`` is restored so
-    subsequent calls proceed normally.  Use ``PREFIX_SHARING_CAPTURE_ROLLOUT`` env
-    var to trigger this automatically.
-
-    Args:
-        rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
-                      (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
-        json_path: Where to save the captured rollout JSON.
+    A normal PS=OFF run both creates the baseline dump and captures rollout
+    output. Replaying it in the PS=ON run avoids a third PS=OFF replay run.
+    Validation rollouts are left untouched.
     """
     original_fn = rollout_obj.generate_sequences
     captured = [False]
 
     def _capturing_patch(batch, **kwargs):
         result = original_fn(batch, **kwargs)
-        if not captured[0]:
+        if not captured[0] and not _is_validation_rollout(batch):
             _save_dataproto_to_json(result, json_path)
             captured[0] = True
-            # Restore original so subsequent calls are not patched
             rollout_obj.generate_sequences = original_fn
             print("[FixedRollout] Capture complete — generate_sequences restored.")
         return result
@@ -175,13 +192,11 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str):
 
     Args:
         rollout_obj: Object with a ``generate_sequences(batch) -> DataProto`` method
-                      (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
+                     (e.g. ``AgentLoopManager`` or trainer.actor_rollout_wg).
         json_path: Absolute path to the JSON file.
     """
     fixed_data = _load_json_to_dataproto(json_path)
 
-    # Extract batch to a plain dict so we can manipulate it freely
-    # (same pattern as prefix-0501 inject_baseline_synthetic).
     batch = dict(fixed_data.batch)
     meta_info = dict(fixed_data.meta_info)
     n_orig = len(fixed_data)
@@ -214,7 +229,7 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str):
         n_orig *= _stack
         print(f"[FixedRollout] Stacked batch x{_stack}: {n_orig} sequences")
 
-    # ── 4. Rebuild DataProto (non_tensors built fresh like prefix-0501) ──
+    # ── 4. Rebuild DataProto ──
     from verl.protocol import DataProto
     fixed_data = DataProto.from_dict(
         batch,
@@ -222,10 +237,14 @@ def patch_fixed_rollout(rollout_obj: Any, json_path: str):
     )
     fixed_data.meta_info = meta_info
 
-    def _patched(batch, **kwargs):
+    original_generate_sequences = rollout_obj.generate_sequences
+
+    def replay_training_rollout(batch: Any, **kwargs: Any) -> Any:
+        if _is_validation_rollout(batch):
+            return original_generate_sequences(batch, **kwargs)
         print("[FixedRollout] Returning fixed rollout data, skipping generation.")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
-    rollout_obj.generate_sequences = _patched
-    print("[FixedRollout] Patched generate_sequences.")
+    rollout_obj.generate_sequences = replay_training_rollout
+    print(f"[FixedRollout] Replay enabled <- {json_path}")

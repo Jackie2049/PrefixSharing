@@ -5,9 +5,8 @@ Patch 目标：
 2. 性能验证相关 profiler 注入（不修改 verl 源码）
 3. rollout/fixed-data 注入辅助
 
-当前 patch set 是 FSDP 开源线的显式开发入口，需通过
-``prefix_sharing.setup.install("verl080_fsdp")`` 安装；不要依赖默认兼容矩阵
-自动选择，避免与 Megatron/MindSpeed patch set 混用。
+当前 patch set 是 FSDP 开源线的默认入口，可通过兼容矩阵自动选择，也可通过
+``prefix_sharing.setup.install("verl080_fsdp")`` 显式安装。
 """
 
 from prefix_sharing.setup.registry import PatchSpec
@@ -91,6 +90,5 @@ PATCH_SET: list[PatchSpec] = [
 
 # Attention patch: directly modify ALL_ATTENTION_FUNCTIONS dict (same approach as verl's PrefixGrouper).
 # Cannot use PatchSpec because get_interface is not an attribute/key of AttentionInterface.
-# 属于 fix/feature 注入。
 from .attention import install_attention_patch
 install_attention_patch()

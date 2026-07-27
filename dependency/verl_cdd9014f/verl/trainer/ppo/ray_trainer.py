@@ -1341,7 +1341,29 @@ class RayPPOTrainer:
         json_path = os.environ.get("USE_FIXED_ROLLOUT", None)
         if json_path:
             from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
-            patch_fixed_rollout(self, json_path=json_path)
+
+            rollout_obj = self.async_rollout_manager or self.actor_rollout_wg
+            patch_fixed_rollout(
+                rollout_obj,
+                json_path=json_path,
+                num_workers=self.config.actor_rollout_ref.rollout.agent.num_workers,
+            )
+
+        # Capture and replay wrap the same boundary, so their env vars are
+        # mutually exclusive.  Captured fixtures keep their original batch
+        # size and must not receive legacy worker-count padding on replay.
+        from prefix_sharing.tools.inject_fixed_rollout import (
+            patch_capture_rollout,
+            patch_fixed_rollout,
+            read_rollout_replay_paths,
+        )
+
+        capture_path, fixed_path = read_rollout_replay_paths()
+        rollout_obj = self.async_rollout_manager or self.actor_rollout_wg
+        if capture_path:
+            patch_capture_rollout(rollout_obj, json_path=capture_path)
+        elif fixed_path:
+            patch_fixed_rollout(rollout_obj, json_path=fixed_path)
 
         # Inject synthetic prefix data when USE_SYNTHETIC_PREFIX env is set
         synthetic_json = os.environ.get("USE_SYNTHETIC_PREFIX", None)

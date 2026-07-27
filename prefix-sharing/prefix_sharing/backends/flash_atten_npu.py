@@ -46,8 +46,8 @@ from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
     FlashBackendValidationError,
 )
+from prefix_sharing.backends.kv_builder import apply_rope_with_plan, build_prefix_expanded_kv
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
-from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 
@@ -150,12 +150,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         supports_cann=True,
         supports_different_q_kv_lengths=True,
         supports_prefix_last_restore=True,
-        supports_gated_attention=False,
-        supports_deltanet_state_reuse=False,
     )
-
-    def __init__(self) -> None:
-        self._torch_ref = TorchReferenceBackend()
 
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         config.validate(model_config=model_config)
@@ -168,7 +163,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         prefix_sharing_plan: PrefixSharingPlan,
         **kwargs: Any,
     ) -> tuple[Any, Any]:
-        return self._torch_ref.apply_rope(query, key, prefix_sharing_plan, **kwargs)
+        return apply_rope_with_plan(query, key, prefix_sharing_plan, **kwargs)
 
     def build_kv(
         self,
@@ -182,14 +177,14 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         tp_rank: int = 0,
         stats: Any | None = None,
     ) -> tuple[Any, Any]:
-        """Delegate KV expansion to the torch reference backend.
+        """Build prefix-expanded K/V via the shared backend helper.
 
         Returns per-sample expanded K/V concatenated in THD order.  The
         caller (megatron_runtime) still passes the THD-concatenated result
         to ``attention()``, where we split it back into per-sample rows for
         the BSHD conversion.
         """
-        return self._torch_ref.build_kv(
+        return build_prefix_expanded_kv(
             key,
             value,
             store,

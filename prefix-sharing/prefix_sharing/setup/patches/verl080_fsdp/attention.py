@@ -28,7 +28,6 @@ _SUPPORTED_ATTENTIONS = {
     # "eager",  # replaced by eager_paged in this transformers version
 }
 
-
 # ##### [PS-diag] dump helpers ######
 
 def _resolve_num_layers(module: Any) -> int:
@@ -157,7 +156,6 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
         if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             _dump_attn_output(output_ld, module)
-        # ##### [PS-diag] end #####
         return output_ld, None
 
     return patched_attention

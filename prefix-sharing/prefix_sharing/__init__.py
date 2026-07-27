@@ -24,7 +24,6 @@ Monkey-patch activation:
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
-from prefix_sharing.integrations.verl_mcore import enable_prefix_sharing, prefix_sharing_enabled
 
 
 __all__ = [
@@ -35,8 +34,6 @@ __all__ = [
     "PrefixReuseSpec",
     "PrefixSharingPlanner",
     "TriePrefixDetector",
-    "enable_prefix_sharing",
-    "prefix_sharing_enabled",
 ]
 
 # ── Monkey-patch auto-activation ──
@@ -44,10 +41,6 @@ __all__ = [
 # (config or env) at runtime and falls through to the native path when disabled.
 # This allows both ENABLE_PREFIX_SHARING env var and prefix_sharing_config yaml
 # key to independently control the feature — no separate "install gate" needed.
-#
-# For verl_v070 environments, the invasive import in megatron_actor.py
-# still works (enable_prefix_sharing / prefix_sharing_enabled), but the
-# setup module is not invoked — the old integration code handles everything.
 #
 # The setup.install() call is safe even when verl/Megatron are not present:
 # if the detected versions match no compat matrix entry, it raises
@@ -59,15 +52,14 @@ _patch_handle = None  # module-level reference for introspection / rollback
 def _auto_install_patches() -> None:
     """Install monkey patches on import.
 
-    Patch set selection order (first match wins):
+    Patch set selection order:
 
-    1. ``PREFIX_SHARING_PATCHSET`` env var — explicit patch set id (e.g.
-       ``verl080_fsdp``). Recommended for environments that install multiple
-       backends (Megatron + FSDP) where auto-detection would be ambiguous.
-       Aligns with docs/feature-fsdp.md §4.6.1 guidance.
-    2. Compat matrix auto-detection — picks a patch set based on detected
-       verl / megatron-core / mindspeed versions. Default path when no env
-       var is set.
+    1. ``PREFIX_SHARING_PATCHSET`` env var — explicit patch set id(s), e.g.
+       ``verl080_fsdp`` or ``verl080_fsdp,verl080_mcore0161_ms0160``. This is
+       intended for debugging or narrowing patch scope.
+    2. Compat matrix auto-detection — installs all patch sets matching the
+       detected verl / megatron-core / mindspeed versions. Default path when no
+       env var is set.
 
     Each patch wrapper checks the runtime switch (PrefixSharingConfig.from_raw,
     which respects both config file and env var) — when disabled, the wrapper

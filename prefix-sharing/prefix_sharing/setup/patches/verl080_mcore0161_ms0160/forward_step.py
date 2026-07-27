@@ -8,6 +8,8 @@ thin wrapper：消费 batch → 读 config → 构建状态 → 设 context → 
 
 from __future__ import annotations
 
+from prefix_sharing.diagnostics import diagnostic_dump_enabled
+
 from typing import Any
 
 

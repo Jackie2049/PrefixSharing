@@ -24,59 +24,104 @@ def check() -> DetectedVersions:
     """仅探测版本并校验兼容性，不安装 patch。
 
     Returns: 探测到的版本信息
-    Raises: IncompatibleEnvironment — 版本组合不兼容
+    Raises: IncompatibleEnvironment — 没有任何兼容 patch set
     """
     versions = detect_versions()
-    entry = _find_compat_entry(versions)
-    if entry is None:
+    entries = _find_compat_entries(versions)
+    if not entries:
         raise IncompatibleEnvironment(
             f"不兼容的版本组合: verl={versions.verl}, "
             f"megatron_core={versions.megatron_core}, "
             f"mindspeed={versions.mindspeed}。\n"
             + _format_compat_matrix()
         )
+    patch_set_ids = [entry.patch_set_id for entry in entries]
     print(
         f"[PS] Version check: verl={versions.verl}, megatron_core={versions.megatron_core}, "
-        f"mindspeed={versions.mindspeed} → compatible (patch_set={entry.patch_set_id})"
+        f"mindspeed={versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
     )
     return versions
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
-    """一键安装：版本探测 → 矩阵匹配 → 注册 patch → 应用 → 返回 handle。
+    """安装 prefix-sharing patch。
 
-    Args:
-        patch_set_id: 显式指定 patch set。FSDP 开发线建议使用
-            ``install("verl080_fsdp")``，避免在同时安装 Megatron/MindSpeed 的
-            环境中被兼容矩阵自动选到 Megatron patch set。
+    默认安装当前环境所有匹配的 patch sets；显式传入 patch_set_id 时
+    只安装指定 patch set。显式值支持逗号分隔，便于调试时限制 patch 范围。
 
     Returns: PatchHandle — 可调用 describe() 查看详情、disable() 回滚
     Raises: IncompatibleEnvironment — 版本组合不兼容
     """
-    if patch_set_id is None:
-        versions = check()
-        entry = _find_compat_entry(versions)
-        patch_set_id = entry.patch_set_id
-    else:
-        print(f"[PS] install() using explicit patch_set={patch_set_id}")
-    patch_set = _load_patch_set(patch_set_id)
+    patch_set_ids = _resolve_patch_set_ids(patch_set_id)
+    if patch_set_id is not None:
+        print(f"[PS] install() using explicit patch_sets={patch_set_ids}")
 
-    for spec in patch_set:
-        PatchRegistry.register(spec)
+    patch_specs: list[PatchSpec] = []
+    for patch_set in patch_set_ids:
+        patch_specs.extend(_load_patch_set(patch_set))
+    patch_specs = _dedupe_patch_specs(patch_specs)
 
-    handle = PatchRegistry.install_all()
+    handle = PatchRegistry.install_specs(patch_specs)
 
     print(
-        f"[PS] install() complete. {len(patch_set)} patches active. patch_set={patch_set_id}"
+        f"[PS] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
     )
     return handle
 
 
+def _resolve_patch_set_ids(
+    patch_set_id: str | None,
+    *,
+    versions: DetectedVersions | None = None,
+) -> list[str]:
+    if patch_set_id is not None:
+        values = [value.strip() for value in patch_set_id.split(",") if value.strip()]
+        if not values:
+            raise ValueError("patch_set_id must not be empty")
+        return _dedupe(values)
+
+    versions = versions or check()
+    entries = _find_compat_entries(versions)
+    if not entries:
+        raise IncompatibleEnvironment(
+            f"不兼容的版本组合: verl={versions.verl}, "
+            f"megatron_core={versions.megatron_core}, "
+            f"mindspeed={versions.mindspeed}。\n"
+            + _format_compat_matrix()
+        )
+    return _dedupe([entry.patch_set_id for entry in entries])
+
+
+def _find_compat_entries(versions: DetectedVersions) -> list[CompatEntry]:
+    return [entry for entry in COMPAT_MATRIX if entry.match(versions)]
+
+
 def _find_compat_entry(versions: DetectedVersions) -> CompatEntry | None:
-    for entry in COMPAT_MATRIX:
-        if entry.match(versions):
-            return entry
-    return None
+    entries = _find_compat_entries(versions)
+    return entries[0] if entries else None
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _dedupe_patch_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
+    seen: set[tuple[str, str]] = set()
+    result: list[PatchSpec] = []
+    for spec in specs:
+        key = (spec.module_name, spec.description)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(spec)
+    return result
 
 
 def _load_patch_set(patch_set_id: str) -> list[PatchSpec]:
@@ -92,7 +137,10 @@ def _format_compat_matrix() -> str:
         parts = []
         if e.verl is not None:
             parts.append(f"verl={e.verl}")
-        parts.append(f"megatron-core={e.megatron_core}")
+        if e.megatron_core == "*":
+            parts.append("megatron-core=*")
+        else:
+            parts.append(f"megatron-core={e.megatron_core}")
         if e.mindspeed is not None:
             parts.append(f"mindspeed={e.mindspeed}")
         lines.append(f"  组合{e.patch_set_id}: " + " + ".join(parts))

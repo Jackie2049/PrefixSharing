@@ -15,15 +15,15 @@ from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.diagnostics import diagnostic_dump_enabled, dump_fsdp_expanded_kv
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_mcore import _collect_kept_position_rows
-from prefix_sharing.integrations.verl_mcore import _extract_seq_from_nested_tensor
-from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-from prefix_sharing.integrations.verl_mcore import _trim_nested_batch
-
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
+from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _is_nested_tensor
+from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 
 class PrefixSharingFSDPAttentionRuntime:
     """Standalone FSDP attention runtime for PrefixSharing.
@@ -145,7 +145,9 @@ def forward_prefix_sharing_fsdp_micro_batch(
         model_output = _call_fsdp_model(
             model,
             trimmed_micro_batch,
-            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(),
+            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(
+                num_layers=model.config.num_hidden_layers if hasattr(model, "config") else 0,
+            ),
             enable_prefix_sharing=runtime_state is not None,
         )
         logits = _extract_logits(model_output) / float(temperature)
@@ -431,7 +433,6 @@ def _run_packed_attention_runtime(
         profiler.stop_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
 
     return output
-
 
 def _call_fsdp_model(
     model: Any,

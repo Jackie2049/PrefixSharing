@@ -461,7 +461,6 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
 def test_verl_fsdp_attention_patch_installs():
     transformers_modeling_utils = pytest.importorskip("transformers.modeling_utils")
     registry = transformers_modeling_utils.ALL_ATTENTION_FUNCTIONS
-    # Pick a supported key that exists in the current transformers version
     supported = {"flash_attention_2", "flash_attention_3", "sdpa", "flex_attention"}
     available = [k for k in supported if k in registry]
     if not available:
@@ -625,22 +624,24 @@ def test_verl080_fsdp_forward_step_patch_allows_remove_padding_config_without_en
     assert output["loss"] == pytest.approx(float(loss.detach().item()))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA (Triton attention in FSDP forward_step)")
 def test_verl080_fsdp_forward_step_patch_runs_native_nested_prepare_outputs_path():
     if not hasattr(torch, "nested"):
         pytest.skip("torch.nested is unavailable")
     torch.manual_seed(2032)
+    device = torch.device("cuda:0")
     batch = {
         "input_ids": torch.nested.nested_tensor(
             [
-                torch.tensor([1, 2, 3, 10, 11], dtype=torch.long),
-                torch.tensor([1, 2, 3, 20, 21, 22], dtype=torch.long),
+                torch.tensor([1, 2, 3, 10, 11], dtype=torch.long, device=device),
+                torch.tensor([1, 2, 3, 20, 21, 22], dtype=torch.long, device=device),
             ],
             layout=torch.jagged,
         ),
         "position_ids": torch.nested.nested_tensor(
             [
-                torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
-                torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long),
+                torch.tensor([0, 1, 2, 3, 4], dtype=torch.long, device=device),
+                torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long, device=device),
             ],
             layout=torch.jagged,
         ),
@@ -656,7 +657,7 @@ def test_verl080_fsdp_forward_step_patch_runs_native_nested_prepare_outputs_path
 
     patched = patch_fsdp_forward_step(original_forward_step)
     engine = _FakeNativeFSDPEngine(
-        _TinyHFStyleModel(vocab_size=32),
+        _TinyHFStyleModel(vocab_size=32).to(device),
         _EngineConfig(
             {"enable_prefix_sharing": True, "min_prefix_len": 3},
             use_remove_padding=True,

@@ -77,7 +77,6 @@ class PrefixLastRestoreSpec:
 
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
-    group_id: int
     target_2d_pos: int = -1
     """The prefix-last position (``prefix_len - 1``): the last token of the
     shared prefix. By the log_probs layout invariant
@@ -108,7 +107,6 @@ class PrefixSharingPlan:
 
     # 前缀复用关系
     reuse_specs: list[PrefixReuseSpec]           # 序列间复用关系规范
-    group_ids: list[int]                        # 各序列所属前缀组ID
     is_provider: list[bool]                      # 各序列是否为provider（被复用方）
     provider_index: list[int]                    # 各序列的provider在batch中的索引
     prefix_lens: list[int]                      # 各序列前缀长度（可共享部分）
@@ -138,7 +136,6 @@ class PrefixSharingPlan:
         expected = self.batch_size
         fields: Sequence[tuple[str, list[object]]] = (
             ("original_lengths", self.original_lengths),
-            ("group_ids", self.group_ids),
             ("is_provider", self.is_provider),
             ("provider_index", self.provider_index),
             ("prefix_lens", self.prefix_lens),
@@ -273,7 +270,6 @@ class PrefixSharingPlanner:
 
         batch_size = len(input_ids)
         original_lengths = [len(seq) for seq in input_ids]
-        group_ids = list(detection.group_ids)
         is_provider = list(detection.is_provider)
         provider_index = list(detection.provider_index)
         prefix_lens = list(detection.prefix_lens)
@@ -318,7 +314,6 @@ class PrefixSharingPlanner:
                         PrefixLastRestoreSpec(
                             reuse_idx_in_batch=index,
                             provider_idx_in_batch=provider_index[index],
-                            group_id=group_ids[index],
                             target_2d_pos=prefix_len - 1,
                             label_value=input_ids[index][prefix_len],
                         )
@@ -346,7 +341,6 @@ class PrefixSharingPlanner:
             batch_size=batch_size,
             original_lengths=original_lengths,
             reuse_specs=reuse_specs,
-            group_ids=group_ids,
             is_provider=is_provider,
             provider_index=provider_index,
             prefix_lens=prefix_lens,
@@ -389,7 +383,6 @@ class PrefixSharingPlanner:
             batch_size=batch_size,
             original_lengths=original_lengths,
             reuse_specs=[],
-            group_ids=[-1] * batch_size,
             is_provider=[True] * batch_size,
             provider_index=list(range(batch_size)),
             prefix_lens=[0] * batch_size,

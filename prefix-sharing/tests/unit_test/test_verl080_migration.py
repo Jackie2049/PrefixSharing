@@ -24,7 +24,7 @@ from prefix_sharing.integrations.context import (
     prefix_sharing_runtime_context,
 )
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 
 
 # ═══════════════════════════════════════
@@ -147,12 +147,12 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
 
 # ═══════════════════════════════════════
-# compat_matrix 新条目匹配
+# compat_matrix FSDP-first 匹配
 # ═══════════════════════════════════════
 
 
-def test_compat_matrix_matches_qwen35_npu_combo():
-    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
+def test_compat_matrix_prefers_verl080_fsdp_even_when_mcore_is_installed():
+    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
     from prefix_sharing.setup.version_guard import DetectedVersions
 
     versions = DetectedVersions(
@@ -161,21 +161,23 @@ def test_compat_matrix_matches_qwen35_npu_combo():
         mindspeed="0.16.0",
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert len(matching) == 1
-    assert matching[0].patch_set_id == "verl080_mcore0161_ms0160"
+    assert matching
+    assert matching[0].patch_set_id == "verl080_fsdp"
+    assert any(e.patch_set_id == "verl080_mcore0161_ms0160" for e in matching)
 
 
-def test_compat_matrix_does_not_match_wrong_mcore():
+def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
     from prefix_sharing.setup.version_guard import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.8.0.dev",
-        megatron_core="0.16.0",  # 不匹配 0.16.1
-        mindspeed="0.16.0",
+        megatron_core=None,
+        mindspeed=None,
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert len(matching) == 0
+    assert matching
+    assert matching[0].patch_set_id == "verl080_fsdp"
 
 
 def test_compat_matrix_no_match_raises_incompatible():
@@ -294,19 +296,14 @@ def test_get_cp_group_returns_none_without_pg_collection():
 
 
 def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
-    """patch 始终尝试安装，本地无 verl/Megatron 时安全回退。
-
-    环境变量不影响是否安装 patch——无论 ENABLE_PREFIX_SHARING 未设置、
-    设为 0 还是 1，_auto_install_patches() 都尝试 setup.install()。
-    本地环境无 verl/Megatron 时 IncompatibleEnvironment 被捕获，
-    _patch_handle 保持 None，不影响训练。
-    """
+    """patch 始终尝试安装，环境兼容时（verl/Megatron 存在）应成功安装。"""
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    # 本地没有 verl/Megatron，版本不兼容，应安全回退
-    assert prefix_sharing._patch_handle is None
+    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    assert prefix_sharing._patch_handle is not None
+    assert len(prefix_sharing._patch_handle._specs) == 7
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -315,7 +312,9 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    assert prefix_sharing._patch_handle is None
+    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    assert prefix_sharing._patch_handle is not None
+    assert len(prefix_sharing._patch_handle._specs) == 7
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -324,7 +323,5 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    assert prefix_sharing._patch_handle is None
-    assert prefix_sharing._patch_handle is None
-
-
+    assert prefix_sharing._patch_handle is not None
+    assert len(prefix_sharing._patch_handle._specs) == 7
