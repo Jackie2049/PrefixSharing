@@ -49,3 +49,58 @@ def test_get_dp_rank_fsdp(monkeypatch):
     monkeypatch.setattr(dd.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(dd.torch.distributed, "get_rank", lambda: 1)
     assert dd._get_dp_rank() == 1
+
+
+def test_dump_weight_grads(tmp_path, monkeypatch):
+    """``dump_weight_grads_verl080`` saves every parameter gradient to a single .pt file."""
+    import os
+
+    import torch
+
+    monkeypatch.setenv("PREFIX_SHARING_DIAG_DUMP", str(tmp_path))
+    monkeypatch.setattr(dd, "_DUMP_DIR", None)
+
+    model = torch.nn.Linear(4, 2)
+    loss = model(torch.randn(3, 4)).sum()
+    loss.backward()
+
+    dd.dump_weight_grads_verl080(model, tag="train")
+
+    dump_path = tmp_path / "weight_grads_train.pt"
+    assert dump_path.exists()
+    grads = torch.load(dump_path, map_location="cpu", weights_only=True)
+    assert "weight" in grads
+    assert "bias" in grads
+    assert grads["weight"].shape == (2, 4)
+    assert grads["bias"].shape == (2,)
+
+
+def test_cmp_weight_grads(tmp_path):
+    """``cmp_weight_grads.compare`` reports cosine similarity per parameter."""
+    import torch
+    from prefix_sharing.tools.cmp_weight_grads import compare
+
+    on_dir = tmp_path / "on"
+    off_dir = tmp_path / "off"
+    on_dir.mkdir()
+    off_dir.mkdir()
+
+    torch.save(
+        {"weight": torch.ones(2, 4), "bias": torch.ones(2)},
+        on_dir / "weight_grads_train.pt",
+    )
+    torch.save(
+        {"weight": torch.ones(2, 4), "bias": torch.ones(2)},
+        off_dir / "weight_grads_train.pt",
+    )
+
+    ret = compare(str(on_dir), str(off_dir), tag="train")
+    assert ret == 0
+
+    # Mismatched gradients should fail the default threshold.
+    torch.save(
+        {"weight": -torch.ones(2, 4), "bias": torch.ones(2)},
+        off_dir / "weight_grads_train.pt",
+    )
+    ret = compare(str(on_dir), str(off_dir), tag="train")
+    assert ret == 1

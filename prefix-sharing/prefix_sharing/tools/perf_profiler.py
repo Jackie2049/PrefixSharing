@@ -53,6 +53,23 @@ _profiler_context: ContextVar[Any] = ContextVar(
 _PER_LAYER_NAME_RE = re.compile(r"\.l\d+$")
 
 
+# ── Attention-internal memory (sampled) ──────────────────────────
+# For overall attention phases ``attn.on`` / ``attn.off``, the background
+# MemoryMonitor samples are tagged with the phase name.  On stop, the samples
+# that fall inside the phase window are aggregated into avg / peak stats.
+
+
+@dataclass
+class AttentionPhaseMemory:
+    """Aggregated memory statistics for one attention phase window."""
+
+    avg_allocated_gb: float
+    peak_allocated_gb: float
+    avg_reserved_gb: float
+    peak_reserved_gb: float
+    num_samples: int
+
+
 def _profiling_enabled() -> bool:
     """Profiling is on when the explicit switch is set OR an output dir is given.
 
@@ -249,6 +266,14 @@ def _is_per_layer_phase(name: str) -> bool:
     return _PER_LAYER_NAME_RE.search(name) is not None
 
 
+_ATTN_OVERALL_PHASES: frozenset[str] = frozenset({"attn.on", "attn.off"})
+
+
+def _is_overall_attention_phase(name: str) -> bool:
+    """True for the overall attention phases whose memory we sample."""
+    return name in _ATTN_OVERALL_PHASES
+
+
 @dataclass
 class MicroBatchSnapshot:
     """Snapshot of a single micro-batch within a step."""
@@ -261,6 +286,7 @@ class MicroBatchSnapshot:
     per_layer: dict[int, dict[str, float]] = field(default_factory=dict)  # layer_id → {"attn.kv": s, "attn.comp": s}
     memory_peak_allocated_gb: float = 0.0
     memory_peak_reserved_gb: float = 0.0
+    attention_memory: dict[str, AttentionPhaseMemory] = field(default_factory=dict)
 
 
 class ProfilerScope:
@@ -303,12 +329,14 @@ class ProfilerScope:
         memory_interval: float = 0.05,
         per_layer: bool = True,
         rank: int = 0,
+        attn_memory: bool = False,
     ) -> None:
         self.perf_dir = perf_dir
         self.step_id = step_id
         self.kind = kind  # "train" | "logp" — old_logp runs in a separate RPC call
         self.per_layer_enabled = per_layer
         self.rank = rank
+        self.attn_memory_enabled = attn_memory
         self._monitor = MemoryMonitor(interval=memory_interval)
         self._stopwatch = Stopwatch()
         self._snapshots: list[MicroBatchSnapshot] = []
@@ -316,6 +344,9 @@ class ProfilerScope:
         self._current_mb_idx = -1
         self._minibatch_phases: dict[int, dict[str, float]] = {}  # mb_idx → phase → elapsed_s
         self._per_layer: dict[int, dict[str, float]] = {}
+        # Attention-internal sampled memory bookkeeping (cleared per micro-batch).
+        self._attn_phase_cursors: dict[str, int] = {}
+        self._attention_memory: dict[str, AttentionPhaseMemory] = {}
         self._sample_cursor = 0
         self._step_start = 0.0
         self._total_elapsed_s = 0.0
@@ -360,6 +391,8 @@ class ProfilerScope:
     def begin_micro_batch(self, micro_batch_idx: int, *, forward_only: bool = False) -> None:
         self._stopwatch.reset()
         self._per_layer = {}
+        self._attn_phase_cursors = {}
+        self._attention_memory = {}
         self._sample_cursor = len(self._monitor._samples)
         self._monitor.set_batch_idx(max(self._current_mb_idx, 0), micro_batch_idx)
         self._current_snapshot = MicroBatchSnapshot(
@@ -386,6 +419,7 @@ class ProfilerScope:
             if not _is_per_layer_phase(name)
         }
         snap.per_layer = self._per_layer
+        snap.attention_memory = dict(self._attention_memory)
         self._snapshots.append(snap)
         self._current_snapshot = None
         self._monitor.set_batch_idx(max(self._current_mb_idx, 0), -1)
@@ -394,6 +428,14 @@ class ProfilerScope:
 
     def start_phase(self, name: str) -> None:
         self._stopwatch.start(name)
+        if (
+            self.attn_memory_enabled
+            and _is_overall_attention_phase(name)
+            and self._current_snapshot is not None
+        ):
+            self._monitor.set_phase(name)
+            # Remember where this phase's sampled window begins.
+            self._attn_phase_cursors[name] = len(self._monitor._samples)
 
     def stop_phase(self, name: str) -> float:
         elapsed = self._stopwatch.stop(name)
@@ -401,6 +443,13 @@ class ProfilerScope:
             # Outside a micro-batch (e.g. ``update``) → mini-batch level.
             phases = self._minibatch_phases.setdefault(self._current_mb_idx, {})
             phases[name] = phases.get(name, 0.0) + elapsed
+        if (
+            self.attn_memory_enabled
+            and _is_overall_attention_phase(name)
+            and name in self._attn_phase_cursors
+        ):
+            self._monitor.set_phase("")
+            self._aggregate_attention_memory(name, self._attn_phase_cursors.pop(name))
         return elapsed
 
     def is_phase_active(self, name: str) -> bool:
@@ -412,6 +461,21 @@ class ProfilerScope:
             return
         per_layer = self._per_layer.setdefault(layer_id, {})
         per_layer[phase] = per_layer.get(phase, 0.0) + elapsed_s
+
+    def _aggregate_attention_memory(self, phase: str, start_idx: int) -> None:
+        """Compute avg/peak allocated & reserved from samples tagged with *phase*."""
+        samples = [s for s in self._monitor._samples[start_idx:] if s.phase == phase]
+        if not samples:
+            return
+        allocated = [s.allocated_gb for s in samples]
+        reserved = [s.reserved_gb for s in samples]
+        self._attention_memory[phase] = AttentionPhaseMemory(
+            avg_allocated_gb=round(sum(allocated) / len(allocated), 3),
+            peak_allocated_gb=round(max(allocated), 3),
+            avg_reserved_gb=round(sum(reserved) / len(reserved), 3),
+            peak_reserved_gb=round(max(reserved), 3),
+            num_samples=len(samples),
+        )
 
     # ── ContextVar access ────────────────────────────────────────
 
@@ -437,6 +501,7 @@ class ProfilerScope:
           - ``PREFIX_SHARING_PERF_DIR`` — output root (default ``./perf_results``)
           - ``PREFIX_SHARING_PERF_MEMORY_INTERVAL`` — sampling interval s (default 0.005)
           - ``PREFIX_SHARING_PERF_PER_LAYER`` — ``0`` disables per-layer attention timing
+          - ``PREFIX_SHARING_PERF_ATTN_MEMORY`` — ``1`` enables sampled attention-internal VRAM
         """
         if not _profiling_enabled():
             return None
@@ -446,6 +511,7 @@ class ProfilerScope:
         except ValueError:
             interval = 0.005
         per_layer = os.environ.get("PREFIX_SHARING_PERF_PER_LAYER", "1").strip() not in ("0", "false", "False")
+        attn_memory = os.environ.get("PREFIX_SHARING_PERF_ATTN_MEMORY", "0").strip() in ("1", "true", "True", "yes", "on")
         return ProfilerScope(
             perf_dir,
             step_id,
@@ -453,6 +519,7 @@ class ProfilerScope:
             memory_interval=interval,
             per_layer=per_layer,
             rank=_resolve_rank(),
+            attn_memory=attn_memory,
         )
 
     # ── persistence ──────────────────────────────────────────────
@@ -470,6 +537,7 @@ class ProfilerScope:
         self._save_microbatch_timing_csv(out_dir, suffix)
         self._save_per_layer_csv(out_dir, suffix)
         self._save_memory_csv(out_dir, suffix)
+        self._save_attention_memory_csv(out_dir, suffix)
         self._save_step_summary_json(out_dir, suffix)
         self._update_latest_link()
 
@@ -525,6 +593,30 @@ class ProfilerScope:
                     layer_id, phase, round(elapsed * 1e3, 3),
                 ])
         print(f"[ProfilerScope] wrote {len(rows)} per-layer rows to {path}")
+
+    def _save_attention_memory_csv(self, out_dir: str, suffix: str) -> None:
+        rows = [
+            (snap, phase, mem)
+            for snap in self._snapshots
+            for phase, mem in snap.attention_memory.items()
+        ]
+        if not rows:
+            return
+        path = os.path.join(out_dir, f"attention_memory_{self.kind}.{suffix}.csv")
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "step_id", "mini_batch_idx", "micro_batch_idx", "phase",
+                "avg_allocated_gb", "peak_allocated_gb",
+                "avg_reserved_gb", "peak_reserved_gb", "num_samples",
+            ])
+            for snap, phase, mem in rows:
+                writer.writerow([
+                    snap.step_id, snap.mini_batch_idx, snap.micro_batch_idx, phase,
+                    mem.avg_allocated_gb, mem.peak_allocated_gb,
+                    mem.avg_reserved_gb, mem.peak_reserved_gb, mem.num_samples,
+                ])
+        print(f"[ProfilerScope] wrote {len(rows)} attention memory rows to {path}")
 
     def _save_memory_csv(self, out_dir: str, suffix: str) -> None:
         if not self._monitor._samples:
@@ -664,7 +756,31 @@ class ProfilerScope:
             "memory": memory_summary,
             "mini_batch_stats": mini_batch_stats,
             "per_layer_attention_summary": per_layer_summary,
+            "attention_memory_summary": self._build_attention_memory_summary(),
         }
+
+    def _build_attention_memory_summary(self) -> dict[str, Any]:
+        """Aggregate sampled attention-memory stats across micro-batches."""
+        phase_samples: dict[str, list[AttentionPhaseMemory]] = {}
+        for snap in self._snapshots:
+            for phase, mem in snap.attention_memory.items():
+                phase_samples.setdefault(phase, []).append(mem)
+        summary: dict[str, Any] = {}
+        for phase, mems in sorted(phase_samples.items()):
+            avg_alloc = sum(m.avg_allocated_gb for m in mems) / len(mems)
+            peak_alloc = max(m.peak_allocated_gb for m in mems)
+            avg_res = sum(m.avg_reserved_gb for m in mems) / len(mems)
+            peak_res = max(m.peak_reserved_gb for m in mems)
+            avg_samples = sum(m.num_samples for m in mems) / len(mems)
+            summary[phase] = {
+                "count": len(mems),
+                "avg_allocated_gb": round(avg_alloc, 3),
+                "peak_allocated_gb": round(peak_alloc, 3),
+                "avg_reserved_gb": round(avg_res, 3),
+                "peak_reserved_gb": round(peak_res, 3),
+                "avg_num_samples": round(avg_samples, 1),
+            }
+        return summary
 
 
 def _resolve_rank() -> int:

@@ -11,7 +11,10 @@ Patch 目标：
 
 from prefix_sharing.setup.registry import PatchSpec
 
-from .forward_step import patch_fsdp_forward_step
+from .forward_step import (
+    patch_forward_backward_batch_for_diag_dump,
+    patch_fsdp_forward_step,
+)
 from .perf_profiler_patch import (
     patch_forward_backward_batch,
     patch_infer_batch,
@@ -60,6 +63,13 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod.FSDPEngine, "forward_backward_batch"),
         patch_factory=patch_forward_backward_batch,
         description="FSDPEngine.forward_backward_batch → micro-batch profiling without source edit",
+        eager=True,
+    ),
+    PatchSpec(
+        module_name="verl.workers.engine.fsdp.transformer_impl",
+        target_getter=lambda mod: (mod.FSDPEngine, "forward_backward_batch"),
+        patch_factory=patch_forward_backward_batch_for_diag_dump,
+        description="FSDPEngine.forward_backward_batch → dump weight gradients after backward",
         eager=True,
     ),
     PatchSpec(
