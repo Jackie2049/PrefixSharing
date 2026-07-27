@@ -228,33 +228,123 @@ def test_exception_inside_scope_still_saves(perf_dir):
     assert os.path.exists(os.path.join(perf_dir, "step_0", "summary_train.rank0.json"))
 
 
-def test_memory_snapshot_carries_batch_idx():
-    """MemoryMonitor.snapshot() reflects the current mini/micro-batch index."""
-    from prefix_sharing.tools.training_monitor import MemoryMonitor
+def test_create_if_enabled_reads_attn_memory_env(perf_dir, monkeypatch):
+    monkeypatch.setenv("PREFIX_SHARING_PERF_PROFILE", "1")
+    monkeypatch.setenv("PREFIX_SHARING_PERF_DIR", perf_dir)
+    monkeypatch.setenv("PREFIX_SHARING_PERF_ATTN_MEMORY", "1")
+    scope = ProfilerScope.create_if_enabled(0)
+    assert scope is not None
+    assert scope.attn_memory_enabled is True
 
-    mon = MemoryMonitor(interval=0.01)
-    snap = mon.snapshot()
-    assert snap.mini_batch_idx == -1
-    assert snap.micro_batch_idx == -1
-    mon.set_batch_idx(2, 3)
-    snap = mon.snapshot()
-    assert snap.mini_batch_idx == 2
-    assert snap.micro_batch_idx == 3
+    monkeypatch.setenv("PREFIX_SHARING_PERF_ATTN_MEMORY", "0")
+    scope = ProfilerScope.create_if_enabled(0)
+    assert scope is not None
+    assert scope.attn_memory_enabled is False
+
+
+def test_attention_memory_disabled_by_default(perf_dir):
+    """No attention_memory CSV is produced when attn_memory is disabled."""
+    scope = _make_scope(perf_dir, attn_memory=False)
+    with scope:
+        scope.begin_minibatch(0)
+        scope.begin_micro_batch(0)
+        scope.start_phase(PerfProfiler.PHASE_ATTN_ON)
+        scope.stop_phase(PerfProfiler.PHASE_ATTN_ON)
+        scope.end_micro_batch()
+        scope.end_minibatch()
+
+    attn_mem_csv = os.path.join(perf_dir, "step_0", "attention_memory_train.rank0.csv")
+    assert not os.path.exists(attn_mem_csv)
+
+
+def test_attention_memory_csv_and_summary(perf_dir):
+    """Attention memory sampling produces CSV rows and summary entries from tagged samples."""
+    from prefix_sharing.tools.training_monitor import MemoryMonitor, MemorySnapshot
+
+    scope = _make_scope(perf_dir, attn_memory=True)
+    with scope:
+        scope.begin_minibatch(0)
+        scope.begin_micro_batch(0)
+        scope.start_phase(PerfProfiler.PHASE_ATTN_ON)
+        # Simulate background samples that fall inside the attn.on window.
+        scope._monitor._samples.extend([
+            MemorySnapshot(1.0, 1.0, 1.5, phase="attn.on"),
+            MemorySnapshot(1.1, 2.0, 2.5, phase="attn.on"),
+        ])
+        scope.stop_phase(PerfProfiler.PHASE_ATTN_ON)
+        scope.end_micro_batch()
+        scope.end_minibatch()
+
+    step_dir = os.path.join(perf_dir, "step_0")
+    attn_mem_csv = os.path.join(step_dir, "attention_memory_train.rank0.csv")
+    summary_json = os.path.join(step_dir, "summary_train.rank0.json")
+
+    assert os.path.exists(attn_mem_csv)
+    with open(attn_mem_csv, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == [
+        "step_id", "mini_batch_idx", "micro_batch_idx", "phase",
+        "avg_allocated_gb", "peak_allocated_gb",
+        "avg_reserved_gb", "peak_reserved_gb", "num_samples",
+    ]
+    assert len(rows) == 2
+    assert rows[1][3] == "attn.on"
+    assert float(rows[1][4]) == 1.5  # avg allocated
+    assert float(rows[1][5]) == 2.0  # peak allocated
+    assert float(rows[1][6]) == 2.0  # avg reserved
+    assert float(rows[1][7]) == 2.5  # peak reserved
+    assert int(rows[1][8]) == 2      # num_samples
+
+    with open(summary_json, encoding="utf-8") as f:
+        summary = json.load(f)
+    attn_summary = summary["attention_memory_summary"]
+    assert "attn.on" in attn_summary
+    assert attn_summary["attn.on"]["count"] == 1
+    assert attn_summary["attn.on"]["avg_allocated_gb"] == 1.5
+    assert attn_summary["attn.on"]["peak_allocated_gb"] == 2.0
+
+
+def test_attention_memory_filters_untagged_samples(perf_dir):
+    """Only samples tagged with the active phase contribute to attention memory stats."""
+    from prefix_sharing.tools.training_monitor import MemorySnapshot
+
+    scope = _make_scope(perf_dir, attn_memory=True)
+    with scope:
+        scope.begin_minibatch(0)
+        scope.begin_micro_batch(0)
+        scope.start_phase(PerfProfiler.PHASE_ATTN_OFF)
+        scope._monitor._samples.extend([
+            MemorySnapshot(1.0, 1.0, 1.0, phase="attn.off"),
+            MemorySnapshot(1.1, 9.0, 9.0, phase=""),
+            MemorySnapshot(1.2, 2.0, 2.0, phase="attn.off"),
+        ])
+        scope.stop_phase(PerfProfiler.PHASE_ATTN_OFF)
+        scope.end_micro_batch()
+        scope.end_minibatch()
+
+    attn_mem_csv = os.path.join(perf_dir, "step_0", "attention_memory_train.rank0.csv")
+    with open(attn_mem_csv, newline="") as f:
+        rows = list(csv.reader(f))
+    assert len(rows) == 2
+    # Untagged 9.0 sample should be ignored.
+    assert float(rows[1][4]) == 1.5  # avg allocated = (1+2)/2
+    assert float(rows[1][5]) == 2.0  # peak allocated
+    assert int(rows[1][8]) == 2      # num_samples
 
 
 def test_memory_trace_csv_tags_batch_idx(tmp_path):
-    """memory_trace CSV carries mini/micro-batch columns for per-micro-batch analysis."""
+    """memory_trace CSV carries mini/micro-batch and phase columns for per-micro-batch analysis."""
     from prefix_sharing.tools.training_monitor import MemoryMonitor, MemorySnapshot
 
     mon = MemoryMonitor(interval=0.01)
     mon._samples = [
-        MemorySnapshot(1.0, 1.5, 2.0, mini_batch_idx=0, micro_batch_idx=0),
-        MemorySnapshot(2.0, 1.6, 2.0, mini_batch_idx=0, micro_batch_idx=-1),
+        MemorySnapshot(1.0, 1.5, 2.0, mini_batch_idx=0, micro_batch_idx=0, phase="attn.on"),
+        MemorySnapshot(2.0, 1.6, 2.0, mini_batch_idx=0, micro_batch_idx=-1, phase=""),
     ]
     path = str(tmp_path / "memory_trace.csv")
     mon.save_to_csv(path)
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
-    assert rows[0] == ["timestamp", "mini_batch_idx", "micro_batch_idx", "allocated_gb", "reserved_gb"]
-    assert rows[1] == ["1.0", "0", "0", "1.5", "2.0"]
-    assert rows[2] == ["2.0", "0", "-1", "1.6", "2.0"]
+    assert rows[0] == ["timestamp", "mini_batch_idx", "micro_batch_idx", "phase", "allocated_gb", "reserved_gb"]
+    assert rows[1] == ["1.0", "0", "0", "attn.on", "1.5", "2.0"]
+    assert rows[2] == ["2.0", "0", "-1", "", "1.6", "2.0"]
