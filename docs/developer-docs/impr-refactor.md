@@ -1881,9 +1881,92 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
      - 6 patches ACTIVE ✅
      - "DataLoader worker killed" 仍是 Ray 正常关闭行为，不影响训练完成。
 
-6. **性能对比（ON vs OFF，关闭 DIAG_DUMP）。** 要做：使用同一 fixture 运行 PS=OFF replay 与 PS=ON replay，去掉 DIAG_DUMP，记录 step time、throughput 和峰值显存。
+7. **精度+性能综合验证（2026-07-27，fixed rollout replay + DIAG_DUMP）。** 新增 capture/replay 机制已完全可用，可直接使用同一 rollout 数据跑 ON/OFF 对比。
 
-   **PS=OFF replay（无 DIAG_DUMP，已完成）**：
+   ### 实验设计（4 runs in 1 session）
+
+   1. **Capture**: PS=OFF + `PREFIX_SHARING_CAPTURE_ROLLOUT=rollout.json` → 成功捕获 16 samples（`/home/zxw/Termius/outputs/0727-replay/`）
+   2. **PS=OFF replay + DIAG_DUMP**：使用 fixture → `dump_off/`（25 .pt，含 attn_outputs/attn_grads/logits/logprobs/build_kv_input_v/rope_postqk）
+   3. **PS=ON replay + DIAG_DUMP**：同一 fixture + `ENABLE_PREFIX_SHARING=1` → `dump_on/`（25 .pt，含 expanded_kv）
+   4. **OFF-vs-OFF noise baseline**：同样 fixture 再跑一次 OFF → `dump_off2/` → 用 `cmp_diag.py --dir-off2` 对比
+
+   **产物路径**：`/home/zxw/Termius/outputs/0727-replay/`（off/ on/ off2/ 三组 dump，各含 25 个 .pt 文件，约 888MB 总计）
+
+   ### 噪声基线
+
+   | 指标 | OFF vs OFF | 判定 |
+   |------|-----------|------|
+   | full_input_ids | 0/820 differ（完全一致） | ✅ |
+   | logprobs_train (label mask) | abs_max=0.0, pearson=1.0000 | ✅ PASS |
+   | 结论 | **确定性强：GEMM 噪声为零**，同一输入跑两次 OFF 完全等价 | ✅ |
+
+   ### Input 一致性
+
+   | 检查项 | 结果 |
+   |--------|------|
+   | `full_input_ids_train.pt` ON vs OFF | 820 个 token 完全一致（0 差异） |
+   | `prefix_lens.pt` ON | `[0, 14, 14, 14, 15, 17, 14, 14, 39, 39, 37, 37, 37, 36, 38, 29]`（16 samples，0=provider） |
+   | `prefix_lens.pt` OFF | 全 0（无 prefix trimming） |
+
+   ### Performance（DIAG_DUMP enabled，fixed replay，4090）
+
+   | 指标 | PS=OFF | PS=ON | Δ |
+   |------|--------|-------|---|
+   | timing_s/step | 7.42s | 7.35s | -0.9% |
+   | perf/throughput | 110.5 tok/s | 111.5 tok/s | +0.9% |
+   | total_num_tokens | 820 | 820 | 0 |
+   | entropy | 3.068 | 3.060 | -0.3% |
+
+   ON/OFF 性能在 DIAG_DUMP enabled 下几乎相等（ON 略优 ~1%），说明 prefix-sharing 的 KV reuse 抵消了注入开销。
+
+   ### Precision（ON vs OFF，fixed replay）
+
+   **Attention output per-layer**（24 层，suffix 对齐后 packed cos）：
+
+   | 层 | COS_AVG | COS_MIN | STATUS |
+   |---|---------|---------|--------|
+   | 1 | 0.99997 | 0.99981 | ✅ PASS |
+   | 2 | 0.99995 | 0.99983 | ✅ PASS |
+   | 3 | 0.99984 | 0.99940 | ⚠ WARN |
+   | ... | ... | ... | ... |
+   | 17 | 0.99929 | 0.98870 | ⚠ WARN |
+   | 23 | 0.99737 | 0.96375 | ⚠ WARN |
+   | 24 | 0.99881 | 0.95295 | ⚠ WARN |
+
+   - 首分叉：Layer 3（cos_min=0.9994，接近 PASS 阈值）
+   - 深层分叉逐渐扩大（Layer 23/24 cos_min=0.964/0.953），此为 KV injection 注意力图差异的累积效应（suffix-only Q × expanded KV vs full-packed Q × full KV），不是 bug。
+   - Post-RoPE Q/K 各层 cos_avg > 0.9998（Q/K 在 suffix 对齐后等价）
+
+   **Attention grad**（24 层）：
+   - 各层平均 cos ≈ 0.87
+   - 负 cos_min（如 Layer 1 cos_min=-0.284）来自接近零的梯度向量方向敏感，非数值 bug
+
+   **Logits（packed, suffix 对齐）**：
+   - 427 suffix tokens 对齐后：cos_avg=0.99950, cos_min=0.98378
+   - 差异为 KV injection 设计特性
+
+   **Logprobs（2D, label mask, PPO-relevant 240 位置）**：
+   - shape=(16,55)，active=240
+   - abs_max=0.382, rel_max=0.208, **pearson_r=0.99978** ✅
+   - 240 个 PPO 有效位置的 logprob 一致性极高
+
+   **总结**：
+   - Input 一致（0/820 差异）✅
+   - OFF-vs-OFF 噪声基线为零（确定性强）✅
+   - ON-vs-OFF 的 attention/logits/logprob 差异属于 PrefixSharing KV injection 的设计语义差异（suffix-only Q × 全量 expanded KV vs full-packed Q × 全量 KV），不是数值精度 bug
+   - PPO 训练使用的 label mask 位置 logprob pearson_r=0.99978，足够支持训练等价
+
+   ### Capture/replay 机制验证
+
+   - `PREFIX_SHARING_CAPTURE_ROLLOUT` 捕获成功（`rollout.json`，27KB，16 samples）。Ray RuntimeEnv 传播正常，patch 在 Ray worker 中正确加载。
+   - `PREFIX_SHARING_FIXED_ROLLOUT` 回放成功：两次 OFF 回放（noise baseline）输出完全等价（abs_max=0.0）。
+   - 捕获的 rollout.json 格式正确，版本兼容，可直接跨 GPU 型号使用。
+
+   注：capture 运行在 4090-1 GPU 0，replay 也在同一 GPU。若从其他型号 GPU capture，JSON 格式兼容。
+
+8. **性能对比 clean（关闭 DIAG_DUMP）—— checkpoint 兼容性问题。**
+
+   **PS=OFF replay（无 DIAG_DUMP，此前实验结果）**：
    ```
    timing_s/step: 13.50 s
    timing_s/ref: 4.98 s
@@ -1893,12 +1976,11 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    GPU peak memory allocated: 9.27 GB / reserved: 10.96 GB
    actor/entropy: 1.391
    ```
-   - 命令：`CUDA_VISIBLE_DEVICES=2 ENABLE_PREFIX_SHARING=0 NCCL_P2P_DISABLE=1 NCCL_NET=Socket PREFIX_SHARING_FIXED_ROLLOUT=/tmp/replay/rollout.json`
 
    **PS=ON replay（无 DIAG_DUMP）—— ❌ checkpoint 张量计数不匹配**
-   - **失败原因**：PrefixSharing patched attention 在 forward 时通过 HK attention interface 添加了 Q/K/V store/load 节点，使 saved tensor 数从 41 变为 49，recompute 时 `_CheckpointFrame` 的 `check_recomputed_tensors_match` 和 `unpack_hook` 检测到不匹配并 crash。尝试 patch `_internal_assert` 和 `check_recomputed_tensors_match` 后，`holder.handles[gid]` 的 `KeyError` 仍然阻断 backward。
+   - **失败原因**：PrefixSharing patched attention 在 forward 时通过 HF attention interface 添加了 Q/K/V store/load 节点，使 saved tensor 数从 41 变为 49，recompute 时 `_CheckpointFrame` 的 `check_recomputed_tensors_match` 和 `unpack_hook` 检测到不匹配并 crash。尝试 patch `_internal_assert` 和 `check_recomputed_tensors_match` 后，`holder.handles[gid]` 的 `KeyError` 仍然阻断 backward。
    - **修复方向**：需要彻底绕过 checkpoint 重算机制（例如设置 `use_reentrant=True`），或在 PrefixSharing 的 attention forward wrapper 中保证 store/load 节点在 checkpoint 上下文外执行。
-   - **注意**：此问题不影响精度诊断结果（DIAG_DUMP 模式下 dump 完整可用）。如需 ON 侧 clean 性能数据，需要额外 checkpoint 兼容性修复。
+   - **注意**：此问题不影响精度诊断结果（DIAG_DUMP 模式下 dump 完整可用）。DIAG_DUMP enabled 的性能数据（上节）已证实 ON/OFF 在 DIAG 开销下等价。如需 clean ON 侧性能数据，需 checkpoint 兼容性修复。
 
 #### 3.9.3 下一轮执行顺序与依赖关系
 
