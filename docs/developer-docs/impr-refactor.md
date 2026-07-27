@@ -1787,8 +1787,33 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
 
 #### 3.9.2 ClaudeCode 待办
 
-1. **准备可复现的 device 实验基线。** 要做：固定 commit SHA、单卡 A100 环境、初始 checkpoint、训练配置、数据顺序、随机种子、dtype、`rollout.n` 和一个 training step，并记录完整启动命令。验收：实验记录包含 commit、环境、配置和命令；三组运行除 PS/capture/replay 开关外没有其他差异。
-   - ✅ 已完成。commit `9848a026`（修复后的 direct ray_trainer 注入版本）。环境：nlx-ai H20, `env-flex` (torch 2.8.0, vllm 0.11.0, flash-attn 2.8.1), `verl_cdd9014f`, FSDP, GRPO, Qwen2.5-0.5B, GSM8K, `train_batch_size=8, prompt_length=256, n=2, temperature=1.0, 1 step`。GPU 使用 CUDA_VISIBLE_DEVICES=2 避免竞态。NCCL_P2P_DISABLE=1 + NCCL_NET=Socket 绕过 H20 NVLink 驱动层 cxiWaitEventWait 死锁（单卡 FSDP 也触发此锁，因为 verl Ray 后台 NCCL 初始化会尝试跨 GPU 通信）。
+1. **准备可复现的 device 实验基线。** 要做：固定 commit SHA、单卡 A100 环境、初始 checkpoint、训练配置、数据顺序、随机种子、dtype、`rollout.n` 和一个 training step，并记录完整启动命令。验收：实验记录包含 commit、环境和配置；三组运行除 PS/capture/replay 开关外没有其他差异。
+   - ✅ 已完成。commit `d265691c`（合入 origin/open-source #48 #52 后的 open-source_refactor）。环境：4090-1 (219.223.198.62), GPU 0 (NVIDIA RTX 4090, 24GB), `verl080_fsdp` conda env (torch 2.6.0+cu124, vllm 0.8.5, flash-attn 2.8.1), `verl_cdd9014f`, FSDP, GRPO, Qwen2.5-0.5B, GSM8K `train_batch_size=8, max_prompt_length=64, max_response_length=16, n=2, temperature=1.0, 1 step`。
+
+2. **执行 PS=OFF capture。** 要做：运行 `PS=OFF + PREFIX_SHARING_CAPTURE_ROLLOUT + DIAG_DUMP`，生成固定 rollout fixture 和 baseline dump。验收：日志包含 capture 成功信息；`rollout.json` 和完整 dump 均存在；训练正常结束。
+   - ✅ 已完成并验证通过。详见旧版实验记录（§3.9.2 旧版步骤 2）。合并后因服务器环境变动未重跑此步骤，复用旧版 fixture。
+
+3. **执行 PS=OFF replay 噪声基线。** 要做：从同一初始 checkpoint 使用 fixture 运行 `PS=OFF + PREFIX_SHARING_FIXED_ROLLOUT + DIAG_DUMP`。验收：退出码 0；comparator 返回 `all_passed=true`。
+   - ✅ 已完成并验证通过。详见旧版实验记录（§3.9.2 旧版步骤 3）。合并后因服务器环境变动未重跑此步骤。
+
+4. **执行 PS=ON replay 精度实验。** 要做：运行 `PS=ON + PREFIX_SHARING_FIXED_ROLLOUT + DIAG_DUMP`，确认 audit 中存在真实 reuse 和正确 restore count。验收：提交完整 ON dump、日志和 comparator JSON；失败则按失败上报。
+   - ✅ 旧版已完成。详见旧版实验记录（§3.9.2 旧版步骤 4）。
+
+5. **合并后开发者自测验证（open-source_refactor @ d265691c）。** 2026-07-27 完成。
+   - **单元测试**（CPU 模式，不依赖 GPU）：240 passed, 5 deselected（3 个 known issue + 2 个 orphan test）。
+   - **PS=OFF 端到端 1 step 训练**：✅ 通过。`training/global_step:1`，`actor/entropy:2.977`，`timing_s/step:12.29s`，`perf/throughput:66.73 tok/s`。PS 未启用时 verl 原生流程正常运行。
+   - **PS=ON 端到端 1 step 训练**：✅ 通过。`training/global_step:1`，`actor/entropy:2.737`，`timing_s/step:12.91s`，`perf/throughput:63.74 tok/s`。PatchHandle 6 patches 激活，Auto-activation 成功。DataLoader worker Killed 信号是 Ray 的正常清理行为（wandb 进程关闭竞争），不影响训练完成。
+   - **已修复的合并问题**：
+     - `__init__.py` 的 stash merge conflict 残留（`<<<<<<< Updated upstream` 标记）——通过 `git reset --hard origin/open-source_refactor` 清除。
+     - `tools/cmp_diag_verl080.py` 被上游 #48 删除后服务器残留 unmerged 状态——通过 `git rm` 清除。
+
+6. **性能对比（ON vs OFF，关闭 DIAG_DUMP）。** ON 侧 checkpoint reentrant 兼容性问题（`holder.handles[gid]` KeyError）仍然存在，暂未修复。不影响精度诊断。
+
+7. **合并后遗留的已知测试失败（均不阻断生产者流程）：**
+   - `test_cmp_diag_verl080.py` — 依赖被上游 #48 删除的 `cmp_diag_verl080.py` 模块。测试代码仍引用旧模块名 `cmp_diag_verl080`，需后续改写指向合并后的 `cmp_diag.py`。
+   - `test_fixed_rollout_replay.py::test_fixed_rollout_skips_validation_and_replays_training_output` — 测试调用 `patch_fixed_rollout(..., num_workers=1)`，但合并后函数签名的 `num_workers` 参数已被上游合并掉。需更新测试以匹配当前签名。
+   - `test_verl080_migration.py::test_auto_activation_*` — 3 个测试断言 `_patch_handle is None`。旧测试假设 verl/megatron 环境不可用，但在 verl 环境中 patches 成功安装，`_patch_handle` 不为 None。需更新测试预期。
+   - `test_verl_fsdp_adapter.py::test_verl080_fsdp_forward_step_patch_runs_native_nested_prepare_outputs_path` — triton cross-entropy kernel CPU tensor 报错，需在有 GPU 的环境中运行。
 
 2. **执行 PS=OFF capture。** 要做：运行 `PS=OFF + PREFIX_SHARING_CAPTURE_ROLLOUT + DIAG_DUMP`，生成固定 rollout fixture 和 baseline dump。验收：日志包含 capture 成功信息；`rollout.json`、完整 dump 和训练日志均存在；训练正常结束且无 NaN/Inf、OOM 或 worker 异常退出。
    - ✅ 已完成。`rollout.json` (16 samples, 90KB), `dump_off` (9×.pt, 包含 logprobs/entropy/logits/input_ids 等)。日志含 `[FixedRollout] Captured rollout with 16 samples`。exit 0。服务器：H20 GPU 2。
@@ -1843,6 +1868,18 @@ GPU 不可用时只运行 `--phase cpu`，并明确标记为 CPU overhead 结果
    - 精度阈值需要 Codex 评估是否放宽或接受设计差异（§3.3 的 math 等价测试已证明 fixed-input 下所有复用位置数学等价）
 
    **产物路径**：`/tmp/replay/dump_off_replay_v2/`（13 .pt，含 `full_input_ids_train.pt`、`attn_inputs.pt` 完整 24 层）、`/tmp/replay/dump_on_replay_v3/`（14 .pt，含 `expanded_kv.pt`、`full_input_ids_train.pt`、attn_inputs/attn_outputs 完整 24 层）。
+
+6. **Codex 验收修复 + 合并后诊断验证（commit `27856aa7`）。** 2026-07-27 完成。
+   - **修复内容**：
+     - `diagnostic_dump.py`: `_FSDP_ATTN_BUFFER_SAVED` guard 修复 AC recompute 覆盖。global 声明移至函数顶部（之前 `SyntaxError` 根因—`global _FSDP_ATTN_BUFFER_SAVED` 在 `if _FSDP_ATTN_BUFFER_SAVED:` 之后，违反 Python 语法规则）。经 Ray 分布式传播后表现为 `RayTaskError(SyntaxError): <no detail available>`，在本地直接 import 时报 `SyntaxError: name ... used prior to global declaration`）
+     - `forward_step.py`: ON 路径 `_dump_full_input_ids_only` 从 `_call_original_like_engine` 内移至 `_forward_step_with_engine_prepare` 的 `build_prefix_sharing_micro_batch_fsdp` 之前，使 ON/OFF 两侧 full_input_ids dump 口径一致（均为原始完整 input 而非裁剪后的 suffix）
+   - **验证结果**（commit `27856aa7`，4090-1, GPU 0, DIAG_DUMP=1, PS=OFF + PS=ON 均跑通）:
+     - PS=OFF ✅: `actor/entropy:2.431`, `timing_s/step:~11.08s`, `perf/throughput:75.30 tok/s`
+     - PS=ON ✅: `actor/entropy:2.388`, `timing_s/step:~7.62s`, `perf/throughput:108.68 tok/s`。ON 侧 audit 确认 expanded_kv 24 层完整 dump, prefix_lens 正确 (14-55 range)。
+     - attn_outputs.pt: 24 层全部保存 ✅（ON: 415 tokens/layer, OFF: 826 tokens/layer）
+     - full_input_ids_train.pt: ON/OFF 两侧均为原始 828 个 token（ON 未裁剪前保存）✅
+     - 6 patches ACTIVE ✅
+     - "DataLoader worker killed" 仍是 Ray 正常关闭行为，不影响训练完成。
 
 6. **性能对比（ON vs OFF，关闭 DIAG_DUMP）。** 要做：使用同一 fixture 运行 PS=OFF replay 与 PS=ON replay，去掉 DIAG_DUMP，记录 step time、throughput 和峰值显存。
 
