@@ -912,6 +912,7 @@ def _response_lengths_from_loss_mask(loss_mask: Any, batch_size: int) -> list[in
 # ════════════════════════════════════════════════════════════════
 
 _FSDP_ATTN_BUFFER: dict[int, torch.Tensor] = {}
+_FSDP_ATTN_BUFFER_SAVED: bool = False
 
 
 def dump_fsdp_attn_output(
@@ -925,12 +926,19 @@ def dump_fsdp_attn_output(
     *output* is ``[B, L, H, D]`` (before o_proj), reshaped to ``[N, H*D]``
     packed format matching Megatron's ``[N, hidden]`` convention.
 
+    Only the FIRST forward that reaches all ``num_layers`` is saved; subsequent
+    calls (e.g. activation-checkpoint recompute) are ignored so that the
+    diagnostic file retains the complete set of layers from the original
+    forward, not just the last layer from recompute.
+
     Args:
         output: Attention output tensor (before o_proj), single tensor or tuple.
         layer_number: 1-based layer index.
         num_layers: Total number of layers in the model.
     """
     import torch as _torch
+
+    global _FSDP_ATTN_BUFFER_SAVED
 
     dump_dir = _get_dump_dir()
     if dump_dir is None:
@@ -940,6 +948,10 @@ def dump_fsdp_attn_output(
     if not hasattr(output, "dim") or output.dim() < 3:
         return
     if num_layers == 0:
+        return
+
+    # 首次 forward 已保存 → 屏蔽 recompute 覆盖
+    if _FSDP_ATTN_BUFFER_SAVED:
         return
 
     hidden_dim = output.shape[-1] * output.shape[-2]
@@ -961,7 +973,9 @@ def dump_fsdp_attn_output(
                 _FSDP_ATTN_BUFFER.clear()
                 return
             filename = "attn_outputs.pt"
-        _torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, filename))
+        if not _FSDP_ATTN_BUFFER_SAVED:
+            _torch.save(_FSDP_ATTN_BUFFER, os.path.join(dump_dir, filename))
+            _FSDP_ATTN_BUFFER_SAVED = True
         _FSDP_ATTN_BUFFER.clear()
 
 

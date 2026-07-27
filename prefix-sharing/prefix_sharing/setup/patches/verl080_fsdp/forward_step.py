@@ -172,6 +172,12 @@ def _forward_step_with_engine_prepare(
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
 
+    # DIAG_DUMP: save original full input_ids BEFORE prefix sharing trimming.
+    # The ON path would otherwise dump only the suffix post-trim, producing a
+    # false different_tokens=186 when compared against OFF's full input_ids.
+    if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+        _dump_full_input_ids_only(micro_batch, "train")
+
     trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
         micro_batch,
         ps_config,
