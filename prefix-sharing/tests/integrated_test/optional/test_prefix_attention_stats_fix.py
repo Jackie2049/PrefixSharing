@@ -10,11 +10,7 @@ torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_runtime import prefix_attention
-from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
-from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
-from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
+from prefix_sharing.integrations.verl_mcore import build_prefix_sharing_micro_batch_verl070
 
 
 def _install_megatron_parallel_state(monkeypatch, tp_size=1):
@@ -58,23 +54,26 @@ def test_prefix_attention_runs_without_nameerror(monkeypatch):
     _install_megatron_parallel_state(monkeypatch, tp_size=1)
     _install_rope_passthrough(monkeypatch)
 
-    # Build state inline (the 070 batch constructor was removed)
-    config = PrefixSharingConfig.from_raw({"enable_prefix_sharing": True, "min_prefix_len": 3})
-    sequences = [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]
-    plan = PrefixSharingPlanner(config).plan(sequences)
-    kept_position_rows = [torch.arange(5) for _ in range(2)]
-    layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows, align_size=1)
-    state = PrefixSharingRuntimeState(
-        prefix_sharing_plan=plan,
-        attention_backend=None,
-        packed_batch_layout=layout,
-        parallel_info=MegatronParallelInfo(
-            global_rank=0, tp_rank=0, tp_size=1,
-            cp_rank=0, cp_size=1,
-            pp_rank=0, pp_size=1,
-            is_pipeline_first_stage=True, is_pipeline_last_stage=True,
-        ),
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
     )
+    _, state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     layout = state.packed_batch_layout
     total = layout.total_padded_length  # 7

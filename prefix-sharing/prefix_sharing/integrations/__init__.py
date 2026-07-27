@@ -11,6 +11,7 @@ from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 from prefix_sharing.integrations.verl_mcore import (
+    build_prefix_sharing_micro_batch_verl070,
     build_prefix_sharing_micro_batch_verl080,
     restore_reuser_prefix_columns_2d,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "PrefixSharingRuntimeState",
     "current_prefix_sharing_context",
     "prefix_sharing_runtime_context",
+    "build_prefix_sharing_micro_batch_verl070",
     "build_prefix_sharing_micro_batch_verl080",
     "restore_reuser_prefix_columns_2d",
     "read_ps_config_from_engine_config",

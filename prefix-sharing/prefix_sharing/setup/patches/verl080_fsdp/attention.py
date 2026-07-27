@@ -28,6 +28,9 @@ _SUPPORTED_ATTENTIONS = {
     # "eager",  # replaced by eager_paged in this transformers version
 }
 
+def patch_transformers_attention(original_fn: Any) -> Any:
+    """Wrap one concrete attention implementation from the HF registry."""
+
 # ##### [PS-diag] dump helpers ######
 
 def _resolve_num_layers(module: Any) -> int:
