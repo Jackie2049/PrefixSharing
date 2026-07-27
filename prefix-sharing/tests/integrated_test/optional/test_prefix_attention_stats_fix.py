@@ -62,7 +62,9 @@ def test_prefix_attention_runs_without_nameerror(monkeypatch):
     config = PrefixSharingConfig.from_raw({"enable_prefix_sharing": True, "min_prefix_len": 3})
     sequences = [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]
     plan = PrefixSharingPlanner(config).plan(sequences)
-    kept_position_rows = [torch.arange(5), torch.arange(2, 5)]
+    # kept_position_rows must match input_keep_ranges from the plan:
+    # provider keeps all 5 positions [0,5), reuser keeps only suffix [3,5) = 2 tokens.
+    kept_position_rows = [torch.arange(5), torch.arange(3, 5)]
     layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows, align_size=1)
     state = PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
