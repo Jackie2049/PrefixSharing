@@ -1,48 +1,36 @@
-# Python
+# python / generated
+*.pyc
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-dist/
-build/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Backup files
+*.bak
+*.bak_*
+*.py.bak
+*.py.bak_*
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+# Logs and config
 *.log
+*.yaml
 
-# Test coverage
-.coverage
-cov.json
+# Tools (non-repo)
+run*.py
+apply_*.py
+gen_*.py
+generate_*.py
+extract_*.py
+summarize_*.py
+verify_*.py
+training_monitor_startup.py
+run_with_monitor.py
+run_fixed_rollout.py
 
-# Model checkpoints (large files)
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-
-# Logs
-outputs/
+# Output dirs
+metrics/
 log/
+extra-info/
+code/
+data/
+outputs/
 
-# Backup git directories
-.git.bak/
-
-# Local tool dirs
-.codebuddy/
-
-# coverage artifacts
-*,cover
-coverage.xml
-htmlcov/
-.coverage.*
+# Proxy
+proxy.sh
