@@ -78,11 +78,6 @@ def _flex_attn_env_options() -> dict[str, Any] | None:
         "BLOCK_N2": block_n_i,
         "num_stages": num_stages,
     }
-    print(
-        f"[flex_atten_gpu] override kernel_options: "
-        f"BLOCK_M={block_m_i}, BLOCK_N={block_n_i}, num_stages={num_stages}",
-        flush=True,
-    )
     return kernel_options
 
 
