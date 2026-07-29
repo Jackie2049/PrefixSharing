@@ -169,7 +169,7 @@ def get_or_create_block_mask(
     if block_size is not None:
         extra_kwargs["BLOCK_SIZE"] = block_size
     block_mask = create_block_mask(
-        mask_mod, 1, 1, total, total, device=device, **extra_kwargs
+        mask_mod, None, None, total, total, device=device, _compile=True, **extra_kwargs
     )
 
     if cache is not None:
