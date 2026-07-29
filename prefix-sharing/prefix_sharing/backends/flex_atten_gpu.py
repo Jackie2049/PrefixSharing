@@ -234,11 +234,13 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
         # block_size here without controlling create_block_mask's internal
         # BLOCK_M/BLOCK_N triggers "Q and KV block size must be divisible by
         # BLOCK_M and BLOCK_N" errors.
-        block_mask = get_or_create_block_mask(
-            prefix_sharing_plan,
-            device=q.device,
-            cache=self._block_mask_cache,
-        )
+        block_mask = kwargs.pop("block_mask", None)
+        if block_mask is None:
+            block_mask = get_or_create_block_mask(
+                prefix_sharing_plan,
+                device=q.device,
+                cache=self._block_mask_cache,
+            )
 
         if self._compiled_flex_attention is None:
             self._compiled_flex_attention = torch.compile(

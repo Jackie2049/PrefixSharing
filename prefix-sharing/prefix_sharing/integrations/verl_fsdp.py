@@ -8,11 +8,13 @@ The helpers stay framework-light enough for CPU tests, while the explicit
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from typing import Any
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.prefix_block_mask import get_or_create_block_mask
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -250,13 +252,46 @@ def build_prefix_sharing_micro_batch_fsdp(
         kept_position_rows,
         align_size=1,
     )
+    attention_backend = get_backend_instance(config, backend)
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        attention_backend=get_backend_instance(config, backend),
+        attention_backend=attention_backend,
         packed_batch_layout=packed_batch_layout,
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
     )
+
+    # Precompute the BlockMask once per micro-batch instead of inside every
+    # attention layer.  This removes the mask construction overhead from layer 0
+    # and lets it be measured as a separate attention sub-phase.
+    try:
+        from prefix_sharing.tools.perf_profiler import PerfProfiler
+        profiler = PerfProfiler.current()
+    except ImportError:
+        profiler = None
+    if profiler is not None:
+        profiler.start_phase(PerfProfiler.PHASE_ATTN_MASK)
+    try:
+        from prefix_sharing.backends.flex_atten_gpu import GpuFlexAttentionBackend
+        block_mask_cache = attention_backend._block_mask_cache if isinstance(attention_backend, GpuFlexAttentionBackend) else None
+        block_mask = get_or_create_block_mask(
+            prefix_sharing_plan,
+            device=input_ids.device,
+            cache=block_mask_cache,
+        )
+        runtime_state = dataclasses.replace(runtime_state, block_mask=block_mask)
+    except Exception as exc:
+        # If BlockMask construction fails here (e.g. unsupported backend or
+        # device mismatch), fall back to the per-layer lazy path in
+        # flex_atten_gpu.py rather than failing the whole micro-batch.
+        print(
+            f"[PS] failed to precompute BlockMask, falling back to per-layer lazy construction: {exc}",
+            flush=True,
+        )
+    finally:
+        if profiler is not None:
+            profiler.stop_phase(PerfProfiler.PHASE_ATTN_MASK)
+
     return trimmed_micro_batch, runtime_state
 
 
@@ -438,6 +473,7 @@ def _run_packed_attention_runtime(
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
+        block_mask=ctx.block_mask,
     )
     # [PS-perf] start — per-layer compute stop —————————————
     if _per_layer_ok:

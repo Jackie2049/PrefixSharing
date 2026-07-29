@@ -60,6 +60,7 @@ class PrefixSharingRuntimeContext:
         self.store = store
         self.attention_backend = runtime_state.attention_backend
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
+        self.block_mask = getattr(runtime_state, "block_mask", None)
         self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
             runtime_state.prefix_sharing_plan,
             runtime_state.packed_batch_layout,

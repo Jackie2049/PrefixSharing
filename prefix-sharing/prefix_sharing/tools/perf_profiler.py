@@ -98,6 +98,7 @@ class PerfProfiler:
     PHASE_FORWARD_OLD = "fwd.old"     # model forward (old_logp / forward_only)
     PHASE_BACKWARD = "bwd"            # model backward (via autograd)
     PHASE_ATTN_KV = "attn.kv"         # build_kv: store provider + load reuser
+    PHASE_ATTN_MASK = "attn.mask"     # BlockMask construction for mask-based backends
     PHASE_ATTN_COMPUTE = "attn.comp"  # attention computation (FA kernel)
     PHASE_ATTN_PACK = "attn.pack"     # QKV pack dense→packed (cross-layer accumulated)
     PHASE_ATTN_UNPACK = "attn.unpack"  # output scatter packed→dense (cross-layer accumulated)
@@ -311,6 +312,7 @@ class ProfilerScope:
     PHASE_FORWARD_OLD = PerfProfiler.PHASE_FORWARD_OLD
     PHASE_BACKWARD = PerfProfiler.PHASE_BACKWARD
     PHASE_ATTN_KV = PerfProfiler.PHASE_ATTN_KV
+    PHASE_ATTN_MASK = PerfProfiler.PHASE_ATTN_MASK
     PHASE_ATTN_COMPUTE = PerfProfiler.PHASE_ATTN_COMPUTE
     PHASE_ATTN_PACK = PerfProfiler.PHASE_ATTN_PACK
     PHASE_ATTN_UNPACK = PerfProfiler.PHASE_ATTN_UNPACK
