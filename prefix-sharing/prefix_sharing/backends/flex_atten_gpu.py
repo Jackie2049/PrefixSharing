@@ -103,6 +103,23 @@ def _import_flex_attention() -> Any:
     return flex_attention
 
 
+# Module-level compiled flex_attention callable.  torch.compile itself is lazy,
+# so the actual Triton/Inductor compilation happens on the first forward call.
+# Keeping the callable at module scope ensures it survives across
+# GpuFlexAttentionBackend instances that may be created per micro-batch.
+_COMPILED_FLEX_ATTENTION: Any | None = None
+
+
+def _get_compiled_flex_attention(flex_module: Any) -> Any:
+    """Return a process-wide compiled flex_attention callable."""
+    global _COMPILED_FLEX_ATTENTION
+    if _COMPILED_FLEX_ATTENTION is None:
+        _COMPILED_FLEX_ATTENTION = torch.compile(
+            flex_module.flex_attention, dynamic=True
+        )
+    return _COMPILED_FLEX_ATTENTION
+
+
 class GpuFlexAttentionBackend(PrefixAttentionBackend):
     """CUDA/GPU FlexAttention backend with per-micro-batch BlockMask.
 
@@ -130,7 +147,6 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
     def __init__(self) -> None:
         self._torch_ref = TorchReferenceBackend()
         self._block_mask_cache: dict[Any, Any] = {}
-        self._compiled_flex_attention: Any | None = None
 
     # ------------------------------------------------------------------
     # Validation
@@ -242,12 +258,9 @@ class GpuFlexAttentionBackend(PrefixAttentionBackend):
                 cache=self._block_mask_cache,
             )
 
-        if self._compiled_flex_attention is None:
-            self._compiled_flex_attention = torch.compile(
-                flex_module.flex_attention, dynamic=True
-            )
+        compiled_flex_attention = _get_compiled_flex_attention(flex_module)
 
-        out = self._compiled_flex_attention(
+        out = compiled_flex_attention(
             q,
             k,
             v,
