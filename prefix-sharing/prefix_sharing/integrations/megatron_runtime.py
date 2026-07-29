@@ -11,6 +11,140 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.utils import ensure_global_packed_token_lengths
 
 
+# ---------------------------------------------------------------------------
+# Per-micro-batch timing accumulator (controlled by PS_TIMING env var)
+# ---------------------------------------------------------------------------
+_ps_timing_enabled = None
+_ps_timing_torch = None
+_ps_timing_events: dict[str, list[tuple[int, Any, Any]]] = {}  # category -> [(layer_id, start_ev, end_ev), ...]
+_ps_timing_mb_events: dict[str, tuple[Any, Any]] = {}  # category -> (start_ev, end_ev) for per-microbatch timing
+
+
+def _ps_timing_is_enabled() -> bool:
+    global _ps_timing_enabled
+    if _ps_timing_enabled is None:
+        _ps_timing_enabled = __import__("os").environ.get("PS_TIMING", "0") == "1"
+    return _ps_timing_enabled
+
+
+def _ps_timing_get_torch() -> Any:
+    global _ps_timing_torch
+    if _ps_timing_torch is None:
+        _ps_timing_torch = __import__("torch")
+    return _ps_timing_torch
+
+
+def _ps_timing_record(category: str, layer_id: int) -> Any:
+    """Create+record start event; return (start_ev, end_ev). Caller must record end_ev."""
+    t = _ps_timing_get_torch()
+    start_ev = t.npu.Event(enable_timing=True)
+    end_ev = t.npu.Event(enable_timing=True)
+    start_ev.record()
+    _ps_timing_events.setdefault(category, []).append((layer_id, start_ev, end_ev))
+    return end_ev
+
+
+def _ps_timing_end(end_ev: Any) -> None:
+    end_ev.record()
+
+
+def _ps_timing_record_mb(category: str) -> Any:
+    """Record per-microbatch-level timing event. Returns end_ev for caller to record."""
+    t = _ps_timing_get_torch()
+    start_ev = t.npu.Event(enable_timing=True)
+    end_ev = t.npu.Event(enable_timing=True)
+    start_ev.record()
+    _ps_timing_mb_events[category] = (start_ev, end_ev)
+    return end_ev
+
+
+def _ps_timing_end_mb(end_ev: Any) -> None:
+    end_ev.record()
+
+
+def _ps_timing_reset() -> None:
+    """Reset all timing accumulators for the next micro-batch."""
+    global _ps_timing_events, _ps_timing_mb_events
+    _ps_timing_events = {}
+    _ps_timing_mb_events = {}
+
+
+def ps_print_timing_summary(forward_id: int, global_rank: Any, extra: dict[str, float] | None = None) -> None:
+    """Print accumulated per-layer + per-microbatch timing summary.
+
+    Call this after ``torch.npu.synchronize()`` to ensure all events have landed.
+    """
+    global _ps_timing_events, _ps_timing_mb_events
+    if not _ps_timing_is_enabled():
+        return
+
+    has_layer = bool(_ps_timing_events)
+    has_mb = bool(_ps_timing_mb_events)
+
+    if not has_layer and not has_mb:
+        return
+
+    # --- Per-layer breakdown ---
+    if has_layer:
+        per_layer: dict[int, dict[str, float]] = {}
+        for category, ev_list in _ps_timing_events.items():
+            for layer_id, start_ev, end_ev in ev_list:
+                elapsed = start_ev.elapsed_time(end_ev)
+                per_layer.setdefault(layer_id, {})[category] = elapsed
+
+        for layer_id in sorted(per_layer):
+            parts = per_layer[layer_id]
+            line = (
+                "[PS-TIMING-BREAKDOWN] forward={} rank={} layer={} ".format(forward_id, global_rank, layer_id)
+                + " ".join("{}={:.3f}ms".format(k, v) for k, v in sorted(parts.items()))
+            )
+            print(line)
+
+    # --- Per-category totals ---
+    totals: dict[str, float] = {}
+
+    # Per-layer categories
+    for category, ev_list in _ps_timing_events.items():
+        totals[category + "_sum"] = sum(start_ev.elapsed_time(end_ev) for _, start_ev, end_ev in ev_list)
+
+    # Per-microbatch categories
+    for category, (start_ev, end_ev) in _ps_timing_mb_events.items():
+        totals[category] = start_ev.elapsed_time(end_ev)
+
+    # Compute forward_total from per-layer sums (all layer-scoped categories)
+    layer_categories = {"qkv", "rope", "build_kv", "mask", "fa", "output_proj",
+                        "b_total"}
+    forward_total = sum(v for k, v in totals.items() if k.replace("_sum", "") in layer_categories)
+
+    # Compute restore_total from restore sub-phases
+    restore_categories = {"restore_unfold", "restore_bulk", "restore_recompute", "restore_pack"}
+    restore_total = sum(v for k, v in totals.items() if k in restore_categories)
+
+    # Compute mb_total = pre_forward + forward + logprobs + restore
+    pre_forward_categories = {"detect", "plan", "trim", "layout"}
+    pre_forward_total = sum(v for k, v in totals.items() if k in pre_forward_categories)
+    logprobs_total = totals.get("save_logits", 0.0)
+    mb_total = pre_forward_total + forward_total + logprobs_total + restore_total
+
+    # Determine mode (totals keys have _sum suffix for per-layer categories)
+    _ps_categories = {"rope_sum", "build_kv_sum", "mask_sum", "fa_sum", "output_proj_sum"}
+    has_ps = any(k in _ps_categories or k.startswith("ps_") for k in totals)
+    mode = "ps" if has_ps else "baseline"
+
+    total_line = (
+        "[PS-TIMING-TOTALS] forward={} rank={} mode={} ".format(forward_id, global_rank, mode)
+        + " ".join("{}={:.3f}ms".format(k, v) for k, v in sorted(totals.items()))
+    )
+    total_line += " forward_total={:.3f}ms restore_total={:.3f}ms mb_total={:.3f}ms".format(
+        forward_total, restore_total, mb_total)
+    if extra:
+        total_line += " " + " ".join("{}={:.3f}ms".format(k, v) for k, v in sorted(extra.items()))
+    print(total_line)
+
+    # Reset for next micro-batch
+    _ps_timing_events = {}
+    _ps_timing_mb_events = {}
+
 
 def prefix_attention(
     attention_module: Any,
@@ -26,12 +160,9 @@ def prefix_attention(
     Returns ``None`` for the normal Megatron path. When active, this function
     owns RoPE, KV expansion, causal masking, and output projection.
     """
-    print("\n\n\nsuccess come into def prefix_attention\n\n\n")
-
     # 读取并校验前缀共享上下文 prefix_sharing_context
     prefix_sharing_context = current_prefix_sharing_context()
     if prefix_sharing_context is None:
-        print("\n\n\nprefix_sharing_context is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
@@ -55,13 +186,18 @@ def prefix_attention(
     # QK位置编码
     #   mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
     #       returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
-    #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
+    #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x)
     cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
     cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
     mscale = _get_yarn_mscale(attention_module)
     cp_group = _get_cp_group(attention_module)
     q_pos_emb, k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
-    
+
+    # [PS-TIMING] RoPE
+    _ps_rope_end_ev = None
+    if _ps_timing_is_enabled():
+        _ps_rope_end_ev = _ps_timing_record("rope", int(getattr(attention_module, "layer_number", 0) or 0))
+
     query, key = _apply_positioned_rope(
         attention_module,
         query,
@@ -75,9 +211,11 @@ def prefix_attention(
         cp_group=cp_group,
     )
 
+    if _ps_rope_end_ev is not None:
+        _ps_timing_end(_ps_rope_end_ev)
+
     parallel_info = prefix_sharing_context.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
-    print("\n\n\ntry to build kv\n\n\n")
     seq_parallel = getattr(getattr(attention_module, "config", None), "sequence_parallel", None)
     print(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
@@ -87,6 +225,11 @@ def prefix_attention(
         f"key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, valid_lengths={packed_batch_layout.valid_lengths}, "
         f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}"
     )
+
+    # [PS-TIMING] build_kv
+    _ps_buildkv_end_ev = None
+    if _ps_timing_is_enabled():
+        _ps_buildkv_end_ev = _ps_timing_record("build_kv", layer_id)
 
     # 前缀共享：provider 存储激活值，reuser 拼接激活值
     attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
@@ -100,13 +243,17 @@ def prefix_attention(
         tp_rank=parallel_info.tp_rank,
         stats=prefix_sharing_context.stats,
     )
+
+    if _ps_buildkv_end_ev is not None:
+        _ps_timing_end(_ps_buildkv_end_ev)
+
     print(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
         f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
-    # 注意力计算
+    # 注意力计算 (attention timing is logged inside flash_atten_npu.py as PS-TIMING mask/fa)
     core_attn_out = attention_backend.attention(
         query,
         expanded_key,
@@ -117,7 +264,16 @@ def prefix_attention(
         layer_id=layer_id,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+
+    # [PS-TIMING] output_proj
+    _ps_proj_end_ev = None
+    if _ps_timing_is_enabled():
+        _ps_proj_end_ev = _ps_timing_record("output_proj", layer_id)
+
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
+
+    if _ps_proj_end_ev is not None:
+        _ps_timing_end(_ps_proj_end_ev)
 
     ######### prefix-sharing diag: ON attention_output (per-layer) #########
     try:
@@ -161,15 +317,6 @@ def _apply_positioned_rope(
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
-    # 当 packed_position_ids 所需要的最大 position id 超过了 q_pos_emb / k_pos_emb 的当前长度时，
-    # 就需要对 q_pos_emb / k_pos_emb 进行扩展。
-    # THD 模式下生成的 pos_emb 仅覆盖 positions 0 .. max_seqlen_q-1 这段范围，
-    # 这个长度往往不够用，因为 prefix-sharing 会保留原始的 position_ids
-    #（例如后缀可能从 position 75 开始）。
-    #
-    # RoPE 具有线性性质：freqs[p] = p * inv_freq。
-    # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
-    # 从而生成缺失的高位置频率向量。
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
@@ -191,18 +338,7 @@ def _apply_positioned_rope(
         extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
         k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
 
-    # Build kwargs for apply_rotary_pos_emb.
-    # Only include version-specific params when they're provided,
-    # to maintain backward compat with v070 (mcore <= 0.15.x).
     def _rope_kwargs(_unused_cu_seqlens: Any | None) -> dict[str, Any]:
-        """Build kwargs for apply_rotary_pos_emb.
-
-        NOTE: cu_seqlens is ALWAYS set to None here because we pre-selected the
-        correct frequencies via index_select(0, packed_position_ids) above.
-        Passing real cu_seqlens would trigger the THD RoPE path, which re-splits
-        sequences and calls torch.cat — unnecessary double work and breaks on
-        NPU (aclnnCat failure).
-        """
         kwargs: dict[str, Any] = {"config": attention_module.config, "cu_seqlens": None}
         if mscale is not None and mscale != 1.0:
             kwargs["mscale"] = mscale
@@ -239,21 +375,12 @@ def _apply_positioned_rope(
 
 
 def _unpack_rotary_pos_emb(rotary_pos_emb: Any) -> tuple[Any, Any]:
-    """解包 rotary_pos_emb，兼容 mcore 版本差异。
-
-    mcore 0.12.1 ~ 0.15.x: (q_pos_emb, k_pos_emb) tuple
-    mcore 0.16.1+:             单 tensor（Q/K 共用）
-    """
     if isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2:
         return rotary_pos_emb[0], rotary_pos_emb[1]
     return rotary_pos_emb, rotary_pos_emb
 
 
 def _extract_cu_seqlens(packed_seq_params: Any, primary_attr: str, fallback_attr: str) -> Any | None:
-    """Extract cu_seqlens from packed_seq_params, preferring padded version.
-
-    Returns None for v070 (mcore <= 0.15.x) where these attributes don't exist.
-    """
     if packed_seq_params is None:
         return None
     val = getattr(packed_seq_params, primary_attr, None)
@@ -263,10 +390,6 @@ def _extract_cu_seqlens(packed_seq_params: Any, primary_attr: str, fallback_attr
 
 
 def _get_yarn_mscale(attention_module: Any) -> float:
-    """Get yarn mscale from attention module config (v0.16.1+).
-
-    Returns 1.0 for v070 (mcore <= 0.15.x) where this function doesn't exist.
-    """
     try:
         from megatron.core.transformer.attention import _yarn_get_concentration_factor_from_config
         return float(_yarn_get_concentration_factor_from_config(attention_module.config))
@@ -275,10 +398,6 @@ def _get_yarn_mscale(attention_module: Any) -> float:
 
 
 def _get_cp_group(attention_module: Any) -> Any | None:
-    """Get context parallel group from attention module (v0.16.1+).
-
-    Returns None for v070 (mcore <= 0.15.x) where pg_collection doesn't exist.
-    """
     pg_collection = getattr(attention_module, "pg_collection", None)
     if pg_collection is None:
         return None

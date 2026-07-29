@@ -236,7 +236,7 @@ class TELayerNormColumnParallelLinear(torch.nn.Module):
         use_fp32_reduce = getattr(self.config, "rmsnorm_zerocenter", False)
         zero_centered_gamma = getattr(self.config, "layernorm_zero_centered_gamma", False)
         # npu_rms_norm is γ*x_norm only; skip when (1+γ) is required.
-        use_fused = self.config.use_fused_rmsnorm and not zero_centered_gamma
+        use_fused = True and not zero_centered_gamma  # [NPU-FIX] always native
         if use_fp32_reduce:
             input_dtype = inp.dtype
             x = inp.to(torch.float32)
@@ -245,6 +245,11 @@ class TELayerNormColumnParallelLinear(torch.nn.Module):
             return self._rmsnorm_scale(x_norm.to(input_dtype)).to(input_dtype)
     
         if use_fused:
+            # [NPU-FIX] squeeze THD dim to avoid aclnnRmsNorm DDR bug
+            if inp.ndim == 3 and inp.shape[1] == 1:
+                inp_2d = inp.squeeze(1).contiguous()
+                out_2d, _ = torch_npu.npu_rms_norm(inp_2d, self.layer_norm_weight, epsilon=eps)
+                return out_2d.unsqueeze(1)
             return torch_npu.npu_rms_norm(inp, self.layer_norm_weight, epsilon=eps)[0]
         x_norm = inp * torch.rsqrt(inp.pow(2).mean(-1, keepdim=True) + eps)
         return self._rmsnorm_scale(x_norm)
@@ -297,6 +302,10 @@ class TELayerNormColumnParallelLinear(torch.nn.Module):
                 self.gradient_accumulation_fusion
             )
         else:
+            # [NPU-FIX] squeeze THD dim to avoid aclnnMatmul DDR bug
+            _need_unsq = input_parallel.ndim == 3 and input_parallel.shape[1] == 1
+            if _need_unsq:
+                input_parallel = input_parallel.squeeze(1).contiguous()
             output_parallel = self._linear_forward_impl(
                 input=input_parallel,
                 weight=self.weight,
@@ -313,6 +322,8 @@ class TELayerNormColumnParallelLinear(torch.nn.Module):
                     else None
                 )
             )
+            if _need_unsq:
+                output_parallel = output_parallel.unsqueeze(1)
 
         bias = self.bias if self.te_return_bias else None
         return output_parallel, bias

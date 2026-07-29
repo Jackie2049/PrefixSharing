@@ -153,6 +153,7 @@ class PrefixSharingPlan:
 
     # 内部缓存（不在 __post_init__ 验证）
     _global_custom_mask: torch.Tensor | None = field(default=None, repr=False)
+    _global_custom_mask_inverted: torch.Tensor | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         expected = self.batch_size
@@ -258,6 +259,8 @@ class PrefixSharingPlan:
         Semantics: True = visible (consistent with _causal_q_kv_mask legacy convention)。
         """
         if self._global_custom_mask is not None:
+            if self._global_custom_mask_inverted is None:
+                object.__setattr__(self, "_global_custom_mask_inverted", self._global_custom_mask.logical_not())
             return self._global_custom_mask
 
         total_q = sum(self.s_packed_q_lengths)
@@ -292,6 +295,7 @@ class PrefixSharingPlan:
                             mask[q_pos, kv_lo:visible_hi] = True
 
         object.__setattr__(self, "_global_custom_mask", mask)
+        object.__setattr__(self, "_global_custom_mask_inverted", mask.logical_not())
         return mask
 
 
@@ -490,4 +494,5 @@ class PrefixSharingPlanner:
             s_packed_prefix_end=s_packed_prefix_ends,
             s_packed_suffix_start=s_packed_suffix_starts,
             _global_custom_mask=_prebuilt_mask,
+            _global_custom_mask_inverted=_prebuilt_mask.logical_not() if _prebuilt_mask is not None else None,
         )

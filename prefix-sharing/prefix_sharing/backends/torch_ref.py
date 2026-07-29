@@ -85,38 +85,43 @@ class TorchReferenceBackend:
         s_packed_v = []
         stored_tokens = 0
 
+        reuse_count = 0
+        reused_tokens = 0
         for batch_index in range(prefix_sharing_plan.batch_size):
             valid_length = layout.valid_lengths[batch_index]
             if valid_length == 0:
                 continue
 
             prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+            # Packed row already contains only non-shared suffix tokens
+            # (prefix was removed during batch trimming)
+            suffix_k = key_rows[batch_index][:valid_length]
+            suffix_v = value_rows[batch_index][:valid_length]
             suffix_len = valid_length
-            suffix_k = key_rows[batch_index][:suffix_len]
-            suffix_v = value_rows[batch_index][:suffix_len]
 
             if not prefix_sharing_plan.is_reuser(batch_index):
-                # Provider: 整行 K/V 都是 unique suffix
+                # Provider: store unique suffix tokens
                 s_packed_k.append(suffix_k)
                 s_packed_v.append(suffix_v)
                 stored_tokens += suffix_len
             else:
-                # Reuser: prefix 在 s_packed 中已存在（由之前的 provider/reuser 构建），
-                # 只追加 suffix
+                # Reuser: shared prefix already in s_packed, only append unique suffix
                 s_packed_k.append(suffix_k)
                 s_packed_v.append(suffix_v)
                 stored_tokens += suffix_len
+                reuse_count += 1
+                reused_tokens += prefix_len
 
         if stats is not None:
             stats.record_attention_kv_build(
                 layer_id=layer_id,
                 store_count=prefix_sharing_plan.batch_size,
-                reuse_count=0,
-                reuse_hit_count=0,
+                reuse_count=reuse_count,
+                reuse_hit_count=reuse_count,
                 reuse_miss_count=0,
                 stored_tokens=stored_tokens,
-                reused_prefix_tokens=0,
-                expanded_kv_tokens=stored_tokens,
+                reused_prefix_tokens=reused_tokens,
+                expanded_kv_tokens=stored_tokens + reused_tokens,
                 valid_q_tokens=layout.total_valid_length,
                 padded_q_tokens=layout.total_padded_length,
             )

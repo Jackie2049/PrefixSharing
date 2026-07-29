@@ -167,7 +167,24 @@ def build_prefix_sharing_micro_batch_verl070(
     seq_lens = [len(s) for s in sequences]
     print(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+    # [PS-TIMING] detect + plan
+    _do_timing = __import__("os").environ.get("PS_TIMING", "0") == "1"
+    if _do_timing:
+        from prefix_sharing.integrations.megatron_runtime import (
+            _ps_timing_record_mb, _ps_timing_end_mb,
+        )
+        _ps_detect_end_ev = _ps_timing_record_mb("detect")
+
+    planner = PrefixSharingPlanner(config)
+
+    if _do_timing:
+        _ps_timing_end_mb(_ps_detect_end_ev)
+        _ps_plan_end_ev = _ps_timing_record_mb("plan")
+
+    prefix_sharing_plan = planner.plan(sequences)
+
+    if _do_timing:
+        _ps_timing_end_mb(_ps_plan_end_ev)
     print(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
@@ -181,6 +198,11 @@ def build_prefix_sharing_micro_batch_verl070(
 
     # --- Path 6: sharing found, trim the original micro-batch ---
     print("[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
+
+    # [PS-TIMING] trim
+    if _do_timing:
+        _ps_trim_end_ev = _ps_timing_record_mb("trim")
+
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -198,6 +220,10 @@ def build_prefix_sharing_micro_batch_verl070(
     trimmed_micro_batch["attention_mask"] = new_attention_mask
     trimmed_micro_batch["position_ids"] = new_position_ids
 
+    if _do_timing:
+        _ps_timing_end_mb(_ps_trim_end_ev)
+        _ps_layout_end_ev = _ps_timing_record_mb("layout")
+
     parallel_info = get_megatron_parallel_info()
     align_size = (
         parallel_info.tp_size * parallel_info.cp_size * 2
@@ -208,6 +234,9 @@ def build_prefix_sharing_micro_batch_verl070(
         kept_position_rows,
         align_size=int(align_size),
     )
+
+    if _do_timing:
+        _ps_timing_end_mb(_ps_layout_end_ev)
     print(
         f"[PS][prepare][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
         f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
@@ -402,6 +431,14 @@ def restore_via_2d_unfold_verl080(
     entropy_nested = output.get("entropy")
     has_entropy = entropy_nested is not None and _is_nested_tensor(entropy_nested)
 
+    # [PS-TIMING] restore_unfold
+    _do_timing = __import__("os").environ.get("PS_TIMING", "0") == "1"
+    if _do_timing:
+        from prefix_sharing.integrations.megatron_runtime import (
+            _ps_timing_record_mb, _ps_timing_end_mb,
+        )
+        _ps_unfold_end_ev = _ps_timing_record_mb("restore_unfold")
+
     original_lengths = plan.original_lengths
     input_keep_ranges = plan.input_keep_ranges
     B = len(original_lengths)
@@ -423,6 +460,11 @@ def restore_via_2d_unfold_verl080(
     # build_kv 式区间拼接：interior 整段从直接 provider 的已恢复 2D 行切片，
     # prefix-last 用 index.label_value + saved logits 重算。identity 列映射
     # （target_2d_pos 即 2D 列号，无 left padding）。
+
+    if _do_timing:
+        _ps_timing_end_mb(_ps_unfold_end_ev)
+        _ps_bulk_end_ev = _ps_timing_record_mb("restore_bulk")
+
     output_2d: dict[str, Any] = {"log_probs": log_probs_2d}
     if entropy_2d is not None:
         output_2d["entropy"] = entropy_2d
@@ -432,10 +474,17 @@ def restore_via_2d_unfold_verl080(
         vocab_parallel_entropy_fn,
     )
 
+    if _do_timing:
+        _ps_timing_end_mb(_ps_bulk_end_ev)
+        _ps_pack_end_ev = _ps_timing_record_mb("restore_pack")
+
     # --- Step 3: 按各 original_lengths 压回 NestedTensor ---
     output["log_probs"] = _fold_2d_to_nested(output_2d["log_probs"], original_lengths)
     if entropy_2d is not None:
         output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
+
+    if _do_timing:
+        _ps_timing_end_mb(_ps_pack_end_ev)
 
     num_prefix_last = len(ctx.prefix_last_restore_indices)
     print(

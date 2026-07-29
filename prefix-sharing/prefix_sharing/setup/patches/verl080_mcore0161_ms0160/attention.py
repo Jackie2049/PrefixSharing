@@ -34,8 +34,23 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         from prefix_sharing.integrations.context import current_prefix_sharing_context
 
         ctx = current_prefix_sharing_context()
+
+        # [PS-TIMING] import helpers (lightweight when PS_TIMING=0)
+        _do_timing = __import__("os").environ.get("PS_TIMING", "0") == "1"
+        if _do_timing:
+            from prefix_sharing.integrations.megatron_runtime import (
+                _ps_timing_record, _ps_timing_end,
+            )
+
         if ctx is None:
-            # ── normal path: 调用原始 forward ──
+            # ── baseline path: 调用原始 forward ──
+            # [PS-TIMING] baseline: entire original_forward as b_total
+            # (QKV+RoPE+FA+proj; cannot subdivide without patching Megatron internals)
+            _ps_b_total_end_ev = None
+            if _do_timing:
+                _layer = int(getattr(self, "layer_number", 0) or 0)
+                _ps_b_total_end_ev = _ps_timing_record("b_total", _layer)
+
             _result = original_forward(
                 self,
                 hidden_states,
@@ -51,6 +66,9 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 sequence_len_offset=sequence_len_offset,
                 inference_params=inference_params,
             )
+            if _do_timing and _ps_b_total_end_ev is not None:
+                _ps_timing_end(_ps_b_total_end_ev)
+
             # ##### [PS-diag] OFF attn_outputs + rope_freqs_off dump #####
             # OFF 走原始 forward，不经 prefix_attention/_apply_positioned_rope，
             # 所以 ON 路径里的 dump_attn_on/dump_rope_freqs_on 不会触发。
@@ -83,6 +101,12 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         # ── prefix-sharing path ──
         # phase 1: training, THD, no fusion, no output gate
 
+        # [PS-TIMING] PS QKV
+        _ps_qkv_end_ev = None
+        if _do_timing:
+            _layer = int(getattr(self, "layer_number", 0) or 0)
+            _ps_qkv_end_ev = _ps_timing_record("qkv", _layer)
+
         # QKV extraction — attention module interaction, not business logic
         query, key, value = self.get_query_key_value_tensors(
             hidden_states,
@@ -94,6 +118,9 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+
+        if _do_timing and _ps_qkv_end_ev is not None:
+            _ps_timing_end(_ps_qkv_end_ev)
 
         # delegate to verified integrations code
         from prefix_sharing.integrations.megatron_runtime import (

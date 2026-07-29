@@ -31,10 +31,42 @@ class PatchRegistry:
     """全局 patch 注册表，install_all() 时一次性应用所有已注册的 patch。"""
 
     _specs: list[PatchSpec] = []
+    _pending_specs: dict[str, list[PatchSpec]] = {}
+    _shared_records: list[PatchRecord] = []
+    _mgr: LoggedPatchManager | None = None
 
     @classmethod
     def register(cls, spec: PatchSpec) -> None:
         cls._specs.append(spec)
+
+    @classmethod
+    def retry_pending(cls, module: object, module_name: str) -> bool:
+        specs = cls._pending_specs.pop(module_name, [])
+        if not specs:
+            return False
+        ok = 0
+        for spec in specs:
+            try:
+                target_obj, attr_name = spec.target_getter(module)
+                original = getattr(target_obj, attr_name)
+                patched = spec.patch_factory(original)
+                if cls._mgr is not None:
+                    cls._mgr.patch_attr(target_obj, attr_name, patched)
+                else:
+                    setattr(target_obj, attr_name, patched)
+                    cls._shared_records.append(
+                        PatchRecord(
+                            target=target_obj,
+                            attr_name=attr_name,
+                            original=original,
+                            replacement=patched,
+                        )
+                    )
+                print(f"[PS] Retry-patched {spec.description} (post-import of {module_name})")
+                ok += 1
+            except (AttributeError, KeyError):
+                print(f"[PS] Retry failed for {spec.description}: target not found in {module_name}")
+        return ok > 0
 
     @classmethod
     def install_all(cls) -> PatchHandle:
@@ -48,8 +80,10 @@ class PatchRegistry:
         所有 pending 最终统一由 import hook 处理。
         import hook 在模块加载完成后才尝试解析目标，确保类定义已完成。
         """
-        shared_records: list[PatchRecord] = []
-        mgr = LoggedPatchManager(shared_records)
+        cls._pending_specs = {}
+        cls._shared_records = []
+        cls._mgr = mgr = LoggedPatchManager(cls._shared_records)
+        shared_records = cls._shared_records
         pending: list[PatchSpec] = []
 
         for spec in cls._specs:
@@ -68,12 +102,14 @@ class PatchRegistry:
                     # 可能是模块正在 import 中，类定义尚未完成。
                     # 加入 pending，等模块完全加载后再 patch。
                     pending.append(spec)
+                    cls._pending_specs.setdefault(spec.module_name, []).append(spec)
                     print(
                         f"[PS] Target not yet defined in {spec.module_name}, "
                         f"deferring patch: {spec.description}"
                     )
             else:
                 pending.append(spec)
+                cls._pending_specs.setdefault(spec.module_name, []).append(spec)
 
         handle = PatchHandle(shared_records, specs=list(cls._specs))
 

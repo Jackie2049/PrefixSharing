@@ -1037,5 +1037,14 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
 # 放在末尾使 PatchRegistry 走"模块已加载 + 目标存在 → 立即 patch"分支，避免 import hook 分支的时序问题。
 try:
     import prefix_sharing
+    # Ray worker compatibility: when this module is imported inside a Ray
+    # actor, sys.modules may not be fully populated when prefix_sharing
+    # auto-activates from within this module body. Explicitly retry any
+    # pending patches for this module after the import completes.
+    import sys as _ps_sys
+    _ps_mod = _ps_sys.modules.get(__name__)
+    if _ps_mod is not None:
+        from prefix_sharing.setup.registry import PatchRegistry
+        PatchRegistry.retry_pending(_ps_mod, __name__)
 except ModuleNotFoundError:
     pass

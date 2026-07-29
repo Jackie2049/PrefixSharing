@@ -52,6 +52,11 @@ def _describe_batch(batch: Any) -> str:
     return ",".join(pieces)
 
 
+def _ps_timing_is_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("PS_TIMING", "0") == "1"
+
+
 def patch_verl_forward_step(original_forward_step: Any) -> Any:
     """创建 MegatronEngineWithLMHead.forward_step 的 patch wrapper。"""
 
@@ -63,9 +68,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         postprocess_micro_batch_func,
     ):
         # ── 获取原始 micro-batch ──
-        # batch_iter 来自外层 engine 的 forward_step 调用方。
-        # 消费 batch，由 build_prefix_sharing_micro_batch_verl080 进行物理裁剪
-        # 返回 trimmed_batch（物理裁剪后的 micro-batch）和 ps_state。
         _ps_forward_step_probe("enter")
         _ps_forward_step_probe("before_next_batch")
         original_batch = next(batch_iter)
@@ -118,10 +120,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             _ps_forward_step_probe("skip_prepare_prefix_sharing_disabled")
 
         # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
-        # 仅当 PREFIX_SHARING_DIAG_DUMP 设定时触发，否则零开销。
-        # ON: prefix_lens / original_lengths 取自 plan；
-        # OFF: prefix_lens 全0、original_lengths 从 input_ids NestedTensor offsets diff 推。
-        # cu_seqlens 取送进 forward 的 input_ids NestedTensor offsets（ON=裁剪后 packed 边界, OFF=完整）。
         import os as _os
         if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump_verl080 import (
@@ -142,22 +140,10 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _orig_lens = [int(d) for d in _diffs]
                     _prefix_lens = [0] * len(_orig_lens)
                 dump_meta_verl080(_prefix_lens, nested_offsets_to_cu(_ids_nested))
-                # attention_mask + label_mask：两种 log_probs 对比范围，都不含越界预测位
-                # （POS L_i-1，其 logp 预测不存在的 token[L_i]）。对齐 restore 后 log_probs
-                # 的 [B, L_max] 紧凑坐标系。
-                #   attention_mask：[0:L_i-1) prompt 区+prompt-last+response 区（整体 restore 验证）
-                #   label_mask：[prompt-last:L_i-1) prompt-last+response 区（PPO loss 范围）
                 _Lmax_lm = max(_orig_lens) if _orig_lens else 0
-                # tag 与 logprobs 一致（接入点2 用 model.training 区分 old/train），
-                # 保证 mask 和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max）。
                 _tag_lm = "train" if model.training else "old"
-                # attention_mask 仅依赖 _orig_lens，不需要 loss_mask。
                 dump_attention_mask_verl080(
                     build_attention_mask_2d(_orig_lens, _Lmax_lm), _tag_lm)
-                # label_mask 用 response_lens（每行 response token 数）。verl080 padding 后
-                # loss_mask = response_mask 是 2D left-right padded（非 NestedTensor，见
-                # verl padding.py:71），不能走 nested_to_2d_full；但 response token 数 =
-                # loss_mask 行 sum，与坐标系无关，据此推 prompt_len 最稳（2D/NestedTensor 均适用）。
                 _lm = original_batch.get("loss_mask")
                 if _lm is not None:
                     if _is_nested_tensor(_lm):
@@ -167,8 +153,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                             int(_lm_val[_lm_off[i]:_lm_off[i + 1]].sum())
                             for i in range(len(_orig_lens))]
                     else:
-                        # .long() 免 import torch（本文件顶部未导入 torch）；
-                        # .cpu() 防御 on-device tensor 的 tolist()
                         _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
                     dump_label_mask_verl080(
                         build_label_mask_2d(_response_lens, _orig_lens, _Lmax_lm),
@@ -198,9 +182,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 postprocess_micro_batch_func,
             )
             # v080 restore：在 context 仍激活时重组 reuser prefix 区段。
-            # forward_step 返回 (output_dict, partial(postprocess_func))，
-            # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
-            # 会检查 context / restore_indices，无 restore 需求时 early return。
             if ps_state is not None:
                 from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
                 from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -214,26 +195,37 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     vocab_parallel_log_probs_from_logits,
                     vocab_parallel_entropy,
                 )
-                # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
-                # restore 已消费完毕）。clear 职责在此，不在包装函数内。
+
+                # 释放 vocab 维 logits
                 ctx = current_prefix_sharing_context()
                 if ctx is not None:
                     ctx.prefix_last_logits_saved.clear()
                 output = (output_dict, postprocess_fn)
+
+            # [PS-TIMING] single synchronize + print per-layer/per-mb summary (rank0 only)
+            _ps_do_timing = _ps_timing_is_enabled()
+            if _ps_do_timing:
+                import torch as _t
+                _t.npu.synchronize()
+                try:
+                    from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
+                    _pi = get_megatron_parallel_info()
+                    _rank = _pi.global_rank
+                except Exception:
+                    _rank = 0
+                _forward_id = (ps_state.prefix_sharing_plan.forward_id
+                               if ps_state is not None else 0)
+                if _rank == 0:
+                    from prefix_sharing.integrations.megatron_runtime import ps_print_timing_summary
+                    ps_print_timing_summary(_forward_id, _rank)
+
             # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
-            # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
-            # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
             import os as _os2
             if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
                     nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
                 )
                 from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-                # 对齐 v070: tag = "old" if forward_only else "train"。
-                # forward_step 拿不到 forward_only，用 model.training 等价区分
-                # （eval_mode→training=False→"old" 对应 old_logp 阶段；
-                #  train_mode→training=True→"train" 对应 update_actor 阶段）。
-                # 这样一次 run 自动产出 logprobs_old + logprobs_train 两份，不互相覆盖。
                 _tag = "train" if model.training else "old"
                 _out_dict, _ = output
                 _lp = _out_dict.get("log_probs")

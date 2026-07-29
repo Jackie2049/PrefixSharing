@@ -36,6 +36,7 @@ from functools import lru_cache
 from typing import Any, List
 import importlib
 
+import os
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
@@ -156,7 +157,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
                 BSHD mask.  Falls back to BSH if set to False.
         """
         self._torch_ref = TorchReferenceBackend()
-        self._use_tnd = use_tnd
+        self._use_tnd = os.getenv("PS_USE_TND", "1") == "1" if use_tnd else False
 
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         config.validate(model_config=model_config)
@@ -255,9 +256,9 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         torch = _torch()
         npu_fusion_attention = _import_npu_fusion_attention()
 
-        q = self._ensure_3d_thd(query, "query")
-        k = self._ensure_3d_thd(key, "key")
-        v = self._ensure_3d_thd(value, "value")
+        q = self._ensure_3d_thd(query, "query").contiguous()
+        k = self._ensure_3d_thd(key, "key").contiguous()
+        v = self._ensure_3d_thd(value, "value").contiguous()
 
         plan = prefix_sharing_plan
         total_q = sum(plan.s_packed_q_lengths)
@@ -278,11 +279,19 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         num_q_heads = q.shape[1]
         head_dim = q.shape[-1]
 
-        # --- Mask: reuse planner's cached global custom mask, invert polarity ---
-        # planner: (total_q, s_packed_length), True = visible
-        # NPU:     (total_q, s_packed_length), True = masked
-        global_mask = plan.build_global_custom_mask(q.device)
-        atten_mask = ~global_mask
+        # --- Mask: use cached inverted mask from plan (True = masked) ---
+        # First layer builds + caches both polarities; layers 2-24 hit cache.
+        _ps_do = __import__("os").environ.get("PS_TIMING", "0") == "1"
+        if _ps_do:
+            from prefix_sharing.integrations.megatron_runtime import (
+                _ps_timing_is_enabled, _ps_timing_record, _ps_timing_end,
+            )
+            _ps_mask_end_ev = _ps_timing_record("mask", kwargs.get("layer_id", 0))
+        plan.build_global_custom_mask(q.device)  # caches both polarities in planner
+        atten_mask = plan._global_custom_mask_inverted
+        if _ps_do:
+            _ps_timing_end(_ps_mask_end_ev)
+            _ps_fa_end_ev = _ps_timing_record("fa", kwargs.get("layer_id", 0))
 
         # --- Invoke TND npu_fusion_attention ---
         scale = kwargs.get("softmax_scale") or (1.0 / math.sqrt(head_dim))
@@ -291,10 +300,10 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
 
         try:
             result = npu_fusion_attention(
-                q, k, v,
+                q if "npu" in str(q.device) else q.npu(), k if "npu" in str(k.device) else k.npu(), v if "npu" in str(v.device) else v.npu(),
                 num_q_heads,
                 "TND",
-                atten_mask=atten_mask,
+                atten_mask=atten_mask if "npu" in str(atten_mask.device) else atten_mask.npu(),
                 scale=scale,
                 keep_prob=keep_prob,
                 sparse_mode=1,
@@ -302,6 +311,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
                 actual_seq_kvlen=[s_packed_length],
             )
         except Exception as exc:
+            print(f"[PS][TND] Inner error: {exc}", flush=True)
             raise FlashBackendValidationError(
                 f"npu_fusion_attention (TND s_packed) failed: "
                 f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
@@ -309,6 +319,9 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
                 f"total_q={total_q}, s_packed_length={s_packed_length}, "
                 f"num_q_heads={num_q_heads}"
             ) from exc
+
+        if _ps_do:
+            _ps_timing_end(_ps_fa_end_ev)
 
         output = result[0] if isinstance(result, (tuple, list)) else result
         return output  # Already (total_q, N_q, D) — no unpacking needed
@@ -410,7 +423,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
                 q_bsh, k_bsh, v_bsh,
                 num_q_heads,
                 "BSH",
-                atten_mask=atten_mask,
+                atten_mask=atten_mask if "npu" in str(atten_mask.device) else atten_mask.npu(),
                 scale=scale,
                 keep_prob=keep_prob,
                 sparse_mode=1,

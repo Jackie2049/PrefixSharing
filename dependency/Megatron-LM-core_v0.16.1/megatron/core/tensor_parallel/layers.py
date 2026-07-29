@@ -284,7 +284,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            output_parallel = F.embedding(masked_input, self.weight).contiguous()
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0

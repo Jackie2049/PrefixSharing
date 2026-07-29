@@ -45,6 +45,14 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         # restore 侧重算 logp(exp(L-max), label) ≠ logp(L, label)，logp 会完全错。
         # 必须在 original_fn 之前 clone 原始 logits（dump 同理）。
         if ctx is not None and ctx.prefix_last_restore_indices:
+            # [PS-TIMING] save_logits
+            _do_timing = __import__("os").environ.get("PS_TIMING", "0") == "1"
+            if _do_timing:
+                from prefix_sharing.integrations.megatron_runtime import (
+                    _ps_timing_record_mb, _ps_timing_end_mb,
+                )
+                _ps_save_end_ev = _ps_timing_record_mb("save_logits")
+
             # logits 形态可能是 [N, V//tp] 或 [N, 1, V//tp]，统一 view 成 2D。
             # N = 裁剪后 packed 1D 总长度（provider 行完整含 prefix-last token）。
             logits_2d = logits.view(-1, logits.size(-1))
@@ -93,6 +101,9 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                 # key 约定：(reuser_row, target_2d_pos)，与 restore_reuser_prefix_columns_2d
                 # 的 saved_key = (reuser_row, valid_col) 对齐。
                 ctx.prefix_last_logits_saved[key] = saved
+
+            if _do_timing:
+                _ps_timing_end_mb(_ps_save_end_ev)
 
         # 调原始函数（此后 logits 被 in-place 改成 exp(L-max)，但 dump/save 已完成）
         log_probs = original_fn(logits, labels)
