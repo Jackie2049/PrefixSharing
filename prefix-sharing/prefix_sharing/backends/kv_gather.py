@@ -52,30 +52,20 @@ from prefix_sharing.core.prefix_store import (
 _CACHE_ATTR = "_kv_gather_index_cache"
 
 
-def _resolve_expanded_span(
-    plan: PrefixSharingPlan,
-    row_starts: list[int],
-    row: int,
+def _truncate_segments(
+    segments: list[tuple[int, int]],
     length: int,
 ) -> list[tuple[int, int]]:
-    """Map ``expanded_row[row][0:length]`` onto packed K/V coordinates.
-
-    Returns a list of ``(packed_start, segment_length)`` segments in
-    expanded-position order.  A reuser's packed row holds only its kept
-    suffix, so expanded positions ``>= prefix_len`` map to the start of its
-    own packed row; positions inside the prefix recurse into the provider
-    chain until a non-reuser row, whose packed row holds its full sequence.
-    """
-    if length <= 0:
-        return []
-    if not plan.is_reuser(row):
-        return [(row_starts[row], length)]
-    prefix_len = plan.prefix_lens[row]
-    if length <= prefix_len:
-        return _resolve_expanded_span(plan, row_starts, plan.provider_index[row], length)
-    segments = _resolve_expanded_span(plan, row_starts, plan.provider_index[row], prefix_len)
-    segments.append((row_starts[row], length - prefix_len))
-    return segments
+    """Take the first ``length`` tokens of a segment list (expanded order)."""
+    out: list[tuple[int, int]] = []
+    remaining = length
+    for start, seg_len in segments:
+        if remaining <= 0:
+            break
+        take = min(seg_len, remaining)
+        out.append((start, take))
+        remaining -= take
+    return out
 
 
 def _build_gather_index(
@@ -83,20 +73,36 @@ def _build_gather_index(
     layout: PackedBatchLayout,
     device: Any,
 ) -> torch.Tensor:
-    """Build the packed→expanded gather index tensor for one micro-batch."""
+    """Build the packed→expanded gather index tensor for one micro-batch.
+
+    Single forward pass over rows: the online-detector invariant (a provider
+    always precedes its reusers, the same invariant the copy-based build_kv
+    relies on for its store lookups) means each row's expanded-row segment
+    decomposition is already computed when a later row reuses it.  A
+    reuser's prefix segments are therefore just its provider's expanded
+    segments truncated to ``prefix_len`` — no recursion, no re-resolution
+    of ancestor chains.
+    """
     row_starts = list(layout.cu_seqlens[:-1])
     segments: list[tuple[int, int]] = []
+    expanded_segments_by_row: list[list[tuple[int, int]]] = []
     for row in range(plan.batch_size):
         valid_length = layout.valid_lengths[row]
         if plan.is_reuser(row):
+            provider = plan.provider_index[row]
+            if provider >= row:
+                raise RuntimeError(
+                    f"provider index {provider} must precede reuser row {row} "
+                    "(online-detector invariant violated)"
+                )
             prefix_len = plan.prefix_lens[row]
-            segments.extend(
-                _resolve_expanded_span(plan, row_starts, plan.provider_index[row], prefix_len)
-            )
-            if valid_length > 0:
-                segments.append((row_starts[row], valid_length))
-        elif valid_length > 0:
-            segments.append((row_starts[row], valid_length))
+            prefix_segments = _truncate_segments(expanded_segments_by_row[provider], prefix_len)
+            own_segments = [(row_starts[row], valid_length)] if valid_length > 0 else []
+            row_segments = prefix_segments + own_segments
+        else:
+            row_segments = [(row_starts[row], valid_length)] if valid_length > 0 else []
+        expanded_segments_by_row.append(row_segments)
+        segments.extend(row_segments)
 
     expanded_total = sum(length for _, length in segments)
     if expanded_total != sum(plan.expanded_lengths_kv):
