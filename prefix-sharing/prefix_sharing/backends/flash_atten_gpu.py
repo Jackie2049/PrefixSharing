@@ -112,10 +112,12 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
             )
         from prefix_sharing.backends.kv_gather import build_kv_via_gather
 
+        # The gather path resolves reuse chains in packed coordinates and
+        # never touches the store / tp_rank; layer_id is only used for stats.
         return build_kv_via_gather(
-            key, value, store, prefix_sharing_plan,
+            key, value, prefix_sharing_plan,
             packed_batch_layout=packed_batch_layout,
-            layer_id=layer_id, tp_rank=tp_rank,
+            layer_id=layer_id,
             stats=stats,
         )
 
