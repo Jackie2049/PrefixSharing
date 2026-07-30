@@ -9,6 +9,7 @@ shorter Q (suffix only) but full-length KV (prefix + suffix).
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -40,10 +41,17 @@ def _import_flash_attn_varlen() -> Any:
 class GpuFlashAttentionBackend(FlashAttentionMixin):
     """CUDA/GPU Flash Attention 2 backend.
 
-    ``apply_rope`` and ``build_kv`` are delegated to
-    :class:`TorchReferenceBackend` because RoPE position injection and KV
-    cache store/load are pure PyTorch operations that do not benefit from
-    fused attention kernels.
+    ``apply_rope`` is delegated to :class:`TorchReferenceBackend` because
+    RoPE position injection is a pure PyTorch operation that does not
+    benefit from fused attention kernels.
+
+    ``build_kv`` uses the gather-based expansion in
+    :mod:`prefix_sharing.backends.kv_gather` (single ``index_select`` per
+    K/V, one ``index_add`` in backward) instead of the reference
+    ``new_empty`` + ``copy_`` loop, whose per-copy ``CopySlices`` autograd
+    nodes made the backward launch ~1.5k serial small kernels per
+    micro-batch.  Set ``PREFIX_SHARING_FA_BUILD_KV=copy`` to fall back to
+    the reference copy loop (A/B debugging).
 
     Only ``attention()`` is replaced by the Flash Attention 2 kernel.
     """
@@ -70,7 +78,9 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         _import_flash_attn_varlen()
 
     # ------------------------------------------------------------------
-    # RoPE & KV build: reuse the reference implementation
+    # RoPE: reuse the reference implementation
+    # KV build: gather-based expansion (see kv_gather module docstring);
+    # PREFIX_SHARING_FA_BUILD_KV=copy falls back to the reference copy loop.
     # ------------------------------------------------------------------
     def apply_rope(
         self,
@@ -93,7 +103,16 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         tp_rank: int = 0,
         stats: Any | None = None,
     ) -> tuple[Any, Any]:
-        return self._torch_ref.build_kv(
+        if os.environ.get("PREFIX_SHARING_FA_BUILD_KV", "gather") == "copy":
+            return self._torch_ref.build_kv(
+                key, value, store, prefix_sharing_plan,
+                packed_batch_layout=packed_batch_layout,
+                layer_id=layer_id, tp_rank=tp_rank,
+                stats=stats,
+            )
+        from prefix_sharing.backends.kv_gather import build_kv_via_gather
+
+        return build_kv_via_gather(
             key, value, store, prefix_sharing_plan,
             packed_batch_layout=packed_batch_layout,
             layer_id=layer_id, tp_rank=tp_rank,
