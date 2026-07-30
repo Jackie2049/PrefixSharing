@@ -21,8 +21,9 @@ Semantics are identical to the copy-based reference:
   valid suffix tokens.  Transitive reuse chains are resolved directly
   against the packed (unexpanded) K/V coordinates, so no store load/store
   round-trip is needed for the KV content itself;
-* the store is still populated with per-row expanded views so diagnostics
-  and external consumers observe the same state as with the copy path;
+* the store is **not** touched: its only readers were the copy loop
+  itself and the DeltaNet path, so publishing per-row expanded views
+  would be write-only dead work;
 * gradients flow to the packed K/V rows that produced each token: the
   provider prefix rows receive the sum of all reusers' contributions via
   the gather's ``index_add`` backward (CUDA uses atomicAdd — values are
@@ -43,11 +44,6 @@ import torch
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
-from prefix_sharing.core.prefix_store import (
-    PREFIX_STATE_TYPE_ATTENTION_KV,
-    PrefixActivationSlotId,
-    PrefixAttentionStore,
-)
 
 _CACHE_ATTR = "_kv_gather_index_cache"
 
@@ -145,20 +141,25 @@ def get_kv_gather_index(
 def build_kv_via_gather(
     key: Any,
     value: Any,
-    store: PrefixAttentionStore,
     prefix_sharing_plan: PrefixSharingPlan,
     *,
     packed_batch_layout: Any | None = None,
     layer_id: int,
-    tp_rank: int = 0,
     stats: PrefixSharingStats | None = None,
 ) -> tuple[Any, Any]:
     """Expand packed K/V to the plan's expanded layout via one gather.
 
     Drop-in replacement for the copy-loop assembly in
-    :meth:`TorchReferenceBackend.build_kv`, with identical output values,
-    store contents, and stats accounting.  See the module docstring for the
-    autograd motivation.
+    :meth:`TorchReferenceBackend.build_kv`, with identical output values
+    and stats accounting.  See the module docstring for the autograd
+    motivation.
+
+    Unlike the copy path, this function has no ``store`` parameter at all:
+    transitive reuse is resolved at index-build time directly in packed
+    coordinates, and the store's only readers were the copy loop itself
+    and the DeltaNet path.  ``layer_id`` is likewise retained only for
+    stats accounting (the gather itself is layer-independent — the index
+    is shared by all layers).
     """
     plan = prefix_sharing_plan
     layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
@@ -167,30 +168,9 @@ def build_kv_via_gather(
     expanded_key = key.index_select(0, index)
     expanded_value = value.index_select(0, index)
 
-    # Publish every row's expanded view with the same slot ids / prefix_len
-    # semantics as the reference build_kv, so store consumers (diagnostics,
-    # chained-reuse analysis tools) observe identical state.  These are
-    # views into the gather output and stay inside the autograd graph.
     reuse_count = 0
     reused_prefix_tokens = 0
     for batch_index in range(plan.batch_size):
-        slot_id = PrefixActivationSlotId(
-            plan.forward_id,
-            plan.micro_batch_id,
-            layer_id,
-            batch_index,
-            PREFIX_STATE_TYPE_ATTENTION_KV,
-            tp_rank,
-        )
-        row_start = plan.cu_seqlens_kv[batch_index]
-        row_end = plan.cu_seqlens_kv[batch_index + 1]
-        store.store(
-            slot_id,
-            key_tensor=expanded_key[row_start:row_end],
-            value_tensor=expanded_value[row_start:row_end],
-            prefix_len=row_end - row_start,
-            overwrite=True,
-        )
         if plan.is_reuser(batch_index):
             reuse_count += 1
             reused_prefix_tokens += int(plan.prefix_lens[batch_index])

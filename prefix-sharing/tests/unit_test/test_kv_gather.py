@@ -5,7 +5,9 @@ copy-loop assembly in :meth:`TorchReferenceBackend.build_kv`:
 
 * identical expanded K/V values (bitwise — both copy the same source rows);
 * equivalent gradients w.r.t. the packed K/V inputs;
-* identical store contents (per-row expanded views, in-graph);
+* no store at all: the function has no ``store`` parameter (reuse chains
+  resolve in packed coordinates at index-build time; the store's only
+  readers were the copy loop and the DeltaNet path);
 * identical stats accounting;
 * transitive reuse chains and TP-padded layouts.
 
@@ -23,11 +25,7 @@ from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.core.prefix_store import (
-    PREFIX_STATE_TYPE_ATTENTION_KV,
-    PrefixActivationSlotId,
-    PrefixAttentionStore,
-)
+from prefix_sharing.core.prefix_store import PrefixAttentionStore
 
 
 def _make_plan(batch_sizes, prefix_lens):
@@ -66,17 +64,15 @@ def _make_layout(plan, align_size=1):
 def _run_both(key, value, plan, layout, *, layer_id=0, tp_rank=0):
     """Run copy-based and gather-based build_kv on identical inputs."""
     ref_backend = TorchReferenceBackend()
-    copy_store = PrefixAttentionStore()
-    gather_store = PrefixAttentionStore()
     copy_k, copy_v = ref_backend.build_kv(
-        key, value, copy_store, plan,
+        key, value, PrefixAttentionStore(), plan,
         packed_batch_layout=layout, layer_id=layer_id, tp_rank=tp_rank,
     )
     gather_k, gather_v = build_kv_via_gather(
-        key, value, gather_store, plan,
-        packed_batch_layout=layout, layer_id=layer_id, tp_rank=tp_rank,
+        key, value, plan,
+        packed_batch_layout=layout, layer_id=layer_id,
     )
-    return (copy_k, copy_v, copy_store), (gather_k, gather_v, gather_store)
+    return (copy_k, copy_v), (gather_k, gather_v)
 
 
 def _random_kv(total, num_heads=2, head_dim=8, dtype=torch.float32, seed=42, requires_grad=False):
@@ -96,7 +92,7 @@ def test_gather_matches_copy_simple_reuse():
     layout = _make_layout(plan)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -108,7 +104,7 @@ def test_gather_matches_copy_transitive_chain():
     layout = _make_layout(plan)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -119,7 +115,7 @@ def test_gather_matches_copy_multi_providers_and_reusers():
     layout = _make_layout(plan)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -130,7 +126,7 @@ def test_gather_matches_copy_no_sharing():
     layout = _make_layout(plan)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -142,7 +138,7 @@ def test_gather_matches_copy_with_tp_padding():
     assert layout.has_padding
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     # Expanded output follows semantic lengths (padding stripped), bitwise equal.
     assert gather_k.shape[0] == sum(plan.expanded_lengths_kv)
@@ -155,7 +151,7 @@ def test_gather_matches_copy_transitive_chain_with_padding():
     layout = _make_layout(plan, align_size=4)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -168,7 +164,7 @@ def test_gather_matches_copy_suffix_only_prefix_row():
     layout = _make_layout(plan)
     key, value = _random_kv(layout.total_padded_length)
 
-    (copy_k, copy_v, _), (gather_k, gather_v, _) = _run_both(key, value, plan, layout)
+    (copy_k, copy_v), (gather_k, gather_v) = _run_both(key, value, plan, layout)
 
     assert torch.equal(gather_k, copy_k)
     assert torch.equal(gather_v, copy_v)
@@ -199,7 +195,7 @@ def test_gather_gradients_match_copy(batch_sizes, prefix_lens):
         packed_batch_layout=layout, layer_id=0,
     )
     gather_k, gather_v = build_kv_via_gather(
-        key2, value2, PrefixAttentionStore(), plan,
+        key2, value2, plan,
         packed_batch_layout=layout, layer_id=0,
     )
 
@@ -227,7 +223,7 @@ def test_gather_backward_kernel_shape_is_single_scatter():
     key, value = _random_kv(layout.total_padded_length, requires_grad=True)
 
     gather_k, _ = build_kv_via_gather(
-        key, value, PrefixAttentionStore(), plan,
+        key, value, plan,
         packed_batch_layout=layout, layer_id=0,
     )
     assert gather_k.grad_fn is not None
@@ -235,32 +231,17 @@ def test_gather_backward_kernel_shape_is_single_scatter():
 
 
 # ------------------------------------------------------------------
-# store publishing semantics
+# store contract: the gather path has no store parameter at all
 # ------------------------------------------------------------------
 
 
-def test_gather_store_contents_match_copy():
-    plan = _make_plan([8, 7, 6], [0, 3, 5])
-    layout = _make_layout(plan)
-    key, value = _random_kv(layout.total_padded_length, requires_grad=True)
+def test_gather_has_no_store_parameter():
+    """Gather resolves reuse chains in packed coordinates; the store's only
+    readers were the copy loop and the DeltaNet path.  Lock the contract:
+    build_kv_via_gather does not accept a store."""
+    import inspect
 
-    (copy_k, copy_v, copy_store), (gather_k, gather_v, gather_store) = _run_both(
-        key, value, plan, layout, layer_id=2, tp_rank=1,
-    )
-
-    assert gather_store.size == copy_store.size
-    for row in range(plan.batch_size):
-        slot_id = PrefixActivationSlotId(
-            plan.forward_id, plan.micro_batch_id, 2, row,
-            PREFIX_STATE_TYPE_ATTENTION_KV, 1,
-        )
-        copy_entry = copy_store.load(slot_id)
-        gather_entry = gather_store.load(slot_id)
-        assert torch.equal(gather_entry.key_tensor, copy_entry.key_tensor)
-        assert torch.equal(gather_entry.value_tensor, copy_entry.value_tensor)
-        assert gather_entry.prefix_len == copy_entry.prefix_len
-        assert gather_entry.key_tensor.requires_grad
-        assert gather_entry.value_tensor.requires_grad
+    assert "store" not in inspect.signature(build_kv_via_gather).parameters
 
 
 # ------------------------------------------------------------------
@@ -288,7 +269,7 @@ def test_gather_stats_match_copy():
         packed_batch_layout=layout, layer_id=0, stats=copy_stats,
     )
     build_kv_via_gather(
-        key, value, PrefixAttentionStore(), plan,
+        key, value, plan,
         packed_batch_layout=layout, layer_id=0, stats=gather_stats,
     )
 
