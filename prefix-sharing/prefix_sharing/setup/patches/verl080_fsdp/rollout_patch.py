@@ -55,7 +55,7 @@ def _wrap_logger_for_perf_dir(trainer: Any) -> None:
         perf_dir = os.environ.get("PREFIX_SHARING_PERF_DIR", "").strip()
         if perf_dir:
             try:
-                step_dir = Path(perf_dir) / f"step_{step}"
+                step_dir = Path(perf_dir) / f"step_{step - 1}"
                 step_dir.mkdir(parents=True, exist_ok=True)
                 out_path = step_dir / "verl_metrics.json"
                 serializable = {}
