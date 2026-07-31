@@ -31,42 +31,48 @@ def _apply_rollout_env(rollout_obj: Any) -> None:
 
 
 def _wrap_logger_for_perf_dir(trainer: Any) -> None:
-    """If PREFIX_SHARING_PERF_DIR is set, wrap trainer.logger.log so that each
-    call also dumps the metrics dict to ``{PERF_DIR}/step_{i}/verl_metrics.json``.
+    """Patch ``Tracking.log`` (class-level, once) so that each call dumps the
+    metrics dict to ``{PREFIX_SHARING_PERF_DIR}/step_{i}/verl_metrics.json``
+    when the env var is set at call time.
 
-    This co-locates verl's coarse step-level timing (timing_s/*, perf/*) with
-    the profiler's fine-grained per-micro-batch summaries under the same dir.
+    Class-level patch is necessary because ``RayPPOTrainer.fit()`` creates a
+    fresh ``Tracking`` instance internally, so wrapping the instance before
+    ``fit()`` would be discarded.  The env var is read inside the wrapper at
+    every ``log()`` call (not captured in a closure), so the dump path always
+    reflects the current process environment.
     """
-    perf_dir = os.environ.get("PREFIX_SHARING_PERF_DIR", "").strip()
-    if not perf_dir:
+    try:
+        from verl.utils.tracking import Tracking
+    except ImportError:
         return
 
-    logger = getattr(trainer, "logger", None)
-    if logger is None or getattr(logger, "_ps_verl_metrics_wrapped", False):
+    if getattr(Tracking, "_ps_verl_metrics_wrapped", False):
         return
 
-    orig_log = logger.log
+    orig_log = Tracking.log
 
-    def _log_with_dump(data: dict, step: int, *args: Any, **kwargs: Any) -> Any:
-        try:
-            step_dir = Path(perf_dir) / f"step_{step}"
-            step_dir.mkdir(parents=True, exist_ok=True)
-            out_path = step_dir / "verl_metrics.json"
-            serializable = {}
-            for k, v in data.items():
-                try:
-                    json.dumps(v)
-                    serializable[k] = v
-                except (TypeError, ValueError):
-                    serializable[k] = str(v)
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(serializable, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass  # never let metrics dumping crash training
-        return orig_log(data, step, *args, **kwargs)
+    def _log_with_dump(self: Any, data: dict, step: int, *args: Any, **kwargs: Any) -> Any:
+        perf_dir = os.environ.get("PREFIX_SHARING_PERF_DIR", "").strip()
+        if perf_dir:
+            try:
+                step_dir = Path(perf_dir) / f"step_{step}"
+                step_dir.mkdir(parents=True, exist_ok=True)
+                out_path = step_dir / "verl_metrics.json"
+                serializable = {}
+                for k, v in data.items():
+                    try:
+                        json.dumps(v)
+                        serializable[k] = v
+                    except (TypeError, ValueError):
+                        serializable[k] = str(v)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(serializable, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass  # never let metrics dumping crash training
+        return orig_log(self, data, step, *args, **kwargs)
 
-    logger.log = _log_with_dump
-    logger._ps_verl_metrics_wrapped = True
+    Tracking.log = _log_with_dump
+    Tracking._ps_verl_metrics_wrapped = True
 
 
 def patch_ray_trainer_fit(original_fit: Any) -> Any:
