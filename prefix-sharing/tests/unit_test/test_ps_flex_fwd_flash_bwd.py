@@ -49,7 +49,7 @@ def _make_layout(plan, align_size=1):
     return PackedBatchLayout.from_kept_position_rows(rows, align_size=align_size)
 
 
-def _random_qkv(total, num_heads=4, head_dim=64, dtype=torch.float32, seed=42, requires_grad=False):
+def _random_qkv(total, num_heads=4, head_dim=64, dtype=torch.bfloat16, seed=42, requires_grad=False):
     torch.manual_seed(seed)
     q = torch.randn(total, num_heads, head_dim, dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(total, num_heads, head_dim, dtype=dtype, requires_grad=requires_grad)
