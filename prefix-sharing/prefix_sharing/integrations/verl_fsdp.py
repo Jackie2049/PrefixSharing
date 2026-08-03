@@ -385,6 +385,21 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
+    # Pre-build BlockMask for FlexAttention-based backends inside the KV phase
+    # so that the mask compilation cost is not charged to attn.comp on layer 0.
+    # The cache lives on the backend instance (per-micro-batch), so only the
+    # first layer pays the build cost.
+    block_mask = None
+    if not getattr(ctx.attention_backend.capabilities, "requires_kv_expansion", True):
+        from prefix_sharing.backends.prefix_block_mask import get_or_create_block_mask
+
+        block_mask_cache = getattr(ctx.attention_backend, "_block_mask_cache", None)
+        block_mask = get_or_create_block_mask(
+            plan,
+            device=packed_query.device,
+            cache=block_mask_cache,
+        )
+
     # Backends that declare requires_kv_expansion=False consume packed K/V
     # directly (e.g. FlexAttention-based backends).  All others must expand
     # the KV layout before calling attention().
@@ -431,6 +446,7 @@ def _run_packed_attention_runtime(
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
+        block_mask=block_mask,
     )
     # [PS-perf] start — per-layer compute stop —————————————
     if _per_layer_ok:

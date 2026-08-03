@@ -458,11 +458,13 @@ class PSFlexFwdFlashBwdBackend(FlashAttentionMixin):
         )
         index = get_kv_gather_index(prefix_sharing_plan, layout, device)
 
-        block_mask = get_or_create_block_mask(
-            prefix_sharing_plan,
-            device=device,
-            cache=self._block_mask_cache,
-        )
+        block_mask = kwargs.pop("block_mask", None)
+        if block_mask is None:
+            block_mask = get_or_create_block_mask(
+                prefix_sharing_plan,
+                device=device,
+                cache=self._block_mask_cache,
+            )
 
         fa_kwargs = {
             "dropout_p": kwargs.get("dropout_p", 0.0),
