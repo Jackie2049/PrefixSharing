@@ -231,18 +231,20 @@ def test_gradient_matches_flash_attention_gather_backend():
     q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
 
     def run(backend_cls):
-        _q, _k, _v = q.cuda(), k.cuda(), v.cuda()
+        _q, _k_leaf, _v_leaf = q.cuda(), k.cuda(), v.cuda()
         backend = backend_cls()
         if getattr(backend.capabilities, "requires_kv_expansion", True):
             from prefix_sharing.core.prefix_store import PrefixAttentionStore
             _k, _v = backend.build_kv(
-                _k, _v, PrefixAttentionStore(), plan,
+                _k_leaf, _v_leaf, PrefixAttentionStore(), plan,
                 packed_batch_layout=layout, layer_id=0,
             )
+        else:
+            _k, _v = _k_leaf, _v_leaf
         out = backend.attention(_q, _k, _v, plan, packed_batch_layout=layout)
         loss = out.sum()
         loss.backward()
-        return _q.grad, _k.grad, _v.grad
+        return _q.grad, _k_leaf.grad, _v_leaf.grad
 
     dq_fa, dk_fa, dv_fa = run(GpuFlashAttentionBackend)
     dq_hy, dk_hy, dv_hy = run(PSFlexFwdFlashBwdBackend)

@@ -259,7 +259,10 @@ class PSFlexFwdFlashBwdFunction(torch.autograd.Function):
         _fa_version = _flash_attn_version()
 
         dropout_p = fa_kwargs.get("dropout_p", 0.0)
-        softmax_scale = fa_kwargs.get("softmax_scale", None)
+        softmax_scale = fa_kwargs.get("softmax_scale")
+        if softmax_scale is None:
+            head_dim = q.shape[-1]
+            softmax_scale = 1.0 / (head_dim ** 0.5)
         causal = fa_kwargs.get("causal", True)
         window_size = fa_kwargs.get("window_size", (-1, -1))
         softcap = fa_kwargs.get("softcap", 0.0)
