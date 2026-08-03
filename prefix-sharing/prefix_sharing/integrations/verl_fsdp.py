@@ -8,6 +8,7 @@ The helpers stay framework-light enough for CPU tests, while the explicit
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from typing import Any
 
@@ -257,6 +258,34 @@ def build_prefix_sharing_micro_batch_fsdp(
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
     )
+
+    # Precompute BlockMask once per micro-batch for FlexAttention-based backends.
+    # Doing this at build time keeps the mask compilation cost out of per-layer
+    # attention timings; it is reported as PHASE_ATTN_MASK instead.
+    attention_backend = runtime_state.attention_backend
+    if not getattr(attention_backend.capabilities, "requires_kv_expansion", True):
+        from prefix_sharing.backends.prefix_block_mask import get_or_create_block_mask
+        from prefix_sharing.tools.perf_profiler import PerfProfiler
+
+        profiler = PerfProfiler.current()
+        if profiler is not None:
+            profiler.start_phase(PerfProfiler.PHASE_ATTN_MASK)
+        try:
+            block_mask = get_or_create_block_mask(
+                prefix_sharing_plan,
+                device=input_ids.device,
+                cache=getattr(attention_backend, "_block_mask_cache", None),
+            )
+            runtime_state = dataclasses.replace(runtime_state, block_mask=block_mask)
+        except Exception as exc:
+            print(
+                f"[PS] failed to precompute BlockMask, falling back to per-layer lazy construction: {exc}",
+                flush=True,
+            )
+        finally:
+            if profiler is not None:
+                profiler.stop_phase(PerfProfiler.PHASE_ATTN_MASK)
+
     return trimmed_micro_batch, runtime_state
 
 
@@ -385,21 +414,6 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
-    # Pre-build BlockMask for FlexAttention-based backends inside the KV phase
-    # so that the mask compilation cost is not charged to attn.comp on layer 0.
-    # The cache lives on the backend instance (per-micro-batch), so only the
-    # first layer pays the build cost.
-    block_mask = None
-    if not getattr(ctx.attention_backend.capabilities, "requires_kv_expansion", True):
-        from prefix_sharing.backends.prefix_block_mask import get_or_create_block_mask
-
-        block_mask_cache = getattr(ctx.attention_backend, "_block_mask_cache", None)
-        block_mask = get_or_create_block_mask(
-            plan,
-            device=packed_query.device,
-            cache=block_mask_cache,
-        )
-
     # Backends that declare requires_kv_expansion=False consume packed K/V
     # directly (e.g. FlexAttention-based backends).  All others must expand
     # the KV layout before calling attention().
@@ -446,7 +460,7 @@ def _run_packed_attention_runtime(
         expanded_value,
         plan,
         packed_batch_layout=ctx.packed_batch_layout,
-        block_mask=block_mask,
+        block_mask=ctx.block_mask,
     )
     # [PS-perf] start — per-layer compute stop —————————————
     if _per_layer_ok:

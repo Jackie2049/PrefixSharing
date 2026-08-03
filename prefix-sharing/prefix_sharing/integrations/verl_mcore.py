@@ -43,6 +43,7 @@ class PrefixSharingRuntimeState:
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
+    block_mask: Any | None = None
 
 
 @dataclass

@@ -41,6 +41,7 @@ class PrefixSharingRuntimeContext:
     kept_position_ids: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
+    block_mask: Any | None = None
     """Saved provider packed logits for prefix-last logprob recompute in 2D space.
 
     Keyed by (reuse_idx_in_batch, target_2d_pos). Each value is [1, V//tp]
@@ -60,6 +61,7 @@ class PrefixSharingRuntimeContext:
         self.store = store
         self.attention_backend = runtime_state.attention_backend
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
+        self.block_mask = getattr(runtime_state, "block_mask", None)
         self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
             runtime_state.prefix_sharing_plan,
             runtime_state.packed_batch_layout,
