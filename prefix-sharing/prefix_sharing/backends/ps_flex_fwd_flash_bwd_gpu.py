@@ -114,6 +114,17 @@ def _import_flash_attn_varlen_backward() -> Any:
     return _flash_attn_varlen_backward
 
 
+def _flash_attn_version() -> tuple[int, int]:
+    """Return (major, minor) flash-attn version; fallback for import-free lint."""
+    try:
+        import flash_attn as _fa
+
+        version_parts = getattr(_fa, "__version__", "2.5.0").split(".")[:2]
+        return (int(version_parts[0]), int(version_parts[1]))
+    except Exception:
+        return (2, 5)
+
+
 _COMPILED_FLEX_ATTENTION: Any | None = None
 
 
@@ -240,38 +251,71 @@ class PSFlexFwdFlashBwdFunction(torch.autograd.Function):
 
         _flash_attn_varlen_backward = _import_flash_attn_varlen_backward()
 
-        # Inspect signature and pass optional kwargs by name so we stay
-        # compatible across flash-attn 2.5.x/2.6.x/2.7.x.
-        bwd_sig = inspect.signature(_flash_attn_varlen_backward)
-        bwd_params = set(bwd_sig.parameters.keys())
+        # flash-attn's internal backward API changed between 2.7.x and 2.8.x:
+        #   * 2.8.x: in-place dq/dk/dv args + separate window_size_left/right
+        #   * <=2.7.x: returns dq/dk/dv + window_size tuple
+        # Dispatch by version so we work on both without fragile introspection
+        # of the C++/CustomOp wrapper.
+        _fa_version = _flash_attn_version()
 
-        bwd_kwargs: dict[str, Any] = {
-            "dropout_p": fa_kwargs.get("dropout_p", 0.0),
-            "softmax_scale": fa_kwargs.get("softmax_scale", None),
-            "causal": fa_kwargs.get("causal", True),
-            "window_size": fa_kwargs.get("window_size", (-1, -1)),
-            "softcap": fa_kwargs.get("softcap", 0.0),
-            "alibi_slopes": fa_kwargs.get("alibi_slopes", None),
-            "deterministic": fa_kwargs.get("deterministic", False),
-        }
-        if "rng_state" in bwd_params:
-            bwd_kwargs["rng_state"] = None
-        if "gen_bias_batch_group" in bwd_params:
-            bwd_kwargs["gen_bias_batch_group"] = None
+        dropout_p = fa_kwargs.get("dropout_p", 0.0)
+        softmax_scale = fa_kwargs.get("softmax_scale", None)
+        causal = fa_kwargs.get("causal", True)
+        window_size = fa_kwargs.get("window_size", (-1, -1))
+        softcap = fa_kwargs.get("softcap", 0.0)
+        alibi_slopes = fa_kwargs.get("alibi_slopes", None)
+        deterministic = fa_kwargs.get("deterministic", False)
 
-        dq, dk_exp, dv_exp = _flash_attn_varlen_backward(
-            grad_out,
-            q,
-            expanded_k,
-            expanded_v,
-            out,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            max_q,
-            max_kv,
-            **bwd_kwargs,
-        )
+        if _fa_version >= (2, 8):
+            dq = torch.zeros_like(q)
+            dk_exp = torch.zeros_like(expanded_k)
+            dv_exp = torch.zeros_like(expanded_v)
+            _flash_attn_varlen_backward(
+                grad_out,
+                q,
+                expanded_k,
+                expanded_v,
+                out,
+                lse,
+                dq,
+                dk_exp,
+                dv_exp,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_q,
+                max_kv,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size[0],
+                window_size[1],
+                softcap,
+                alibi_slopes,
+                deterministic,
+                None,  # rng_state
+                False,  # zero_tensors
+            )
+        else:
+            dq, dk_exp, dv_exp = _flash_attn_varlen_backward(
+                grad_out,
+                q,
+                expanded_k,
+                expanded_v,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_q,
+                max_kv,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                softcap,
+                alibi_slopes,
+                deterministic,
+                None,  # rng_state
+            )
 
         # 3) Scatter expanded gradients back to the packed layout.
         dk = torch.zeros_like(packed_k).index_add_(0, index, dk_exp)

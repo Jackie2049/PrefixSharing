@@ -233,6 +233,12 @@ def test_gradient_matches_flash_attention_gather_backend():
     def run(backend_cls):
         _q, _k, _v = q.cuda(), k.cuda(), v.cuda()
         backend = backend_cls()
+        if getattr(backend.capabilities, "requires_kv_expansion", True):
+            from prefix_sharing.core.prefix_store import PrefixAttentionStore
+            _k, _v = backend.build_kv(
+                _k, _v, PrefixAttentionStore(), plan,
+                packed_batch_layout=layout, layer_id=0,
+            )
         out = backend.attention(_q, _k, _v, plan, packed_batch_layout=layout)
         loss = out.sum()
         loss.backward()
