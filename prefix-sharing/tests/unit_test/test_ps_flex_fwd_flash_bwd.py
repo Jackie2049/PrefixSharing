@@ -49,11 +49,11 @@ def _make_layout(plan, align_size=1):
     return PackedBatchLayout.from_kept_position_rows(rows, align_size=align_size)
 
 
-def _random_qkv(total, num_heads=4, head_dim=64, dtype=torch.bfloat16, seed=42, requires_grad=False):
+def _random_qkv(total, num_heads=4, head_dim=64, dtype=torch.bfloat16, seed=42, requires_grad=False, device="cpu"):
     torch.manual_seed(seed)
-    q = torch.randn(total, num_heads, head_dim, dtype=dtype, requires_grad=requires_grad)
-    k = torch.randn(total, num_heads, head_dim, dtype=dtype, requires_grad=requires_grad)
-    v = torch.randn(total, num_heads, head_dim, dtype=dtype, requires_grad=requires_grad)
+    q = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device, requires_grad=requires_grad)
+    k = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device, requires_grad=requires_grad)
+    v = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device, requires_grad=requires_grad)
     return q, k, v
 
 
@@ -147,8 +147,7 @@ def test_attention_runs_without_build_kv():
     """Smoke test: hybrid backend attention runs and returns packed-shape output."""
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
-    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     backend = PSFlexFwdFlashBwdBackend()
     out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
@@ -164,8 +163,7 @@ def test_backward_flows_to_packed_kv():
     """Gradients must reach the original packed K/V."""
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
-    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     backend = PSFlexFwdFlashBwdBackend()
     out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
@@ -185,8 +183,7 @@ def test_saved_tensors_are_packed_shape():
     """Autograd must retain packed K/V, not expanded K/V."""
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
-    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     backend = PSFlexFwdFlashBwdBackend()
     out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
@@ -208,8 +205,7 @@ def test_forward_matches_flex_attention_backend():
 
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
-    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     flex_backend = GpuFlexAttentionBackend()
     hybrid_backend = PSFlexFwdFlashBwdBackend()
@@ -228,11 +224,11 @@ def test_gradient_matches_flash_attention_gather_backend():
 
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     def run(backend_cls):
-        _q, _k_leaf, _v_leaf = q.cuda(), k.cuda(), v.cuda()
         backend = backend_cls()
+        _q, _k_leaf, _v_leaf = q, k, v
         if getattr(backend.capabilities, "requires_kv_expansion", True):
             from prefix_sharing.core.prefix_store import PrefixAttentionStore
             _k, _v = backend.build_kv(
@@ -260,8 +256,7 @@ def test_block_mask_not_saved():
     """BlockMask is a non-tensor object and must not appear in saved_tensors."""
     plan = _make_plan([8, 7, 6], [0, 3, 5])
     layout = _make_layout(plan)
-    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True)
-    q, k, v = q.cuda(), k.cuda(), v.cuda()
+    q, k, v = _random_qkv(layout.total_padded_length, requires_grad=True, device="cuda")
 
     backend = PSFlexFwdFlashBwdBackend()
     out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
