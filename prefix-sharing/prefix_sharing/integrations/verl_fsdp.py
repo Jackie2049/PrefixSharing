@@ -385,16 +385,22 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
-    expanded_key, expanded_value = ctx.attention_backend.build_kv(
-        packed_key,
-        packed_value,
-        ctx.store,
-        plan,
-        packed_batch_layout=ctx.packed_batch_layout,
-        layer_id=layer_id,
-        tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
-        stats=ctx.stats,
-    )
+    # Backends that declare requires_kv_expansion=False consume packed K/V
+    # directly (e.g. FlexAttention-based backends).  All others must expand
+    # the KV layout before calling attention().
+    if getattr(ctx.attention_backend.capabilities, "requires_kv_expansion", True):
+        expanded_key, expanded_value = ctx.attention_backend.build_kv(
+            packed_key,
+            packed_value,
+            ctx.store,
+            plan,
+            packed_batch_layout=ctx.packed_batch_layout,
+            layer_id=layer_id,
+            tp_rank=getattr(ctx.parallel_info, "tp_rank", 0),
+            stats=ctx.stats,
+        )
+    else:
+        expanded_key, expanded_value = packed_key, packed_value
     # [PS-perf] start — per-layer KV stop ——————————————————
     if _per_layer_ok:
         _kv_elapsed = profiler.stop_phase(f"attn.kv.l{layer_id}")
@@ -404,7 +410,11 @@ def _run_packed_attention_runtime(
         profiler.stop_phase(PerfProfiler.PHASE_ATTN_KV)
 
     # ##### [PS-diag] per-layer dump: expanded_kv (ON only) ######
-    if _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None and num_layers > 0:
+    if (
+        _ps_dump_env.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+        and num_layers > 0
+        and getattr(ctx.attention_backend.capabilities, "requires_kv_expansion", True)
+    ):
         from prefix_sharing.tools.diagnostic_dump import dump_expanded_kv_on
         dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
     # ##### [PS-diag] end #####
