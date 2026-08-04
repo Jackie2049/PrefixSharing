@@ -165,18 +165,35 @@ class TriePrefixDetector(PrefixDetector):
 
         for index, seq in enumerate(input_ids):
             node = root
+            root.indices.append(index)
+
             matched = 0
             matched_provider = -1
             matched_group_size = 0
+            still_matching = True
+
             for token in seq:
-                child = node.children.get(int(token))
-                if child is None:
-                    break
-                node = child
-                matched += 1
-                if node.provider_index >= 0:
-                    matched_provider = node.provider_index
-                    matched_group_size = len(node.indices) + 1
+                token = int(token)
+                child = node.children.get(token)
+
+                if still_matching and child is not None:
+                    # Still on a matching path: reuse existing node
+                    node = child
+                    matched += 1
+                    if node.provider_index >= 0:
+                        matched_provider = node.provider_index
+                        # +1 because current index hasn't been appended yet
+                        matched_group_size = len(node.indices) + 1
+                else:
+                    # Match ended (or never started): switch to insert mode
+                    still_matching = False
+                    if child is None:
+                        child = _TrieNode(node.depth + 1)
+                        child.provider_index = index
+                        node.children[token] = child
+                    node = child
+
+                node.indices.append(index)
 
             if (
                 matched >= self.min_prefix_len
@@ -192,18 +209,6 @@ class TriePrefixDetector(PrefixDetector):
                 provider_index[index] = matched_provider
                 prefix_lens[index] = matched
                 is_provider[index] = False
-
-            node = root
-            node.indices.append(index)
-            for token in seq:
-                token = int(token)
-                child = node.children.get(token)
-                if child is None:
-                    child = _TrieNode(node.depth + 1)
-                    child.provider_index = index
-                    node.children[token] = child
-                node = child
-                node.indices.append(index)
 
         return PrefixDetectionResult(
             batch_size=batch_size,
