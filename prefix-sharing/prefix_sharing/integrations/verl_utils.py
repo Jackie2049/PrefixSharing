@@ -278,10 +278,67 @@ def _is_nested_tensor(tensor: Any) -> bool:
 
 
 def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
+    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。
+
+    使用异步 GPU→CPU 拷贝避免 pipeline stall。
+    """
+    import torch
+
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()
-    sequences = []
-    for i in range(offsets.numel() - 1):
-        seq = values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
-        sequences.append(seq)
-    return sequences
+
+    # 1. Collect all GPU slices
+    gpu_slices = [
+        values[offsets[i]:offsets[i + 1]].detach()
+        for i in range(offsets.numel() - 1)
+    ]
+
+    # 2. Batch async copy to pinned memory
+    pinned_buffers = []
+    for gpu_slice in gpu_slices:
+        pinned = torch.empty_like(gpu_slice, device='cpu', pin_memory=True)
+        pinned.copy_(gpu_slice, non_blocking=True)
+        pinned_buffers.append(pinned)
+
+    # 3. Single sync point
+    torch.cuda.synchronize()
+
+    # 4. Convert to Python lists
+    return [buf.tolist() for buf in pinned_buffers]
+
+
+def _extract_sequences_async(
+    input_ids: Any,
+    valid_indices: list[Any],
+) -> list[list[int]]:
+    """Extract token sequences from GPU tensor with async copy to avoid pipeline stall.
+
+    Instead of calling .cpu().tolist() per row (which syncs each time),
+    we batch all GPU→CPU copies as non-blocking, then sync once at the end.
+
+    Args:
+        input_ids: 2D GPU tensor of shape [batch_size, seq_len].
+        valid_indices: Pre-computed nonzero indices per row.
+
+    Returns:
+        List of token ID lists (CPU Python ints).
+    """
+    import torch
+
+    # 1. Collect all GPU tensors to copy
+    gpu_tensors = []
+    for row, indices in enumerate(valid_indices):
+        gpu_tensors.append(input_ids[row, indices].detach())
+
+    # 2. Batch async copy to pinned memory
+    pinned_buffers = []
+    for gpu_tensor in gpu_tensors:
+        pinned = torch.empty_like(gpu_tensor, device='cpu', pin_memory=True)
+        pinned.copy_(gpu_tensor, non_blocking=True)
+        pinned_buffers.append(pinned)
+
+    # 3. Single sync point: wait for all copies to complete
+    torch.cuda.synchronize()
+
+    # 4. Convert to Python lists (pure CPU, no GPU interaction)
+    return [buf.tolist() for buf in pinned_buffers]

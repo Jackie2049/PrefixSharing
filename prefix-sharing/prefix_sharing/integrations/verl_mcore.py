@@ -26,6 +26,7 @@ from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 from prefix_sharing.integrations.verl_utils import _clone_batch
 from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
 from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _extract_sequences_async
 from prefix_sharing.integrations.verl_utils import _is_nested_tensor
 from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 from prefix_sharing.integrations.verl_utils import _trim_plain_batch_thd
@@ -387,10 +388,7 @@ def build_prefix_sharing_micro_batch_verl080(
             attention_mask_bool[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = [
-            input_ids[row, indices].detach().cpu().tolist()
-            for row, indices in enumerate(valid_indices)
-        ]
+        sequences = _extract_sequences_async(input_ids, valid_indices)
 
     # ── 阶段 4: 前缀共享规划 ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
@@ -682,10 +680,30 @@ def _is_nested_tensor(tensor: Any) -> bool:
 
 
 def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
-    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。"""
+    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。
+
+    使用异步 GPU→CPU 拷贝避免 pipeline stall。
+    """
+    import torch
+
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()
-    return [
-        values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
+
+    # 1. Collect all GPU slices
+    gpu_slices = [
+        values[offsets[i]:offsets[i + 1]].detach()
         for i in range(offsets.diff().shape[0])
     ]
+
+    # 2. Batch async copy to pinned memory
+    pinned_buffers = []
+    for gpu_slice in gpu_slices:
+        pinned = torch.empty_like(gpu_slice, device='cpu', pin_memory=True)
+        pinned.copy_(gpu_slice, non_blocking=True)
+        pinned_buffers.append(pinned)
+
+    # 3. Single sync point
+    torch.cuda.synchronize()
+
+    # 4. Convert to Python lists
+    return [buf.tolist() for buf in pinned_buffers]

@@ -22,6 +22,7 @@ from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
 from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _extract_sequences_async
 from prefix_sharing.integrations.verl_utils import _is_nested_tensor
 from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 
@@ -207,10 +208,7 @@ def build_prefix_sharing_micro_batch_fsdp(
             attention_mask[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = [
-            input_ids[row, indices].detach().cpu().tolist()
-            for row, indices in enumerate(valid_indices)
-        ]
+        sequences = _extract_sequences_async(input_ids, valid_indices)
     prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
         return batch, None
