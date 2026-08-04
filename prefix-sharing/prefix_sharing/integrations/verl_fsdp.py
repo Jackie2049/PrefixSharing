@@ -245,7 +245,7 @@ def build_prefix_sharing_micro_batch_fsdp(
             trimmed_micro_batch,
             prefix_sharing_plan,
             is_nested_tensor=False,
-            attention_mask_bool=attention_mask,
+            valid_indices=valid_indices,
         )
 
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(

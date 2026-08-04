@@ -383,7 +383,6 @@ def build_prefix_sharing_micro_batch_verl080(
             print("[PS][prepare] PATH 4: plain 2D batch without attention_mask")
             return batch, None
         attention_mask_bool = attention_mask.to(bool)
-        attention_mask_bool_for_layout = attention_mask_bool  # 供阶段 6 使用
         valid_indices = [
             attention_mask_bool[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
@@ -407,12 +406,12 @@ def build_prefix_sharing_micro_batch_verl080(
     if is_nested_tensor:
         trimmed_batch = _trim_nested_batch(batch, plan)
     else:
-        trimmed_batch = _trim_plain_batch_thd(batch, plan)
+        trimmed_batch = _trim_plain_batch_thd(batch, plan, valid_indices)
 
     # layout 计算：从 trimmed 后的实际 kept position rows 构建
     kept_position_rows = _collect_kept_position_rows(
         trimmed_batch, plan, is_nested_tensor,
-        attention_mask_bool=attention_mask_bool_for_layout,
+        valid_indices=valid_indices if not is_nested_tensor else None,
     )
 
     # ── 阶段 6: 构建 layout ──
@@ -502,7 +501,7 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
     return trimmed_batch
 
 
-def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
+def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: list[Any] | None = None) -> Any:
     """物理裁剪 plain 2D tensor batch（verl080 NPU THD 路径）。
 
     v080 THD 路径即使 input_ids 是 2D tensor，preprocess_thd_engine
@@ -514,21 +513,32 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
     attention_mask 标记为 False，这样 Megatron 处理时只看 True 的位置。
     同时将裁剪后的数据转为 NestedTensor 格式，确保
     preprocess_thd_engine 正确处理。
+
+    Args:
+        batch: Input batch with 2D tensors.
+        plan: Prefix sharing plan with keep ranges.
+        valid_indices: Pre-computed nonzero indices from attention_mask.
+            If None, will compute from batch["attention_mask"].
     """
     import torch
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
-    attention_mask = batch.get("attention_mask")
 
-    if attention_mask is not None:
-        attention_mask_bool = attention_mask.to(bool)
-    else:
-        # 无 explicit attention_mask → 所有位置都 valid
-        attention_mask_bool = torch.ones(
-            input_ids.shape[0], input_ids.shape[1],
-            dtype=torch.bool, device=input_ids.device,
-        )
+    if valid_indices is None:
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask_bool = attention_mask.to(bool)
+        else:
+            # 无 explicit attention_mask → 所有位置都 valid
+            attention_mask_bool = torch.ones(
+                input_ids.shape[0], input_ids.shape[1],
+                dtype=torch.bool, device=input_ids.device,
+            )
+        valid_indices = [
+            attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+            for row in range(input_ids.shape[0])
+        ]
 
     # 按 keep_ranges 从每个 row 中提取 kept 区段
     kept_id_rows = []
@@ -536,7 +546,7 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
     kept_mask_rows = []
 
     for row in range(input_ids.shape[0]):
-        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        indices = valid_indices[row]
         keep_start, keep_end = plan.input_keep_ranges[row]
         kept_indices = indices[keep_start:keep_end]
         kept_id_rows.append(input_ids[row, kept_indices])
@@ -557,7 +567,7 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
     if loss_mask is not None:
         kept_loss_rows = []
         for row in range(loss_mask.shape[0]):
-            indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+            indices = valid_indices[row]
             keep_start, keep_end = plan.input_keep_ranges[row]
             kept_indices = indices[keep_start:keep_end]
             kept_loss_rows.append(loss_mask[row, kept_indices])
@@ -611,14 +621,23 @@ def _collect_kept_position_rows(
     plan: PrefixSharingPlan,
     is_nested_tensor: bool,
     attention_mask_bool: Any | None = None,
+    valid_indices: list[Any] | None = None,
 ) -> list[Any]:
     """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
 
     用于 PackedBatchLayout.from_kept_position_rows 构建 layout。
 
-    当 position_ids 是 2D tensor 时，需要 attention_mask_bool 来定位有效列索引
+    当 position_ids 是 2D tensor 时，需要 valid_indices 来定位有效列索引
     （keep_range 是序列偏移，不是列索引）。当 position_ids 是 NestedTensor 时，
-    offsets/values 已包含裁剪后的正确数据，无需 attention_mask。
+    offsets/values 已包含裁剪后的正确数据，无需额外索引。
+
+    Args:
+        trimmed_batch: Batch after trimming.
+        plan: Prefix sharing plan.
+        is_nested_tensor: Whether position_ids is a NestedTensor.
+        attention_mask_bool: Boolean attention mask (deprecated, use valid_indices).
+        valid_indices: Pre-computed nonzero indices. If provided, skips
+            attention_mask_bool computation.
     """
     position_ids = trimmed_batch["position_ids"]
 
@@ -627,15 +646,21 @@ def _collect_kept_position_rows(
         values = position_ids.values()
         return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
 
-    # 2D tensor — 用 attention_mask 的 valid_indices 切片
-    if attention_mask_bool is None:
-        raise ValueError(
-            "attention_mask_bool is required when position_ids is 2D tensor; "
-            "keep_range is a sequence offset, not a column index"
-        )
+    # 2D tensor — need valid_indices to locate valid column indices
+    if valid_indices is None:
+        if attention_mask_bool is None:
+            raise ValueError(
+                "valid_indices or attention_mask_bool is required when position_ids is 2D tensor; "
+                "keep_range is a sequence offset, not a column index"
+            )
+        valid_indices = [
+            attention_mask_bool[i].nonzero(as_tuple=False).flatten()
+            for i in range(len(plan.input_keep_ranges))
+        ]
+
     rows = []
     for i in range(len(plan.input_keep_ranges)):
-        indices = attention_mask_bool[i].nonzero(as_tuple=False).flatten()
+        indices = valid_indices[i]
         keep_start, keep_end = plan.input_keep_ranges[i]
         kept_indices = indices[keep_start:keep_end]
         rows.append(position_ids[i, kept_indices])
