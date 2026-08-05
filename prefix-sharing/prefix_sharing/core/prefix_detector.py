@@ -136,6 +136,57 @@ class _TrieNode:
         self.depth = depth
         self.provider_index = -1
 
+    def reset(self, depth: int = 0) -> None:
+        """Reset node for pool reuse."""
+        self.children.clear()
+        self.indices.clear()
+        self.depth = depth
+        self.provider_index = -1
+
+
+class _TrieNodePool:
+    """Pre-allocated pool of _TrieNode to avoid repeated memory allocation.
+
+    Each detect() creates ~10k+ TrieNode objects. When pymalloc's free arenas
+    are exhausted, the next allocation triggers a slow OS-level memory request,
+    causing periodic multi-hundred-ms spikes.
+
+    The pool pre-allocates nodes and reuses them across detect() calls,
+    eliminating the allocation spike. On exhaustion it grows by 50%
+    (minimum 4096); the extra capacity persists across reset(), so growth
+    happens at most until the largest micro-batch has been seen once.
+
+    IMPORTANT: the pool must be shared across detect() calls (module-level
+    singleton), otherwise the pre-allocation cost itself is paid per-call
+    and the spike just moves from detect() to pool construction.
+    """
+
+    __slots__ = ("_nodes", "_index")
+
+    def __init__(self, initial_size: int = 16384) -> None:
+        self._nodes: list[_TrieNode] = [_TrieNode() for _ in range(initial_size)]
+        self._index = 0
+
+    def get(self, depth: int = 0) -> _TrieNode:
+        if self._index >= len(self._nodes):
+            # Pool exhausted: extend by 50%
+            extend = max(4096, len(self._nodes) // 2)
+            self._nodes.extend([_TrieNode() for _ in range(extend)])
+        node = self._nodes[self._index]
+        self._index += 1
+        node.reset(depth)
+        return node
+
+    def reset(self) -> None:
+        """Reset pool for next detect() call."""
+        self._index = 0
+
+
+# Module-level singleton: allocated once per process, reused across all
+# detect() calls (all micro-batches, all steps). Training is single-threaded
+# per worker process, so no locking is needed.
+_SHARED_NODE_POOL = _TrieNodePool(initial_size=16384)
+
 
 class TriePrefixDetector(PrefixDetector):
     """Detect per-sample reuse relations with an online token trie.
@@ -145,6 +196,9 @@ class TriePrefixDetector(PrefixDetector):
     becomes a reuser of the provider recorded at the matched trie node. The
     current sequence is then inserted, allowing it to provide longer prefixes to
     later samples.
+
+    Uses the module-level shared node pool to avoid periodic memory allocation
+    spikes (see _TrieNodePool docstring).
     """
 
     def __init__(self, min_prefix_len: int = 1, min_group_size: int = 2) -> None:
@@ -157,7 +211,8 @@ class TriePrefixDetector(PrefixDetector):
 
     def detect(self, input_ids: Sequence[TokenSequence]) -> PrefixDetectionResult:
         batch_size = len(input_ids)
-        root = _TrieNode()
+        _SHARED_NODE_POOL.reset()
+        root = _SHARED_NODE_POOL.get(depth=0)
         provider_index = list(range(batch_size))
         prefix_lens = [0] * batch_size
         is_provider = [True] * batch_size
@@ -188,7 +243,7 @@ class TriePrefixDetector(PrefixDetector):
                     # Match ended (or never started): switch to insert mode
                     still_matching = False
                     if child is None:
-                        child = _TrieNode(node.depth + 1)
+                        child = _SHARED_NODE_POOL.get(depth=node.depth + 1)
                         child.provider_index = index
                         node.children[token] = child
                     node = child
