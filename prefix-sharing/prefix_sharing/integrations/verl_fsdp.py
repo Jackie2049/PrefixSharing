@@ -20,6 +20,7 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import _clone_batch
 from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
 from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
 from prefix_sharing.integrations.verl_utils import _extract_sequences_async
@@ -338,17 +339,6 @@ def restore_prefix_sharing_outputs_2d(
     if ctx.stats is not None:
         ctx.stats.record_restore(restored_reusers)
     return output
-
-
-def _clone_batch(batch: Any) -> Any:
-    if hasattr(batch, "clone"):
-        try:
-            return batch.clone()
-        except TypeError:
-            pass
-    if isinstance(batch, dict):
-        return dict(batch)
-    return batch.copy()
 
 
 def _run_packed_attention_runtime(

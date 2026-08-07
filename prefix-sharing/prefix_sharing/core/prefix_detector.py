@@ -156,16 +156,27 @@ class _TrieNodePool:
     (minimum 4096); the extra capacity persists across reset(), so growth
     happens at most until the largest micro-batch has been seen once.
 
-    IMPORTANT: the pool must be shared across detect() calls (module-level
-    singleton), otherwise the pre-allocation cost itself is paid per-call
-    and the spike just moves from detect() to pool construction.
+    The pool only pays off when it outlives a single detect() call, so the
+    process-wide shared instance is obtained via :meth:`instance()` (lazy:
+    nothing is allocated until the first detect()). The pool is pure scratch
+    memory — every detect() starts with reset() — so sharing it across
+    detector instances is safe in the single-threaded training worker.
     """
 
     __slots__ = ("_nodes", "_index")
 
+    _instance: _TrieNodePool | None = None
+
     def __init__(self, initial_size: int = 16384) -> None:
         self._nodes: list[_TrieNode] = [_TrieNode() for _ in range(initial_size)]
         self._index = 0
+
+    @classmethod
+    def instance(cls) -> _TrieNodePool:
+        """Return the shared pool, creating it lazily on first use."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
     def get(self, depth: int = 0) -> _TrieNode:
         if self._index >= len(self._nodes):
@@ -182,12 +193,6 @@ class _TrieNodePool:
         self._index = 0
 
 
-# Module-level singleton: allocated once per process, reused across all
-# detect() calls (all micro-batches, all steps). Training is single-threaded
-# per worker process, so no locking is needed.
-_SHARED_NODE_POOL = _TrieNodePool(initial_size=16384)
-
-
 class TriePrefixDetector(PrefixDetector):
     """Detect per-sample reuse relations with an online token trie.
 
@@ -197,8 +202,8 @@ class TriePrefixDetector(PrefixDetector):
     current sequence is then inserted, allowing it to provide longer prefixes to
     later samples.
 
-    Uses the module-level shared node pool to avoid periodic memory allocation
-    spikes (see _TrieNodePool docstring).
+    Trie nodes come from the shared :meth:`_TrieNodePool.instance()` to avoid
+    periodic memory allocation spikes (see _TrieNodePool docstring).
     """
 
     def __init__(self, min_prefix_len: int = 1, min_group_size: int = 2) -> None:
@@ -211,8 +216,9 @@ class TriePrefixDetector(PrefixDetector):
 
     def detect(self, input_ids: Sequence[TokenSequence]) -> PrefixDetectionResult:
         batch_size = len(input_ids)
-        _SHARED_NODE_POOL.reset()
-        root = _SHARED_NODE_POOL.get(depth=0)
+        pool = _TrieNodePool.instance()
+        pool.reset()
+        root = pool.get(depth=0)
         provider_index = list(range(batch_size))
         prefix_lens = [0] * batch_size
         is_provider = [True] * batch_size
@@ -243,7 +249,7 @@ class TriePrefixDetector(PrefixDetector):
                     # Match ended (or never started): switch to insert mode
                     still_matching = False
                     if child is None:
-                        child = _SHARED_NODE_POOL.get(depth=node.depth + 1)
+                        child = pool.get(depth=node.depth + 1)
                         child.provider_index = index
                         node.children[token] = child
                     node = child

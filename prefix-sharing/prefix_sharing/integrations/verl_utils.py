@@ -66,7 +66,10 @@ def _prefix_sharing_config_from_prefix_grouper(engine_config: Any) -> dict[str, 
 
 def _clone_batch(batch: Any) -> Any:
     if hasattr(batch, "clone"):
-        return batch.clone()
+        try:
+            return batch.clone()
+        except TypeError:
+            pass
     if hasattr(batch, "copy"):
         return batch.copy()
     if isinstance(batch, dict):
@@ -106,12 +109,12 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
     position_ids = batch["position_ids"]
 
     trimmed_ids_seqs = _slice_nested_sequences(input_ids, plan)
-    new_input_ids = torch.nested.nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
+    new_input_ids = torch.nested.as_nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
     trimmed_batch["input_ids"] = new_input_ids
 
     if _is_nested_tensor(position_ids):
         trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     else:
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
@@ -124,13 +127,13 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
         trimmed_pos_seqs = _slice_2d_position_rows(
             position_ids, plan, attention_mask_bool,
         )
-        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     trimmed_batch["position_ids"] = new_position_ids
 
     loss_mask = batch.get("loss_mask")
     if loss_mask is not None and _is_nested_tensor(loss_mask):
         trimmed_loss_seqs = _slice_nested_sequences(loss_mask, plan)
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+        trimmed_batch["loss_mask"] = torch.nested.as_nested_tensor(
             trimmed_loss_seqs, layout=torch.jagged
         )
 
@@ -177,8 +180,8 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: li
         kept_pos_rows.append(position_ids[row, kept_indices])
 
     trimmed_batch = _clone_batch(batch)
-    trimmed_batch["input_ids"] = torch.nested.nested_tensor(kept_id_rows, layout=torch.jagged)
-    trimmed_batch["position_ids"] = torch.nested.nested_tensor(kept_pos_rows, layout=torch.jagged)
+    trimmed_batch["input_ids"] = torch.nested.as_nested_tensor(kept_id_rows, layout=torch.jagged)
+    trimmed_batch["position_ids"] = torch.nested.as_nested_tensor(kept_pos_rows, layout=torch.jagged)
 
     loss_mask = batch.get("loss_mask")
     if loss_mask is not None:
@@ -188,7 +191,7 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: li
             keep_start, keep_end = plan.input_keep_ranges[row]
             kept_indices = indices[keep_start:keep_end]
             kept_loss_rows.append(loss_mask[row, kept_indices])
-        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+        trimmed_batch["loss_mask"] = torch.nested.as_nested_tensor(
             kept_loss_rows, layout=torch.jagged
         )
 
@@ -277,68 +280,84 @@ def _is_nested_tensor(tensor: Any) -> bool:
     )
 
 
+def _copy_tensors_to_cpu_lists(tensors: list[Any]) -> list[list[int]]:
+    """Copy device tensors to Python int lists with a single sync point.
+
+    Fast path (CUDA / NPU): stage all slices into pinned host buffers with
+    non-blocking copies, then synchronize the source device once — avoiding
+    one pipeline stall per tensor. Backends without pinned-memory support
+    (older torch_npu, CPU, …) fall back to plain per-tensor copies: correct
+    everywhere, just without the batched-copy optimization.
+
+    Device handling is dispatched via ``getattr(torch, device.type)`` so this
+    works on any accelerator backend without hardcoding ``torch.cuda``.
+    """
+
+    import torch
+
+    if not tensors:
+        return []
+
+    device = tensors[0].device
+    accel = getattr(torch, device.type, None)
+    if accel is None or not hasattr(accel, "synchronize"):
+        # CPU and unknown backends: plain copies, no accelerator calls.
+        return [t.cpu().tolist() for t in tensors]
+
+    try:
+        pinned_buffers = [
+            torch.empty_like(t, device="cpu", pin_memory=True) for t in tensors
+        ]
+    except RuntimeError:
+        # Backend has no pinned-memory allocator (e.g. old torch_npu):
+        # fall back to the original per-tensor synchronous copies.
+        return [t.cpu().tolist() for t in tensors]
+
+    for buf, t in zip(pinned_buffers, tensors):
+        buf.copy_(t, non_blocking=True)
+
+    # Single sync point on the device the tensors actually live on.
+    accel.synchronize(device)
+
+    return [buf.tolist() for buf in pinned_buffers]
+
+
 def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
     """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。
 
-    使用异步 GPU→CPU 拷贝避免 pipeline stall。
+    批量异步 device→CPU 拷贝（CUDA/NPU），单次同步，避免 pipeline stall。
     """
-    import torch
 
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()
 
-    # 1. Collect all GPU slices
-    gpu_slices = [
+    slices = [
         values[offsets[i]:offsets[i + 1]].detach()
         for i in range(offsets.numel() - 1)
     ]
-
-    # 2. Batch async copy to pinned memory
-    pinned_buffers = []
-    for gpu_slice in gpu_slices:
-        pinned = torch.empty_like(gpu_slice, device='cpu', pin_memory=True)
-        pinned.copy_(gpu_slice, non_blocking=True)
-        pinned_buffers.append(pinned)
-
-    # 3. Single sync point
-    torch.cuda.synchronize()
-
-    # 4. Convert to Python lists
-    return [buf.tolist() for buf in pinned_buffers]
+    return _copy_tensors_to_cpu_lists(slices)
 
 
 def _extract_sequences_async(
     input_ids: Any,
     valid_indices: list[Any],
 ) -> list[list[int]]:
-    """Extract token sequences from GPU tensor with async copy to avoid pipeline stall.
+    """Extract token sequences from a device tensor with batched async copy.
 
     Instead of calling .cpu().tolist() per row (which syncs each time),
-    we batch all GPU→CPU copies as non-blocking, then sync once at the end.
+    all device→CPU copies are queued non-blocking, then synchronized once
+    (CUDA/NPU fast path; other backends fall back to plain copies).
 
     Args:
-        input_ids: 2D GPU tensor of shape [batch_size, seq_len].
+        input_ids: 2D device tensor of shape [batch_size, seq_len].
         valid_indices: Pre-computed nonzero indices per row.
 
     Returns:
         List of token ID lists (CPU Python ints).
     """
-    import torch
 
-    # 1. Collect all GPU tensors to copy
-    gpu_tensors = []
-    for row, indices in enumerate(valid_indices):
-        gpu_tensors.append(input_ids[row, indices].detach())
-
-    # 2. Batch async copy to pinned memory
-    pinned_buffers = []
-    for gpu_tensor in gpu_tensors:
-        pinned = torch.empty_like(gpu_tensor, device='cpu', pin_memory=True)
-        pinned.copy_(gpu_tensor, non_blocking=True)
-        pinned_buffers.append(pinned)
-
-    # 3. Single sync point: wait for all copies to complete
-    torch.cuda.synchronize()
-
-    # 4. Convert to Python lists (pure CPU, no GPU interaction)
-    return [buf.tolist() for buf in pinned_buffers]
+    tensors = [
+        input_ids[row, indices].detach()
+        for row, indices in enumerate(valid_indices)
+    ]
+    return _copy_tensors_to_cpu_lists(tensors)
