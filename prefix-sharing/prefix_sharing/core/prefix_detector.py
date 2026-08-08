@@ -136,6 +136,62 @@ class _TrieNode:
         self.depth = depth
         self.provider_index = -1
 
+    def reset(self, depth: int = 0) -> None:
+        """Reset node for pool reuse."""
+        self.children.clear()
+        self.indices.clear()
+        self.depth = depth
+        self.provider_index = -1
+
+
+class _TrieNodePool:
+    """Pre-allocated pool of _TrieNode to avoid repeated memory allocation.
+
+    Each detect() creates ~10k+ TrieNode objects. When pymalloc's free arenas
+    are exhausted, the next allocation triggers a slow OS-level memory request,
+    causing periodic multi-hundred-ms spikes.
+
+    The pool pre-allocates nodes and reuses them across detect() calls,
+    eliminating the allocation spike. On exhaustion it grows by 50%
+    (minimum 4096); the extra capacity persists across reset(), so growth
+    happens at most until the largest micro-batch has been seen once.
+
+    The pool only pays off when it outlives a single detect() call, so the
+    process-wide shared instance is obtained via :meth:`instance()` (lazy:
+    nothing is allocated until the first detect()). The pool is pure scratch
+    memory — every detect() starts with reset() — so sharing it across
+    detector instances is safe in the single-threaded training worker.
+    """
+
+    __slots__ = ("_nodes", "_index")
+
+    _instance: _TrieNodePool | None = None
+
+    def __init__(self, initial_size: int = 16384) -> None:
+        self._nodes: list[_TrieNode] = [_TrieNode() for _ in range(initial_size)]
+        self._index = 0
+
+    @classmethod
+    def instance(cls) -> _TrieNodePool:
+        """Return the shared pool, creating it lazily on first use."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def get(self, depth: int = 0) -> _TrieNode:
+        if self._index >= len(self._nodes):
+            # Pool exhausted: extend by 50%
+            extend = max(4096, len(self._nodes) // 2)
+            self._nodes.extend([_TrieNode() for _ in range(extend)])
+        node = self._nodes[self._index]
+        self._index += 1
+        node.reset(depth)
+        return node
+
+    def reset(self) -> None:
+        """Reset pool for next detect() call."""
+        self._index = 0
+
 
 class TriePrefixDetector(PrefixDetector):
     """Detect per-sample reuse relations with an online token trie.
@@ -145,6 +201,9 @@ class TriePrefixDetector(PrefixDetector):
     becomes a reuser of the provider recorded at the matched trie node. The
     current sequence is then inserted, allowing it to provide longer prefixes to
     later samples.
+
+    Trie nodes come from the shared :meth:`_TrieNodePool.instance()` to avoid
+    periodic memory allocation spikes (see _TrieNodePool docstring).
     """
 
     def __init__(self, min_prefix_len: int = 1, min_group_size: int = 2) -> None:
@@ -157,7 +216,9 @@ class TriePrefixDetector(PrefixDetector):
 
     def detect(self, input_ids: Sequence[TokenSequence]) -> PrefixDetectionResult:
         batch_size = len(input_ids)
-        root = _TrieNode()
+        pool = _TrieNodePool.instance()
+        pool.reset()
+        root = pool.get(depth=0)
         provider_index = list(range(batch_size))
         prefix_lens = [0] * batch_size
         is_provider = [True] * batch_size
@@ -165,18 +226,35 @@ class TriePrefixDetector(PrefixDetector):
 
         for index, seq in enumerate(input_ids):
             node = root
+            root.indices.append(index)
+
             matched = 0
             matched_provider = -1
             matched_group_size = 0
+            still_matching = True
+
             for token in seq:
-                child = node.children.get(int(token))
-                if child is None:
-                    break
-                node = child
-                matched += 1
-                if node.provider_index >= 0:
-                    matched_provider = node.provider_index
-                    matched_group_size = len(node.indices) + 1
+                token = int(token)
+                child = node.children.get(token)
+
+                if still_matching and child is not None:
+                    # Still on a matching path: reuse existing node
+                    node = child
+                    matched += 1
+                    if node.provider_index >= 0:
+                        matched_provider = node.provider_index
+                        # +1 because current index hasn't been appended yet
+                        matched_group_size = len(node.indices) + 1
+                else:
+                    # Match ended (or never started): switch to insert mode
+                    still_matching = False
+                    if child is None:
+                        child = pool.get(depth=node.depth + 1)
+                        child.provider_index = index
+                        node.children[token] = child
+                    node = child
+
+                node.indices.append(index)
 
             if (
                 matched >= self.min_prefix_len
@@ -192,18 +270,6 @@ class TriePrefixDetector(PrefixDetector):
                 provider_index[index] = matched_provider
                 prefix_lens[index] = matched
                 is_provider[index] = False
-
-            node = root
-            node.indices.append(index)
-            for token in seq:
-                token = int(token)
-                child = node.children.get(token)
-                if child is None:
-                    child = _TrieNode(node.depth + 1)
-                    child.provider_index = index
-                    node.children[token] = child
-                node = child
-                node.indices.append(index)
 
         return PrefixDetectionResult(
             batch_size=batch_size,

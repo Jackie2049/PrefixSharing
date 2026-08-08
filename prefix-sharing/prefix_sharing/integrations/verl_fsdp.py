@@ -20,8 +20,10 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import _clone_batch
 from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
 from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import _extract_sequences_async
 from prefix_sharing.integrations.verl_utils import _is_nested_tensor
 from prefix_sharing.integrations.verl_utils import _trim_nested_batch
 
@@ -207,10 +209,7 @@ def build_prefix_sharing_micro_batch_fsdp(
             attention_mask[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = [
-            input_ids[row, indices].detach().cpu().tolist()
-            for row, indices in enumerate(valid_indices)
-        ]
+        sequences = _extract_sequences_async(input_ids, valid_indices)
     prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
         return batch, None
@@ -245,7 +244,7 @@ def build_prefix_sharing_micro_batch_fsdp(
             trimmed_micro_batch,
             prefix_sharing_plan,
             is_nested_tensor=False,
-            attention_mask_bool=attention_mask,
+            valid_indices=valid_indices,
         )
 
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
@@ -340,17 +339,6 @@ def restore_prefix_sharing_outputs_2d(
     if ctx.stats is not None:
         ctx.stats.record_restore(restored_reusers)
     return output
-
-
-def _clone_batch(batch: Any) -> Any:
-    if hasattr(batch, "clone"):
-        try:
-            return batch.clone()
-        except TypeError:
-            pass
-    if isinstance(batch, dict):
-        return dict(batch)
-    return batch.copy()
 
 
 def _run_packed_attention_runtime(
