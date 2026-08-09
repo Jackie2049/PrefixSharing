@@ -1,10 +1,17 @@
-"""compatibility matrix for dependency versions."""
+"""module: prefix_sharing.setup.compat_matrix
+
+This module defines the compatibility matrix for dependency versions.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from prefix_sharing.setup.version_guard import DetectedVersions
+
+
+class IncompatibleEnvironment(RuntimeError):
+    """Raised when the detected version combination is not in the compatibility matrix."""
 
 
 @dataclass(frozen=True)

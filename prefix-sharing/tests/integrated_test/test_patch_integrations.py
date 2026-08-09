@@ -2,7 +2,7 @@ import pytest
 
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
-from prefix_sharing.setup.logged_patch import LoggedPatchManager
+from prefix_sharing.setup.patch_installer import LoggedPatchManager
 class Target:
     def method(self):
         return "original"
@@ -127,8 +127,7 @@ def test_explicit_patch_set_deduplicates_preserving_order():
 
 def test_install_loads_all_resolved_patch_sets(monkeypatch):
     from prefix_sharing.setup import install
-    from prefix_sharing.setup.logged_patch import PatchHandle
-    from prefix_sharing.setup.registry import PatchSpec
+    from prefix_sharing.setup.patch_installer import PatchHandle, PatchSpec
 
     loaded_patch_sets = []
     installed_specs = []
@@ -153,7 +152,7 @@ def test_install_loads_all_resolved_patch_sets(monkeypatch):
         lambda patch_set_id: ["verl080_fsdp", "verl080_mcore0161_ms0160"],
     )
     monkeypatch.setattr("prefix_sharing.setup._load_patch_set", fake_load_patch_set)
-    monkeypatch.setattr("prefix_sharing.setup.PatchRegistry.install_specs", fake_install_specs)
+    monkeypatch.setattr("prefix_sharing.setup.install_specs", fake_install_specs)
 
     handle = install()
 

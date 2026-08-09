@@ -1,38 +1,40 @@
-"""setup — 版本门卫 + 条件化运行时 patch 注入。
+"""module: prefix_sharing.setup
 
-使用：
+This module provides the version guard and runtime patch injection functionality.
+
+Usage:
     import prefix_sharing
-    handle = prefix_sharing.setup.install()
+    handle = prefix_sharing.setup.install() # install prefix-sharing's patches for the current environment
     print(handle.describe())
-    handle.disable()
+    handle.disable() # rollback above patches
 """
 
 from __future__ import annotations
 
 import importlib
 from prefix_sharing.setup.version_guard import detect_versions, DetectedVersions
-from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
-from prefix_sharing.setup.registry import PatchSpec, PatchRegistry
-from prefix_sharing.setup.logged_patch import PatchHandle
-
-
-class IncompatibleEnvironment(RuntimeError):
-    """版本组合不在兼容矩阵中。"""
+from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
+from prefix_sharing.setup.patch_installer import (
+    PatchHandle,
+    PatchRegistry as PatchRegistry,
+    PatchSpec,
+    install_specs,
+)
 
 
 def check() -> DetectedVersions:
-    """仅探测版本并校验兼容性，不安装 patch。
+    """Detect versions and validate compatibility without installing patches.
 
-    Returns: 探测到的版本信息
-    Raises: IncompatibleEnvironment — 没有任何兼容 patch set
+    Returns: detected version info
+    Raises: IncompatibleEnvironment — no matching patch set
     """
     versions = detect_versions()
     entries = _find_compat_entries(versions)
     if not entries:
         raise IncompatibleEnvironment(
-            f"不兼容的版本组合: verl={versions.verl}, "
+            f"Incompatible version combination: verl={versions.verl}, "
             f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}。\n"
+            f"mindspeed={versions.mindspeed}.\n"
             + _format_compat_matrix()
         )
     patch_set_ids = [entry.patch_set_id for entry in entries]
@@ -44,13 +46,13 @@ def check() -> DetectedVersions:
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
-    """安装 prefix-sharing patch。
+    """Install prefix-sharing patches.
 
-    默认安装当前环境所有匹配的 patch sets；显式传入 patch_set_id 时
-    只安装指定 patch set。显式值支持逗号分隔，便于调试时限制 patch 范围。
+    By default installs every patch set that matches the current environment.
+    When ``patch_set_id`` is given, only the specified patch set is installed.
 
-    Returns: PatchHandle — 可调用 describe() 查看详情、disable() 回滚
-    Raises: IncompatibleEnvironment — 版本组合不兼容
+    Returns: PatchHandle — call describe() for details, disable() to roll back
+    Raises: IncompatibleEnvironment — version combination is unsupported
     """
     patch_set_ids = _resolve_patch_set_ids(patch_set_id)
     if patch_set_id is not None:
@@ -61,7 +63,7 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
         patch_specs.extend(_load_patch_set(patch_set))
     patch_specs = _dedupe_patch_specs(patch_specs)
 
-    handle = PatchRegistry.install_specs(patch_specs)
+    handle = install_specs(patch_specs)
 
     print(
         f"[PS] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
@@ -84,9 +86,9 @@ def _resolve_patch_set_ids(
     entries = _find_compat_entries(versions)
     if not entries:
         raise IncompatibleEnvironment(
-            f"不兼容的版本组合: verl={versions.verl}, "
+            f"Incompatible version combination: verl={versions.verl}, "
             f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}。\n"
+            f"mindspeed={versions.mindspeed}.\n"
             + _format_compat_matrix()
         )
     return _dedupe([entry.patch_set_id for entry in entries])
@@ -132,7 +134,7 @@ def _load_patch_set(patch_set_id: str) -> list[PatchSpec]:
 
 
 def _format_compat_matrix() -> str:
-    lines = ["支持的组合："]
+    lines = ["Supported combinations:"]
     for e in COMPAT_MATRIX:
         parts = []
         if e.verl is not None:
@@ -143,5 +145,5 @@ def _format_compat_matrix() -> str:
             parts.append(f"megatron-core={e.megatron_core}")
         if e.mindspeed is not None:
             parts.append(f"mindspeed={e.mindspeed}")
-        lines.append(f"  组合{e.patch_set_id}: " + " + ".join(parts))
+        lines.append(f"  combination {e.patch_set_id}: " + " + ".join(parts))
     return "\n".join(lines)
