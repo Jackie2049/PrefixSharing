@@ -161,7 +161,6 @@ def _forward_step_with_engine_prepare(
     import torch
     from contextlib import nullcontext
 
-    from prefix_sharing.integrations.context import current_prefix_sharing_context
     from prefix_sharing.integrations.context import create_prefix_sharing_context
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
     from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp

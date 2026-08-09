@@ -9,7 +9,7 @@ Patch 目标：
 ``prefix_sharing.setup.install("verl080_fsdp")`` 显式安装。
 """
 
-from prefix_sharing.setup.registry import PatchSpec
+from prefix_sharing.setup.patch_installer import PatchSpec
 
 from .forward_step import (
     patch_forward_backward_batch_for_diag_dump,

@@ -10,7 +10,7 @@ Patch 目标：
 所有业务逻辑由 integrations 层处理，本 patch set 只负责 thin wrapper 编排。
 """
 
-from prefix_sharing.setup.registry import PatchSpec
+from prefix_sharing.setup.patch_installer import PatchSpec
 from .forward_step import patch_verl_forward_step
 from .attention import patch_megatron_attention
 from .vocab_logprobs import patch_megatron_vocab

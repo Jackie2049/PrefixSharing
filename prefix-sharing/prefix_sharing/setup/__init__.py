@@ -1,138 +1,104 @@
-"""setup — 版本门卫 + 条件化运行时 patch 注入。
+"""module: prefix_sharing.setup
 
-使用：
+This module provides the version guard and runtime patch injection functionality.
+
+Usage:
     import prefix_sharing
-    handle = prefix_sharing.setup.install()
-    print(handle.describe())
-    handle.disable()
+    patch_handle = prefix_sharing.setup.install() # install prefix-sharing's patches for the current environment
+    print(patch_handle.describe())
+    patch_handle.disable() # rollback above patches
 """
 
 from __future__ import annotations
 
 import importlib
-from prefix_sharing.setup.version_guard import detect_versions, DetectedVersions
-from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
-from prefix_sharing.setup.registry import PatchSpec, PatchRegistry
-from prefix_sharing.setup.logged_patch import PatchHandle
-
-
-class IncompatibleEnvironment(RuntimeError):
-    """版本组合不在兼容矩阵中。"""
-
-
-def check() -> DetectedVersions:
-    """仅探测版本并校验兼容性，不安装 patch。
-
-    Returns: 探测到的版本信息
-    Raises: IncompatibleEnvironment — 没有任何兼容 patch set
-    """
-    versions = detect_versions()
-    entries = _find_compat_entries(versions)
-    if not entries:
-        raise IncompatibleEnvironment(
-            f"不兼容的版本组合: verl={versions.verl}, "
-            f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}。\n"
-            + _format_compat_matrix()
-        )
-    patch_set_ids = [entry.patch_set_id for entry in entries]
-    print(
-        f"[PS] Version check: verl={versions.verl}, megatron_core={versions.megatron_core}, "
-        f"mindspeed={versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
-    )
-    return versions
+from prefix_sharing.setup.version_detector import detect_dependency_versions, DependencyDetectedVersions
+from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
+from prefix_sharing.setup import patch_installer
+from prefix_sharing.setup.patch_installer import PatchHandle, PatchSpec
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
-    """安装 prefix-sharing patch。
+    """Install prefix-sharing patches.
 
-    默认安装当前环境所有匹配的 patch sets；显式传入 patch_set_id 时
-    只安装指定 patch set。显式值支持逗号分隔，便于调试时限制 patch 范围。
+    By default installs every patch set that matches the current environment.
+    When ``patch_set_id`` is given, only the specified patch set is installed.
 
-    Returns: PatchHandle — 可调用 describe() 查看详情、disable() 回滚
-    Raises: IncompatibleEnvironment — 版本组合不兼容
+    Returns: PatchHandle — call describe() for details, disable() to roll back
+    Raises: IncompatibleEnvironment — when version combination is unsupported
     """
     patch_set_ids = _resolve_patch_set_ids(patch_set_id)
     if patch_set_id is not None:
-        print(f"[PS] install() using explicit patch_sets={patch_set_ids}")
+        print(f"[PrefixSharing] using explicit patch_sets={patch_set_ids}")
 
     patch_specs: list[PatchSpec] = []
     for patch_set in patch_set_ids:
-        patch_specs.extend(_load_patch_set(patch_set))
-    patch_specs = _dedupe_patch_specs(patch_specs)
+        mod = importlib.import_module(f"prefix_sharing.setup.patches.{patch_set}")
+        patch_specs.extend(mod.PATCH_SET)
 
-    handle = PatchRegistry.install_specs(patch_specs)
+    patch_handle = patch_installer.install_specs(patch_specs)
 
     print(
-        f"[PS] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
+        f"[PrefixSharing] setup.install() complete. patch_sets={patch_set_ids}"
     )
-    return handle
+    return patch_handle
 
 
-def _resolve_patch_set_ids(
-    patch_set_id: str | None,
-    *,
-    versions: DetectedVersions | None = None,
-) -> list[str]:
+def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
+    """Resolve patch-set package names to install.
+
+    CompatEntry.patch_set_id is the package under setup/patches/, e.g.
+    patch_set_id=\"verl080_fsdp\" → patches/verl080_fsdp (its PATCH_SET).
+
+    Explicit ``patch_set_id`` skips automatic matching; otherwise detect
+    dependency versions, match compatibility entries, and collect their
+    patch_set_id values.
+    """
+    def _deduplicate(patch_set_ids: list[str]) -> list[str]:
+        return list(dict.fromkeys(patch_set_ids))
+
     if patch_set_id is not None:
-        values = [value.strip() for value in patch_set_id.split(",") if value.strip()]
-        if not values:
+        patch_set_ids = [
+            part.strip() for part in patch_set_id.split(",") if part.strip()
+        ]
+        if not patch_set_ids:
             raise ValueError("patch_set_id must not be empty")
-        return _dedupe(values)
+        return _deduplicate(patch_set_ids)
 
-    versions = versions or check()
-    entries = _find_compat_entries(versions)
-    if not entries:
+    dependency_versions = detect_dependency_versions()
+    compat_entries = _match_compat_entries(dependency_versions)
+    return _deduplicate([entry.patch_set_id for entry in compat_entries])
+
+
+def _match_compat_entries(
+    dependency_versions: DependencyDetectedVersions,
+) -> list[CompatEntry]:
+    """Match ``dependency_versions`` against the compatibility matrix.
+
+    Returns: matched compatibility entries (non-empty)
+    Raises: IncompatibleEnvironment — no matching patch set
+    """
+    compat_entries = [
+        entry for entry in COMPAT_MATRIX if entry.match(dependency_versions)
+    ]
+    if not compat_entries:
         raise IncompatibleEnvironment(
-            f"不兼容的版本组合: verl={versions.verl}, "
-            f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}。\n"
-            + _format_compat_matrix()
+            f"Incompatible dependency versions: verl={dependency_versions.verl}, "
+            f"megatron_core={dependency_versions.megatron_core}, "
+            f"mindspeed={dependency_versions.mindspeed}.\n"
+            + _show_compat_matrix()
         )
-    return _dedupe([entry.patch_set_id for entry in entries])
-
-
-def _find_compat_entries(versions: DetectedVersions) -> list[CompatEntry]:
-    return [entry for entry in COMPAT_MATRIX if entry.match(versions)]
-
-
-def _find_compat_entry(versions: DetectedVersions) -> CompatEntry | None:
-    entries = _find_compat_entries(versions)
-    return entries[0] if entries else None
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
-
-
-def _dedupe_patch_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
-    seen: set[tuple[str, str]] = set()
-    result: list[PatchSpec] = []
-    for spec in specs:
-        key = (spec.module_name, spec.description)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(spec)
-    return result
-
-
-def _load_patch_set(patch_set_id: str) -> list[PatchSpec]:
-    mod = importlib.import_module(
-        f"prefix_sharing.setup.patches.{patch_set_id}"
+    patch_set_ids = [entry.patch_set_id for entry in compat_entries]
+    print(
+        f"[PrefixSharing] Version check: verl={dependency_versions.verl}, "
+        f"megatron_core={dependency_versions.megatron_core}, "
+        f"mindspeed={dependency_versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
     )
-    return mod.PATCH_SET
+    return compat_entries
 
 
-def _format_compat_matrix() -> str:
-    lines = ["支持的组合："]
+def _show_compat_matrix() -> str:
+    lines = ["Supported combinations:"]
     for e in COMPAT_MATRIX:
         parts = []
         if e.verl is not None:
@@ -143,5 +109,5 @@ def _format_compat_matrix() -> str:
             parts.append(f"megatron-core={e.megatron_core}")
         if e.mindspeed is not None:
             parts.append(f"mindspeed={e.mindspeed}")
-        lines.append(f"  组合{e.patch_set_id}: " + " + ".join(parts))
+        lines.append(f"  combination {e.patch_set_id}: " + " + ".join(parts))
     return "\n".join(lines)

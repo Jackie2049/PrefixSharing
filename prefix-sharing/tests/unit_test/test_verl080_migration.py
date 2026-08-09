@@ -12,17 +12,12 @@
 属于 integrated_test，本地不可运行，在 NPU/GPU 环境中单独验证。
 """
 
-from dataclasses import dataclass
-
 import pytest
 
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.integrations.context import (
-    current_prefix_sharing_context,
-    prefix_sharing_runtime_context,
-)
+from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 
@@ -153,24 +148,25 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
 def test_compat_matrix_prefers_verl080_fsdp_even_when_mcore_is_installed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
-    versions = DetectedVersions(
+    versions = DependencyDetectedVersions(
         verl="0.8.0.dev",
         megatron_core="0.16.1",
         mindspeed="0.16.0",
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert matching
-    assert matching[0].patch_set_id == "verl080_fsdp"
-    assert any(e.patch_set_id == "verl080_mcore0161_ms0160" for e in matching)
+    assert [entry.patch_set_id for entry in matching] == [
+        "verl080_fsdp",
+        "verl080_mcore0161_ms0160",
+    ]
 
 
 def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
-    versions = DetectedVersions(
+    versions = DependencyDetectedVersions(
         verl="0.8.0.dev",
         megatron_core=None,
         mindspeed=None,
@@ -180,11 +176,24 @@ def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
     assert matching[0].patch_set_id == "verl080_fsdp"
 
 
+def test_compat_matrix_selects_only_fsdp_without_mindspeed():
+    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
+
+    versions = DependencyDetectedVersions(
+        verl="0.8.0.dev",
+        megatron_core="0.16.1",
+        mindspeed=None,
+    )
+    matching = [entry for entry in COMPAT_MATRIX if entry.match(versions)]
+    assert [entry.patch_set_id for entry in matching] == ["verl080_fsdp"]
+
+
 def test_compat_matrix_no_match_raises_incompatible():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
-    versions = DetectedVersions(
+    versions = DependencyDetectedVersions(
         verl="0.7.0",  # 不匹配任何条目
         megatron_core="0.12.0",
         mindspeed="0.12.0",
@@ -303,7 +312,7 @@ def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert len(prefix_sharing._patch_handle._specs) == 7
+    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -314,7 +323,7 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert len(prefix_sharing._patch_handle._specs) == 7
+    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -324,4 +333,4 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import prefix_sharing
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is not None
-    assert len(prefix_sharing._patch_handle._specs) == 7
+    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
