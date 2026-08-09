@@ -65,7 +65,7 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
 def test_default_install_selects_all_matching_patch_sets(monkeypatch):
     from prefix_sharing.setup import _resolve_patch_set_ids
     from prefix_sharing.setup.compat_matrix import CompatEntry
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     monkeypatch.setattr(
         "prefix_sharing.setup.COMPAT_MATRIX",
@@ -86,7 +86,7 @@ def test_default_install_selects_all_matching_patch_sets(monkeypatch):
 def test_default_install_selects_fsdp_only_when_mcore_dependencies_absent(monkeypatch):
     from prefix_sharing.setup import _resolve_patch_set_ids
     from prefix_sharing.setup.compat_matrix import CompatEntry
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     monkeypatch.setattr(
         "prefix_sharing.setup.COMPAT_MATRIX",

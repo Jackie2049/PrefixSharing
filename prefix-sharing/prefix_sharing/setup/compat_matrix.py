@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from prefix_sharing.setup.version_guard import DetectedVersions
+from prefix_sharing.setup.version_detector import DetectedVersions
 
 
 class IncompatibleEnvironment(RuntimeError):

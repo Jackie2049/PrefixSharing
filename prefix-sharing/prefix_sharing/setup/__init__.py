@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
-from prefix_sharing.setup.version_guard import detect_versions, DetectedVersions
+from prefix_sharing.setup.version_detector import detect_versions, DetectedVersions
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
 from prefix_sharing.setup.patch_installer import (
     PatchHandle,

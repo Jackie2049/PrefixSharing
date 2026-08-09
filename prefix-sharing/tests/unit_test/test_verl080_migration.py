@@ -148,7 +148,7 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
 def test_compat_matrix_prefers_verl080_fsdp_even_when_mcore_is_installed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.8.0.dev",
@@ -164,7 +164,7 @@ def test_compat_matrix_prefers_verl080_fsdp_even_when_mcore_is_installed():
 
 def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.8.0.dev",
@@ -178,7 +178,7 @@ def test_compat_matrix_matches_verl080_fsdp_without_mcore_or_mindspeed():
 
 def test_compat_matrix_selects_only_fsdp_without_mindspeed():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.8.0.dev",
@@ -191,7 +191,7 @@ def test_compat_matrix_selects_only_fsdp_without_mindspeed():
 
 def test_compat_matrix_no_match_raises_incompatible():
     from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
+    from prefix_sharing.setup.version_detector import DetectedVersions
 
     versions = DetectedVersions(
         verl="0.7.0",  # 不匹配任何条目
