@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from prefix_sharing.setup.version_detector import DetectedVersions
+from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
 
 class IncompatibleEnvironment(RuntimeError):
@@ -25,7 +25,7 @@ class CompatEntry:
     patch_set_id: str
     notes: str = ""
 
-    def match(self, versions: DetectedVersions) -> bool:
+    def match(self, versions: DependencyDetectedVersions) -> bool:
         """Return True if detected versions fully match this compatibility rule."""
         return (
             self._version_match(self.verl, versions.verl)

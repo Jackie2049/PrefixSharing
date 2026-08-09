@@ -12,33 +12,33 @@ import sys
 
 
 @dataclass(frozen=True)
-class DetectedVersions:
+class DependencyDetectedVersions:
     verl: str | None
     megatron_core: str | None
     mindspeed: str | None
 
 
-def detect_versions() -> DetectedVersions:
+def detect_dependency_versions() -> DependencyDetectedVersions:
     """Detect installed versions of dependencies.
 
     Lookup order: sys.modules → importlib.import_module → importlib.metadata.
     None means the library is not present in the current environment.
     """
-    verl_ver = _detect_from_module("verl")
-    mcore_ver = _detect_from_module("megatron.core")
-    ms_ver = _detect_from_metadata("mindspeed") # MindSpeed has no __version__， read package metadata instead.
+    verl_ver = _detect_version_from_module("verl")
+    mcore_ver = _detect_version_from_module("megatron.core")
+    ms_ver = _detect_version_from_metadata("mindspeed") # MindSpeed has no __version__， read package metadata instead.
 
     print(
         f"[PrefixSharing] Detected versions: verl={verl_ver}, megatron_core={mcore_ver}, mindspeed={ms_ver}"
     )
-    return DetectedVersions(
+    return DependencyDetectedVersions(
         verl=verl_ver,
         megatron_core=mcore_ver,
         mindspeed=ms_ver,
     )
 
 
-def _detect_from_module(module_name: str, attr: str = "__version__") -> str | None:
+def _detect_version_from_module(module_name: str, attr: str = "__version__") -> str | None:
     """Read a version attribute from a loaded or importable module."""
     if module_name in sys.modules:
         return getattr(sys.modules[module_name], attr, None)
@@ -49,7 +49,7 @@ def _detect_from_module(module_name: str, attr: str = "__version__") -> str | No
         return None
 
 
-def _detect_from_metadata(module_name: str, *, package: str | None = None) -> str | None:
+def _detect_version_from_metadata(module_name: str, *, package: str | None = None) -> str | None:
     """Read version from package metadata after ensuring the module is importable.
     """
     package = package or module_name

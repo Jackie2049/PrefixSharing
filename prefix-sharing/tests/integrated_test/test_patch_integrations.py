@@ -65,7 +65,7 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
 def test_default_install_selects_all_matching_patch_sets(monkeypatch):
     from prefix_sharing.setup import _resolve_patch_set_ids
     from prefix_sharing.setup.compat_matrix import CompatEntry
-    from prefix_sharing.setup.version_detector import DetectedVersions
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
     monkeypatch.setattr(
         "prefix_sharing.setup.COMPAT_MATRIX",
@@ -74,19 +74,21 @@ def test_default_install_selects_all_matching_patch_sets(monkeypatch):
             CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
         ],
     )
-
-    patch_set_ids = _resolve_patch_set_ids(
-        None,
-        versions=DetectedVersions("0.8.0.dev", "0.16.1", "0.16.0"),
+    monkeypatch.setattr(
+        "prefix_sharing.setup.detect_and_validate_dependency_versions",
+        lambda: DependencyDetectedVersions("0.8.0.dev", "0.16.1", "0.16.0"),
     )
 
-    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+    assert _resolve_patch_set_ids(None) == [
+        "verl080_fsdp",
+        "verl080_mcore0161_ms0160",
+    ]
 
 
 def test_default_install_selects_fsdp_only_when_mcore_dependencies_absent(monkeypatch):
     from prefix_sharing.setup import _resolve_patch_set_ids
     from prefix_sharing.setup.compat_matrix import CompatEntry
-    from prefix_sharing.setup.version_detector import DetectedVersions
+    from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
     monkeypatch.setattr(
         "prefix_sharing.setup.COMPAT_MATRIX",
@@ -95,13 +97,12 @@ def test_default_install_selects_fsdp_only_when_mcore_dependencies_absent(monkey
             CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
         ],
     )
-
-    patch_set_ids = _resolve_patch_set_ids(
-        None,
-        versions=DetectedVersions("0.8.0.dev", None, None),
+    monkeypatch.setattr(
+        "prefix_sharing.setup.detect_and_validate_dependency_versions",
+        lambda: DependencyDetectedVersions("0.8.0.dev", None, None),
     )
 
-    assert patch_set_ids == ["verl080_fsdp"]
+    assert _resolve_patch_set_ids(None) == ["verl080_fsdp"]
 
 
 def test_explicit_patch_set_accepts_comma_separated_list():

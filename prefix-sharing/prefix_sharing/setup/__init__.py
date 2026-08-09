@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
-from prefix_sharing.setup.version_detector import detect_versions, DetectedVersions
+from prefix_sharing.setup.version_detector import detect_dependency_versions, DependencyDetectedVersions
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
 from prefix_sharing.setup.patch_installer import (
     PatchHandle,
@@ -22,27 +22,28 @@ from prefix_sharing.setup.patch_installer import (
 )
 
 
-def check() -> DetectedVersions:
-    """Detect versions and validate compatibility without installing patches.
+def detect_and_validate_dependency_versions() -> DependencyDetectedVersions:
+    """Detect dependency versions and validate them against the compatibility matrix.
 
-    Returns: detected version info
+    Returns: detected dependency versions
     Raises: IncompatibleEnvironment — no matching patch set
     """
-    versions = detect_versions()
-    entries = _find_compat_entries(versions)
-    if not entries:
+    dependency_versions = detect_dependency_versions()
+    compat_entries = _find_compat_entries(dependency_versions)
+    if not compat_entries:
         raise IncompatibleEnvironment(
-            f"Incompatible version combination: verl={versions.verl}, "
-            f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}.\n"
-            + _format_compat_matrix()
+            f"Incompatible dependency versions: verl={dependency_versions.verl}, "
+            f"megatron_core={dependency_versions.megatron_core}, "
+            f"mindspeed={dependency_versions.mindspeed}.\n"
+            + _show_compat_matrix()
         )
-    patch_set_ids = [entry.patch_set_id for entry in entries]
+    patch_set_ids = [entry.patch_set_id for entry in compat_entries]
     print(
-        f"[PS] Version check: verl={versions.verl}, megatron_core={versions.megatron_core}, "
-        f"mindspeed={versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
+        f"[PrefixSharing] Version check: verl={dependency_versions.verl}, "
+        f"megatron_core={dependency_versions.megatron_core}, "
+        f"mindspeed={dependency_versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
     )
-    return versions
+    return dependency_versions
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
@@ -52,11 +53,11 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
     When ``patch_set_id`` is given, only the specified patch set is installed.
 
     Returns: PatchHandle — call describe() for details, disable() to roll back
-    Raises: IncompatibleEnvironment — version combination is unsupported
+    Raises: IncompatibleEnvironment — when version combination is unsupported
     """
     patch_set_ids = _resolve_patch_set_ids(patch_set_id)
     if patch_set_id is not None:
-        print(f"[PS] install() using explicit patch_sets={patch_set_ids}")
+        print(f"[PrefixSharing] install() using explicit patch_sets={patch_set_ids}")
 
     patch_specs: list[PatchSpec] = []
     for patch_set in patch_set_ids:
@@ -66,52 +67,46 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
     handle = install_specs(patch_specs)
 
     print(
-        f"[PS] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
+        f"[PrefixSharing] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
     )
     return handle
 
 
-def _resolve_patch_set_ids(
-    patch_set_id: str | None,
-    *,
-    versions: DetectedVersions | None = None,
-) -> list[str]:
+def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
+    def _dedupe(patch_set_ids: list[str]) -> list[str]:
+        return list(dict.fromkeys(patch_set_ids))
+
     if patch_set_id is not None:
-        values = [value.strip() for value in patch_set_id.split(",") if value.strip()]
-        if not values:
+        patch_set_ids = [
+            part.strip() for part in patch_set_id.split(",") if part.strip()
+        ]
+        if not patch_set_ids:
             raise ValueError("patch_set_id must not be empty")
-        return _dedupe(values)
+        return _dedupe(patch_set_ids)
 
-    versions = versions or check()
-    entries = _find_compat_entries(versions)
-    if not entries:
+    dependency_versions = detect_and_validate_dependency_versions()
+    compat_entries = _find_compat_entries(dependency_versions)
+    if not compat_entries:
         raise IncompatibleEnvironment(
-            f"Incompatible version combination: verl={versions.verl}, "
-            f"megatron_core={versions.megatron_core}, "
-            f"mindspeed={versions.mindspeed}.\n"
-            + _format_compat_matrix()
+            f"Incompatible version combination: verl={dependency_versions.verl}, "
+            f"megatron_core={dependency_versions.megatron_core}, "
+            f"mindspeed={dependency_versions.mindspeed}.\n"
+            + _show_compat_matrix()
         )
-    return _dedupe([entry.patch_set_id for entry in entries])
+    return _dedupe([entry.patch_set_id for entry in compat_entries])
 
 
-def _find_compat_entries(versions: DetectedVersions) -> list[CompatEntry]:
-    return [entry for entry in COMPAT_MATRIX if entry.match(versions)]
+def _find_compat_entries(
+    dependency_versions: DependencyDetectedVersions,
+) -> list[CompatEntry]:
+    return [entry for entry in COMPAT_MATRIX if entry.match(dependency_versions)]
 
 
-def _find_compat_entry(versions: DetectedVersions) -> CompatEntry | None:
-    entries = _find_compat_entries(versions)
-    return entries[0] if entries else None
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
+def _find_compat_entry(
+    dependency_versions: DependencyDetectedVersions,
+) -> CompatEntry | None:
+    compat_entries = _find_compat_entries(dependency_versions)
+    return compat_entries[0] if compat_entries else None
 
 
 def _dedupe_patch_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
@@ -133,7 +128,7 @@ def _load_patch_set(patch_set_id: str) -> list[PatchSpec]:
     return mod.PATCH_SET
 
 
-def _format_compat_matrix() -> str:
+def _show_compat_matrix() -> str:
     lines = ["Supported combinations:"]
     for e in COMPAT_MATRIX:
         parts = []
