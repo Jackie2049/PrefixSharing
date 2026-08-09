@@ -1,14 +1,12 @@
 """prefix_sharing.setup.patch_installer
 
-Install runtime monkey-patches: describe targets, choose when to apply them,
-perform the replacements, and support later inspection or rollback.
+Install PrefixSharing's runtime monkey-patches for the current environment.
 
-Scheduling rules:
+Installation rules:
 - module loaded and target resolvable → patch immediately
-- module loaded but target missing (import in progress) → pending, retry later
-- module not loaded → import hook patches after load
-- import hook restores builtins.__import__ when pending is empty, or after
-  consecutive misses (subprocess cases that never load training-side modules)
+- module loaded but target missing (import in progress) → pending, retry later (for lazy-loaded modules)
+- module not loaded → import hook patches after load (for lazy-loaded modules)
+- import hook restores builtins.__import__ when pending is empty, or after consecutive misses (for subprocesses that never load training-side modules)
 """
 
 from __future__ import annotations
