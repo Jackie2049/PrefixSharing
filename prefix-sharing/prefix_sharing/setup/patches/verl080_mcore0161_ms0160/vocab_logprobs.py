@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from prefix_sharing.diagnostics import diagnostic_dump_enabled
-
 from typing import Any
 
 

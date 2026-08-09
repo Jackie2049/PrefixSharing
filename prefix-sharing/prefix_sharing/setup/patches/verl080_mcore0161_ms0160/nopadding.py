@@ -19,8 +19,6 @@ from...import 引用此函数。每个模块的局部引用都需要被 patch。
 
 from __future__ import annotations
 
-from prefix_sharing.diagnostics import diagnostic_dump_enabled
-
 from typing import Any
 
 import torch
