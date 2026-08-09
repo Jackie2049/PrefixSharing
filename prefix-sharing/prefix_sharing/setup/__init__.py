@@ -4,9 +4,9 @@ This module provides the version guard and runtime patch injection functionality
 
 Usage:
     import prefix_sharing
-    handle = prefix_sharing.setup.install() # install prefix-sharing's patches for the current environment
-    print(handle.describe())
-    handle.disable() # rollback above patches
+    patch_handle = prefix_sharing.setup.install() # install prefix-sharing's patches for the current environment
+    print(patch_handle.describe())
+    patch_handle.disable() # rollback above patches
 """
 
 from __future__ import annotations
@@ -14,11 +14,8 @@ from __future__ import annotations
 import importlib
 from prefix_sharing.setup.version_detector import detect_dependency_versions, DependencyDetectedVersions
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
-from prefix_sharing.setup.patch_installer import (
-    PatchHandle,
-    PatchRegistry,
-    PatchSpec,
-)
+from prefix_sharing.setup import patch_installer
+from prefix_sharing.setup.patch_installer import PatchHandle, PatchSpec
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
@@ -39,12 +36,12 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
         mod = importlib.import_module(f"prefix_sharing.setup.patches.{patch_set}")
         patch_specs.extend(mod.PATCH_SET)
 
-    handle = PatchRegistry.install_specs(patch_specs)
+    patch_handle = patch_installer.install_specs(patch_specs)
 
     print(
         f"[PrefixSharing] setup.install() complete. patch_sets={patch_set_ids}"
     )
-    return handle
+    return patch_handle
 
 
 def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
@@ -57,7 +54,7 @@ def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
     dependency versions, match compatibility entries, and collect their
     patch_set_id values.
     """
-    def _dedupe(patch_set_ids: list[str]) -> list[str]:
+    def _deduplicate(patch_set_ids: list[str]) -> list[str]:
         return list(dict.fromkeys(patch_set_ids))
 
     if patch_set_id is not None:
@@ -66,11 +63,11 @@ def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
         ]
         if not patch_set_ids:
             raise ValueError("patch_set_id must not be empty")
-        return _dedupe(patch_set_ids)
+        return _deduplicate(patch_set_ids)
 
     dependency_versions = detect_dependency_versions()
     compat_entries = _match_compat_entries(dependency_versions)
-    return _dedupe([entry.patch_set_id for entry in compat_entries])
+    return _deduplicate([entry.patch_set_id for entry in compat_entries])
 
 
 def _match_compat_entries(

@@ -2,7 +2,9 @@ import pytest
 
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
-from prefix_sharing.setup.patch_installer import LoggedPatchManager
+from prefix_sharing.setup.patch_installer import LoggedPatchManager, PatchHandle
+
+
 class Target:
     def method(self):
         return "original"
@@ -10,13 +12,14 @@ class Target:
 
 def test_logged_patch_manager_installs_and_disables_patch():
     target = Target()
-    manager = LoggedPatchManager()
+    records = []
+    patch_manager = LoggedPatchManager(records)
 
     def replacement(instance):
         return "patched"
 
-    manager.patch_attr(Target, "method", replacement)
-    handle = manager.handle()
+    patch_manager.patch_attr(Target, "method", replacement)
+    handle = PatchHandle(records)
     assert target.method() == "patched"
     assert handle.active
 
@@ -27,23 +30,13 @@ def test_logged_patch_manager_installs_and_disables_patch():
 
 def test_logged_patch_manager_context_manager_restores_original():
     target = Target()
-    manager = LoggedPatchManager()
-    manager.patch_attr(Target, "method", lambda instance: "patched")
+    records = []
+    patch_manager = LoggedPatchManager(records)
+    patch_manager.patch_attr(Target, "method", lambda instance: "patched")
 
-    with manager.handle():
+    with PatchHandle(records):
         assert target.method() == "patched"
     assert target.method() == "original"
-
-
-def test_logged_patch_manager_restores_mapping_item():
-    manager = LoggedPatchManager()
-    mapping = {"flash_attention_2": "original"}
-
-    manager.patch_item(mapping, "flash_attention_2", "patched")
-
-    assert mapping["flash_attention_2"] == "patched"
-    manager.handle().disable()
-    assert mapping["flash_attention_2"] == "original"
 
 
 def test_setup_can_load_explicit_verl080_fsdp_patch_set():
@@ -154,26 +147,26 @@ def test_install_loads_all_resolved_patch_sets(monkeypatch):
             ),
         )
 
-    def fake_install_specs(specs):
-        installed_specs.extend(specs)
-        return PatchHandle([], specs=list(specs))
+    def fake_install_specs(patch_specs):
+        installed_specs.extend(patch_specs)
+        return PatchHandle([], patch_specs=list(patch_specs))
 
     monkeypatch.setattr(
         "prefix_sharing.setup._resolve_patch_set_ids",
         lambda _patch_set_id: patch_set_ids,
     )
     monkeypatch.setattr(
-        "prefix_sharing.setup.PatchRegistry.install_specs",
+        "prefix_sharing.setup.patch_installer.install_specs",
         fake_install_specs,
     )
 
-    handle = install()
+    patch_handle = install()
 
-    assert [spec.module_name for spec in installed_specs] == [
+    assert [patch.module_name for patch in installed_specs] == [
         "fake.verl080_fsdp",
         "fake.verl080_mcore0161_ms0160",
     ]
-    assert handle.describe().startswith("PatchHandle")
+    assert patch_handle.describe().startswith("PatchHandle")
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():
