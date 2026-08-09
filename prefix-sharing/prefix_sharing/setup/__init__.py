@@ -16,34 +16,9 @@ from prefix_sharing.setup.version_detector import detect_dependency_versions, De
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry, IncompatibleEnvironment
 from prefix_sharing.setup.patch_installer import (
     PatchHandle,
-    PatchRegistry as PatchRegistry,
+    PatchRegistry,
     PatchSpec,
-    install_specs,
 )
-
-
-def detect_and_validate_dependency_versions() -> DependencyDetectedVersions:
-    """Detect dependency versions and validate them against the compatibility matrix.
-
-    Returns: detected dependency versions
-    Raises: IncompatibleEnvironment — no matching patch set
-    """
-    dependency_versions = detect_dependency_versions()
-    compat_entries = _find_compat_entries(dependency_versions)
-    if not compat_entries:
-        raise IncompatibleEnvironment(
-            f"Incompatible dependency versions: verl={dependency_versions.verl}, "
-            f"megatron_core={dependency_versions.megatron_core}, "
-            f"mindspeed={dependency_versions.mindspeed}.\n"
-            + _show_compat_matrix()
-        )
-    patch_set_ids = [entry.patch_set_id for entry in compat_entries]
-    print(
-        f"[PrefixSharing] Version check: verl={dependency_versions.verl}, "
-        f"megatron_core={dependency_versions.megatron_core}, "
-        f"mindspeed={dependency_versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
-    )
-    return dependency_versions
 
 
 def install(patch_set_id: str | None = None) -> PatchHandle:
@@ -57,22 +32,31 @@ def install(patch_set_id: str | None = None) -> PatchHandle:
     """
     patch_set_ids = _resolve_patch_set_ids(patch_set_id)
     if patch_set_id is not None:
-        print(f"[PrefixSharing] install() using explicit patch_sets={patch_set_ids}")
+        print(f"[PrefixSharing] using explicit patch_sets={patch_set_ids}")
 
     patch_specs: list[PatchSpec] = []
     for patch_set in patch_set_ids:
-        patch_specs.extend(_load_patch_set(patch_set))
-    patch_specs = _dedupe_patch_specs(patch_specs)
+        mod = importlib.import_module(f"prefix_sharing.setup.patches.{patch_set}")
+        patch_specs.extend(mod.PATCH_SET)
 
-    handle = install_specs(patch_specs)
+    handle = PatchRegistry.install_specs(patch_specs)
 
     print(
-        f"[PrefixSharing] install() complete. {len(patch_specs)} patches active. patch_sets={patch_set_ids}"
+        f"[PrefixSharing] setup.install() complete. patch_sets={patch_set_ids}"
     )
     return handle
 
 
 def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
+    """Resolve patch-set package names to install.
+
+    CompatEntry.patch_set_id is the package under setup/patches/, e.g.
+    patch_set_id=\"verl080_fsdp\" → patches/verl080_fsdp (its PATCH_SET).
+
+    Explicit ``patch_set_id`` skips automatic matching; otherwise detect
+    dependency versions, match compatibility entries, and collect their
+    patch_set_id values.
+    """
     def _dedupe(patch_set_ids: list[str]) -> list[str]:
         return list(dict.fromkeys(patch_set_ids))
 
@@ -84,48 +68,36 @@ def _resolve_patch_set_ids(patch_set_id: str | None) -> list[str]:
             raise ValueError("patch_set_id must not be empty")
         return _dedupe(patch_set_ids)
 
-    dependency_versions = detect_and_validate_dependency_versions()
-    compat_entries = _find_compat_entries(dependency_versions)
+    dependency_versions = detect_dependency_versions()
+    compat_entries = _match_compat_entries(dependency_versions)
+    return _dedupe([entry.patch_set_id for entry in compat_entries])
+
+
+def _match_compat_entries(
+    dependency_versions: DependencyDetectedVersions,
+) -> list[CompatEntry]:
+    """Match ``dependency_versions`` against the compatibility matrix.
+
+    Returns: matched compatibility entries (non-empty)
+    Raises: IncompatibleEnvironment — no matching patch set
+    """
+    compat_entries = [
+        entry for entry in COMPAT_MATRIX if entry.match(dependency_versions)
+    ]
     if not compat_entries:
         raise IncompatibleEnvironment(
-            f"Incompatible version combination: verl={dependency_versions.verl}, "
+            f"Incompatible dependency versions: verl={dependency_versions.verl}, "
             f"megatron_core={dependency_versions.megatron_core}, "
             f"mindspeed={dependency_versions.mindspeed}.\n"
             + _show_compat_matrix()
         )
-    return _dedupe([entry.patch_set_id for entry in compat_entries])
-
-
-def _find_compat_entries(
-    dependency_versions: DependencyDetectedVersions,
-) -> list[CompatEntry]:
-    return [entry for entry in COMPAT_MATRIX if entry.match(dependency_versions)]
-
-
-def _find_compat_entry(
-    dependency_versions: DependencyDetectedVersions,
-) -> CompatEntry | None:
-    compat_entries = _find_compat_entries(dependency_versions)
-    return compat_entries[0] if compat_entries else None
-
-
-def _dedupe_patch_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
-    seen: set[tuple[str, str]] = set()
-    result: list[PatchSpec] = []
-    for spec in specs:
-        key = (spec.module_name, spec.description)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(spec)
-    return result
-
-
-def _load_patch_set(patch_set_id: str) -> list[PatchSpec]:
-    mod = importlib.import_module(
-        f"prefix_sharing.setup.patches.{patch_set_id}"
+    patch_set_ids = [entry.patch_set_id for entry in compat_entries]
+    print(
+        f"[PrefixSharing] Version check: verl={dependency_versions.verl}, "
+        f"megatron_core={dependency_versions.megatron_core}, "
+        f"mindspeed={dependency_versions.mindspeed} → compatible (patch_sets={patch_set_ids})"
     )
-    return mod.PATCH_SET
+    return compat_entries
 
 
 def _show_compat_matrix() -> str:

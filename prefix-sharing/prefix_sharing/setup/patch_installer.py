@@ -333,11 +333,6 @@ class PatchRegistry:
         return handle
 
 
-def install_specs(specs: list[PatchSpec]) -> PatchHandle:
-    """Module-level alias for ``PatchRegistry.install_specs``."""
-    return PatchRegistry.install_specs(specs)
-
-
 def _spec_key(spec: PatchSpec) -> tuple[str, str]:
     return spec.module_name, spec.description
 
@@ -356,15 +351,11 @@ def _apply_spec(spec: PatchSpec, module: object, manager: LoggedPatchManager) ->
 
 
 def _dedupe_specs(specs: list[PatchSpec]) -> list[PatchSpec]:
-    seen: set[tuple[str, str]] = set()
-    result: list[PatchSpec] = []
+    """Keep first occurrence of each (module_name, description)."""
+    deduped: dict[tuple[str, str], PatchSpec] = {}
     for spec in specs:
-        key = _spec_key(spec)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(spec)
-    return result
+        deduped.setdefault(_spec_key(spec), spec)
+    return list(deduped.values())
 
 
 _original_import = None
