@@ -28,10 +28,10 @@ def read_ps_config_from_engine_config(engine_config: Any) -> Any | None:
     if explicit_config is not None:
         return explicit_config
 
-    return _prefix_sharing_config_from_prefix_grouper(engine_config)
+    return read_ps_config_from_prefix_grouper(engine_config)
 
 
-def _prefix_sharing_config_from_prefix_grouper(engine_config: Any) -> dict[str, Any] | None:
+def read_ps_config_from_prefix_grouper(engine_config: Any) -> dict[str, Any] | None:
     use_prefix_grouper = _read_actor_value(engine_config, "use_prefix_grouper", False)
     if not use_prefix_grouper:
         return None

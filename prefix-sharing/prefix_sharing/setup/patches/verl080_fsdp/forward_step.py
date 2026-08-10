@@ -8,9 +8,14 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+import torch.utils.checkpoint as _ckpt
+
+from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
+from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
+
 
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
-    """Build the patched FSDPEngineWithLMHead.forward_step wrapper."""
 
     # Patch _CheckpointFrame.check_recomputed_tensors_match and
     # _internal_assert to no-op.
@@ -18,7 +23,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     # computation graph, causing the saved-tensor count mismatch detected by
     # these methods.  The recomputed values are numerically correct — the count
     # difference is benign.  Bypass both checks so ON-path training completes.
-    import torch.utils.checkpoint as _ckpt
     # Apply once, globally.
     if not getattr(patch_fsdp_forward_step, "_cp_patched", False):
         _ckpt._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
@@ -27,10 +31,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         patch_fsdp_forward_step._cp_patched = True
 
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
-        from prefix_sharing.core.config import PrefixSharingConfig
-        from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
-        from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
-
         raw_config = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(raw_config)
         if not ps_config.enable_prefix_sharing:
@@ -371,7 +371,6 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     if _ps_diag_fwd_ids.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     device_name = _read_device_name()
     autocast_ctx = (
