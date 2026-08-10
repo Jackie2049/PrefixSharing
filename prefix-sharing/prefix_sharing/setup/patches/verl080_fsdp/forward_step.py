@@ -580,6 +580,16 @@ def patch_forward_backward_batch_for_diag_dump(
     def wrapped(self: Any, data: Any, loss_function: Any, forward_only: bool = False) -> Any:
         result = original_forward_backward_batch(self, data, loss_function, forward_only)
 
+        # 无条件清理 PrefixSharing runtime context：打印 audit 日志 + 关闭 KV store。
+        # 之前该清理被误关在 PREFIX_SHARING_DIAG_DUMP 条件块内，导致正常训练时
+        # audit 日志不输出、KV store 不 close（多步训练存在内存累积风险）。
+        if not forward_only:
+            ctx_cleanup = getattr(self.module, "_ps_ctx_cleanup", None)
+            if ctx_cleanup is not None:
+                ctx_cleanup()
+                delattr(self.module, "_ps_ctx_cleanup")
+
+        # 诊断 dump 专用：dump weight gradients + 清理 per-layer attention grad hooks。
         if not forward_only and os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             tag = "train" if self.module.training else "old"
             print(
@@ -590,12 +600,6 @@ def patch_forward_backward_batch_for_diag_dump(
             from prefix_sharing.tools.diagnostic_dump import dump_weight_grads_verl080
 
             dump_weight_grads_verl080(self.module, tag)
-
-            # Clean up PrefixSharing context if the root backward hook did not fire.
-            ctx_cleanup = getattr(self.module, "_ps_ctx_cleanup", None)
-            if ctx_cleanup is not None:
-                ctx_cleanup()
-                delattr(self.module, "_ps_ctx_cleanup")
 
             # Remove per-layer attention gradient hooks.
             for module in self.module.modules():
