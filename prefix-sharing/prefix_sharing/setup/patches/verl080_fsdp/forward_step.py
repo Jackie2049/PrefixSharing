@@ -1,10 +1,6 @@
-"""Patch: FSDPEngineWithLMHead.forward_step — verl 0.8.0 FSDP 路径。
+"""patch: FSDPEngineWithLMHead.forward_step → verl080_fsdp.patch_fsdp_forward_step
 
-thin wrapper：读取 prefix_sharing_config，优先复用真实 engine 的
-``prepare_model_inputs`` / ``prepare_model_outputs``，在 forward 期间注入
-PrefixSharing runtime，并在输出阶段做 interior / prefix-last restore。
-本 patch 已覆盖 dense 2D 与 verl remove-padding 后的 jagged NestedTensor
-形态；Ulysses SP、fused kernels 等未验证形态仍在配置校验阶段显式拒绝。
+forward_step wrapper for PrefixSharing under verl 0.8.0 + FSDP.
 """
 
 from __future__ import annotations
@@ -14,7 +10,7 @@ from typing import Any, Callable
 
 
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
-    """创建 FSDPEngineWithLMHead.forward_step 的 patch wrapper。"""
+    """Build the patched FSDPEngineWithLMHead.forward_step wrapper."""
 
     # Patch _CheckpointFrame.check_recomputed_tensors_match and
     # _internal_assert to no-op.
@@ -74,7 +70,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
 
                 micro_batch = micro_batch.to(get_device_id())
             except Exception:
-                # 本地单测使用 plain dict / fake engine，不依赖 verl device helper。
+                # Local unit tests use plain dict / fake engine without verl device helpers.
                 pass
 
         ulysses_sp_size = _read_runtime_value(
@@ -212,7 +208,7 @@ def _forward_step_with_engine_prepare(
             diagnostic_tag,
         )
 
-    # 获取模型层数以支持 per-layer diagnostic dump
+    # Read layer count for per-layer diagnostic dumps.
     _diag_num_layers = int(getattr(
         getattr(getattr(self, "module", None), "config", None),
         "num_hidden_layers", 0)) or 0
@@ -359,9 +355,9 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     import torch
     from contextlib import nullcontext
 
-    # 对齐 verl 原生 forward_step：先把 micro_batch 搬到 device（disable 路径绕过了
-    # patched_forward_step 里那段 .to(device)，这里补上，否则 prepare_model_outputs
-    # 里 logits/temperature device 不一致）。
+    # Match native verl forward_step: move micro_batch to device first.
+    # The disable / no-sharing path skips the .to(device) in patched_forward_step;
+    # without it, logits/temperature can land on different devices in prepare_model_outputs.
     if hasattr(micro_batch, "to"):
         try:
             from verl.utils.device import get_device_id
@@ -370,7 +366,7 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
             pass
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-    # DIAG_DUMP: ON path dump原始full input_ids（suffix-only dump会缺失prefix tokens）
+    # DIAG_DUMP: dump original full input_ids (suffix-only dumps miss prefix tokens).
     import os as _ps_diag_fwd_ids
     if _ps_diag_fwd_ids.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
