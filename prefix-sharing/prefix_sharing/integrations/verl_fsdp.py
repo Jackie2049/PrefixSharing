@@ -1,7 +1,9 @@
-"""verl FSDP integration helpers for PrefixSharing.
+"""prefix_sharing.integrations.verl_fsdp
+
+verl FSDP integration helpers for PrefixSharing.
 
 The FSDP path follows the same public shape as the Megatron integration:
-``build_*`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
+``plan_and_trim_microbatch_fsdp`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
 The helpers stay framework-light enough for CPU tests, while the explicit
 ``verl080_fsdp`` patch set wires them into ``FSDPEngineWithLMHead.forward_step``.
 """
@@ -114,7 +116,7 @@ class PrefixSharingFSDPAttentionRuntime:
 def forward_prefix_sharing_fsdp_micro_batch(
     micro_batch: Any,
     model: Any,
-    config: PrefixSharingConfig,
+    ps_config: PrefixSharingConfig,
     *,
     model_config: Any | None = None,
     backend: Any | None = None,
@@ -134,9 +136,9 @@ def forward_prefix_sharing_fsdp_micro_batch(
     own ``prepare_model_inputs`` / ``prepare_model_outputs`` path.
     """
 
-    trimmed_micro_batch, runtime_state = build_prefix_sharing_micro_batch_fsdp(
+    trimmed_micro_batch, runtime_state = plan_and_trim_microbatch_fsdp(
         micro_batch,
-        config,
+        ps_config,
         model_config=model_config,
         backend=backend,
     )
@@ -173,33 +175,33 @@ def forward_prefix_sharing_fsdp_micro_batch(
         return output
 
 
-def build_prefix_sharing_micro_batch_fsdp(
-    batch: Any,
-    config: PrefixSharingConfig,
-    *,
+def plan_and_trim_microbatch_fsdp(
+    micro_batch: Any,
+    ps_config: PrefixSharingConfig,
     model_config: Any | None = None,
     backend: Any | None = None,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
-    """Build a trimmed FSDP micro-batch and PrefixSharing runtime state.
+    """Plan prefix sharing and trim one FSDP micro-batch.
 
+    Returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
     This helper is intentionally framework-light: it accepts dense 2D
     ``input_ids``/``attention_mask`` or jagged NestedTensor ``input_ids`` from
-    verl remove-padding, and returns the original batch unchanged when prefix
-    sharing is disabled or no reusable prefix is detected.
+    verl remove-padding, and returns the original micro-batch unchanged when
+    prefix sharing is disabled or no reusable prefix is detected.
     """
 
-    if not config.enable_prefix_sharing:
-        return batch, None
-    config.validate(model_config=model_config, integrate_mode="verl_fsdp")
+    if not ps_config.enable_prefix_sharing:
+        return micro_batch, None
+    ps_config.validate(model_config=model_config, integrate_mode="verl_fsdp")
 
-    input_ids = batch["input_ids"]
+    input_ids = micro_batch["input_ids"]
     is_nested_input = _is_nested_tensor(input_ids)
     if is_nested_input:
         sequences = _extract_seq_from_nested_tensor(input_ids)
         valid_indices = None
         attention_mask = None
     else:
-        attention_mask = batch["attention_mask"].to(bool)
+        attention_mask = micro_batch["attention_mask"].to(bool)
         if input_ids.dim() != 2 or attention_mask.dim() != 2:
             raise RuntimeError("prefix sharing FSDP path expects 2D or jagged NestedTensor input_ids")
         if input_ids.shape != attention_mask.shape:
@@ -210,19 +212,19 @@ def build_prefix_sharing_micro_batch_fsdp(
             for row in range(input_ids.shape[0])
         ]
         sequences = _extract_sequences_async(input_ids, valid_indices)
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+    prefix_sharing_plan = PrefixSharingPlanner(ps_config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
-        return batch, None
+        return micro_batch, None
 
     if is_nested_input:
-        trimmed_micro_batch = _trim_nested_batch(batch, prefix_sharing_plan)
+        trimmed_micro_batch = _trim_nested_batch(micro_batch, prefix_sharing_plan)
         kept_position_rows = _collect_kept_position_rows(
             trimmed_micro_batch,
             prefix_sharing_plan,
             is_nested_tensor=True,
         )
     else:
-        trimmed_micro_batch = _clone_batch(batch)
+        trimmed_micro_batch = _clone_batch(micro_batch)
         trimmed_attention_mask = attention_mask.clone()
         trimmed_attention_mask[:] = False
 
@@ -238,7 +240,7 @@ def build_prefix_sharing_micro_batch_fsdp(
             trimmed_loss_mask[:] = False
             for row, indices in enumerate(valid_indices):
                 keep_start, keep_end = prefix_sharing_plan.loss_mask_keep_ranges[row]
-                trimmed_loss_mask[row, indices[keep_start:keep_end]] = batch["loss_mask"][row, indices[keep_start:keep_end]].to(bool)
+                trimmed_loss_mask[row, indices[keep_start:keep_end]] = micro_batch["loss_mask"][row, indices[keep_start:keep_end]].to(bool)
             trimmed_micro_batch["loss_mask"] = trimmed_loss_mask
         kept_position_rows = _collect_kept_position_rows(
             trimmed_micro_batch,
@@ -253,7 +255,7 @@ def build_prefix_sharing_micro_batch_fsdp(
     )
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        attention_backend=get_backend_instance(config, backend),
+        attention_backend=get_backend_instance(ps_config, backend),
         packed_batch_layout=packed_batch_layout,
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),

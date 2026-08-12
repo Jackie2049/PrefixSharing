@@ -31,8 +31,10 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         patch_fsdp_forward_step._cp_patched = True
 
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
-        raw_config = read_ps_config_from_engine_config(self.engine_config)
-        ps_config = PrefixSharingConfig.from_raw(raw_config)
+
+        raw_config = read_ps_config_from_engine_config(self.engine_config) # framework-level config
+        ps_config = PrefixSharingConfig.from_raw(raw_config) # PrefixSharing-level config
+        
         if not ps_config.enable_prefix_sharing:
             # Memory sampling is managed by the step-level ProfilerScope; this
             # path records only the model-forward phase.
@@ -159,7 +161,7 @@ def _forward_step_with_engine_prepare(
 
     from prefix_sharing.integrations.context import create_prefix_sharing_context
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
-    from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
+    from prefix_sharing.integrations.verl_fsdp import plan_and_trim_microbatch_fsdp
 
     from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
@@ -173,7 +175,7 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
+    trimmed_micro_batch, ps_state = plan_and_trim_microbatch_fsdp(
         micro_batch,
         ps_config,
         model_config={

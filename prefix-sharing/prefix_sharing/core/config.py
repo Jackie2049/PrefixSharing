@@ -103,118 +103,117 @@ class PrefixSharingConfig:
         return cls(**values)
 
     def validate(self, model_config: Any | None = None, integrate_mode: str | None = None) -> None:
-        """Validate phase-1 constraints against a model/config object.
+        """Validate constraints against model_config.
 
         Args:
-            model_config: Mapping or object with Megatron-like attributes.
+            model_config: Model attributes.
             integrate_mode: Optional integration mode name.
         """
 
         if not self.enable_prefix_sharing:
             return
-        if self.detector != "trie":
-            raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
+
+        # detector guard
+        supported_detectors = {"trie"}
+        if self.detector not in supported_detectors:
+            raise PrefixSharingConfigError(
+                f"detector='{self.detector}' is not supported. Supported detectors: {supported_detectors}"
+            )
+
+        # backend guard
         supported_backends = {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}
         if self.backend not in supported_backends:
             raise PrefixSharingConfigError(
-                f"backend='{self.backend}' is not supported. "
-                f"Supported backends: {supported_backends}"
+                f"backend='{self.backend}' is not supported. Supported backends: {supported_backends}"
             )
-        if self.boundary_strategy != "prefix_last_restore":
-            raise PrefixSharingConfigError(
-                "phase 1 currently implements only "
-                "boundary_strategy='prefix_last_restore'; future strategies may include "
-                "'boundary_token' and 'strict_suffix'"
-            )
-        if self.min_prefix_len < 1:
-            raise PrefixSharingConfigError("min_prefix_len must be >= 1")
-        if self.min_group_size < 2:
-            raise PrefixSharingConfigError("min_group_size must be >= 2")
 
-        active_mode = integrate_mode or self.integrate_mode
+        # boundary_strategy guard
+        supported_boundary_strategies = {"prefix_last_restore"}
+        if self.boundary_strategy not in supported_boundary_strategies:
+            raise PrefixSharingConfigError(
+                f"boundary_strategy='{self.boundary_strategy}' is not supported. Supported strategies: {supported_boundary_strategies}"
+            )
+
+        # min_prefix_len guard
+        if self.min_prefix_len < 1:
+            raise PrefixSharingConfigError(f"min_prefix_len='{self.min_prefix_len}' is not supported. Supported min_prefix_len: >= 1")
+        if self.min_group_size < 2:
+            raise PrefixSharingConfigError(f"min_group_size='{self.min_group_size}' is not supported. Supported min_group_size: >= 2")
+
+        # integrate_mode guard
         supported_integrate_modes = {"verl_megatron_actor", "verl_fsdp"}
+        active_mode = integrate_mode or self.integrate_mode
         if active_mode not in supported_integrate_modes:
             raise PrefixSharingConfigError(
-                "phase 1 supports only integrate_mode in "
-                f"{sorted(supported_integrate_modes)}"
+                f"integrate_mode='{active_mode}' is not supported. Supported integrate_modes: {supported_integrate_modes}"
             )
 
+        # model_type guard
+        supported_model_types = {"text_only_causal_lm"}
         model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
-        if self.model_type == "text_only_causal_lm" and model_type != "text_only_causal_lm":
+        if self.model_type in supported_model_types and model_type not in supported_model_types:
             raise PrefixSharingConfigError(
-                f"[Config Error] 当前模型类型 '{model_type}' 不支持当前阶段。"
-                f"Phase 1 仅支持 model_type='text_only_causal_lm' (纯文本因果语言模型)，"
-                f"请使用支持的模型类型或禁用 prefix sharing。"
+                f"model_type='{model_type}' is not supported. Supported model_types: {supported_model_types}"
             )
+
+        # verl_fsdp guard
         if active_mode == "verl_fsdp":
             ulysses_sp_size = _read_config_value(model_config, "ulysses_sequence_parallel_size", 1)
             use_fused_kernels = _read_config_value(model_config, "use_fused_kernels", False)
             if int(ulysses_sp_size) != 1:
                 raise PrefixSharingConfigError(
-                    f"[Config Error] verl_fsdp 当前不支持 ulysses_sequence_parallel_size={ulysses_sp_size}。"
-                    "请关闭 Ulysses SP 或等待专门适配。"
+                    f"ulysses_sequence_parallel_size={ulysses_sp_size} is not supported. "
+                    "Supported ulysses_sequence_parallel_size: 1"
                 )
             if use_fused_kernels:
                 raise PrefixSharingConfigError(
-                    "[Config Error] verl_fsdp 当前不支持 use_fused_kernels=True。"
-                    "请关闭 fused kernels 或等待专门适配。"
+                    f"use_fused_kernels={use_fused_kernels} is not supported. "
+                    "Supported use_fused_kernels: False"
                 )
             return
 
+        # parallel strategy guards
         pp_size = _read_config_value(
             model_config,
             "pipeline_model_parallel_size",
             _read_config_value(model_config, "pipeline_parallel_size", 1),
         )
-        virtual_pp_size = _read_config_value(model_config, "virtual_pipeline_model_parallel_size", None)
-        num_layers_per_virtual_pipeline_stage = _read_config_value(
-            model_config,
-            "num_layers_per_virtual_pipeline_stage",
-            None,
-        )
-        cp_size = _read_config_value(
-            model_config,
-            "context_parallel_size",
-            self.supported_cp_size,
-        )
-        rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
-        fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
-
         if int(pp_size) < 1:
             raise PrefixSharingConfigError(
-                f"[Config Error] pipeline_model_parallel_size={pp_size} 不合法。"
-                f"pipeline_model_parallel_size 必须 >= 1，"
-                f"请修改为合法物理 PP 大小，或禁用 prefix sharing。"
+                f"pipeline_model_parallel_size={pp_size} is not supported. "
+                "Supported pipeline_model_parallel_size: >= 1"
             )
+        virtual_pp_size = _read_config_value(model_config, "virtual_pipeline_model_parallel_size", 1)
         if virtual_pp_size not in (None, 1):
             raise PrefixSharingConfigError(
-                f"[Config Error] virtual_pipeline_model_parallel_size={virtual_pp_size} 不支持当前阶段。"
-                f"当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
-                f"请关闭 virtual PP 或禁用 prefix sharing。"
+                f"virtual_pipeline_model_parallel_size={virtual_pp_size} is not supported. "
+                "Supported virtual_pipeline_model_parallel_size: 1"
             )
+        num_layers_per_virtual_pipeline_stage = _read_config_value(
+            model_config, "num_layers_per_virtual_pipeline_stage", None
+        )
         if num_layers_per_virtual_pipeline_stage is not None:
             raise PrefixSharingConfigError(
-                "[Config Error] num_layers_per_virtual_pipeline_stage 不支持当前阶段。"
-                "当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
-                "请关闭 virtual PP 或禁用 prefix sharing。"
+                f"num_layers_per_virtual_pipeline_stage={num_layers_per_virtual_pipeline_stage} "
+                "is not supported. Supported num_layers_per_virtual_pipeline_stage: None"
             )
+        cp_size = _read_config_value(model_config, "context_parallel_size", self.supported_cp_size)
         if cp_size != self.supported_cp_size:
             raise PrefixSharingConfigError(
-                f"[Config Error] context_parallel_size={cp_size} 不支持当前阶段。"
-                f"Phase 1 仅支持 context_parallel_size=1 (无上下文并行)，"
-                f"请修改配置将 CP 大小设为 1，或禁用 prefix sharing。"
+                f"context_parallel_size={cp_size} is not supported. "
+                f"Supported context_parallel_size: {self.supported_cp_size}"
             )
+        rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
         if not self.supported_rope_fusion and rope_fusion:
             raise PrefixSharingConfigError(
-                "[Config Error] apply_rope_fusion=True 不支持当前阶段。"
-                "Phase 1 要求关闭 rope fusion (apply_rope_fusion=False)，"
-                "请修改配置或禁用 prefix sharing。"
+                f"apply_rope_fusion={rope_fusion} is not supported. "
+                "Supported apply_rope_fusion: False"
             )
+        fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
         if not self.supported_fused_qkv_rope and fused_qkv_rope:
             raise PrefixSharingConfigError(
-                "[Config Error] fused_single_qkv_rope=True 不支持当前阶段。"
-                "Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
-                "请修改配置或禁用 prefix sharing。"
+                f"fused_single_qkv_rope={fused_qkv_rope} is not supported. "
+                "Supported fused_single_qkv_rope: False"
             )
 
     def validate_for_engine(
@@ -222,16 +221,16 @@ class PrefixSharingConfig:
         use_remove_padding: bool = True,
         integrate_mode: str = "verl_megatron_actor",
     ) -> None:
-        """Validate phase-1 constraints for verl engine 架构（verl 0.8.0+）。
+        """Validate phase-1 constraints for the verl engine (verl 0.8.0+).
 
-        与 validate() 不同，此方法从 engine_config 而非 model_config 读取配置。
-        用于 setup/patches 中的 forward_step patch，此时只有 engine_config
-        可用（self.engine_config），而非 Megatron TransformerConfig。
+        Unlike ``validate()``, this reads constraints from engine-facing flags
+        rather than Megatron ``model_config``. Used by setup/patches
+        ``forward_step`` when only ``self.engine_config`` is available.
         """
         if not self.enable_prefix_sharing:
             return
 
-        # 基础校验
+        # Basic field checks.
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
         if self.backend not in {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}:
@@ -248,10 +247,10 @@ class PrefixSharingConfig:
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
-        # THD packed layout 需要 use_remove_padding
+        # THD packed layout requires use_remove_padding.
         if not use_remove_padding:
             raise PrefixSharingConfigError(
-                "[Config Error] Phase 1 THD 路径要求 use_remove_padding=True。"
-                "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
-                "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
+                "[Config Error] Phase 1 THD path requires use_remove_padding=True. "
+                "BSHD (use_remove_padding=False) is not supported by the current "
+                "patch set. Enable use_remove_padding or use a BSHD-specific patch set."
             )

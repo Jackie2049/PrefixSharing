@@ -26,7 +26,7 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
-    build_prefix_sharing_micro_batch_fsdp,
+    plan_and_trim_microbatch_fsdp,
     restore_prefix_sharing_outputs_2d,
 )
 
@@ -67,7 +67,7 @@ def test_reuser_suffix_attention_matches_baseline():
             [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long
         ),
     }
-    trimmed, state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
     assert state is not None
     plan = state.prefix_sharing_plan
     prefix_len = plan.prefix_lens[1]  # 3
@@ -143,7 +143,7 @@ def test_gradient_flows_through_provider_prefix_kv():
             [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long
         ),
     }
-    trimmed, state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
     assert state is not None
 
     H, D = 2, 4
@@ -184,7 +184,7 @@ def test_restore_interior_prefix_matches_provider():
             [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long
         ),
     }
-    _, state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    _, state = plan_and_trim_microbatch_fsdp(batch, config)
     assert state is not None
 
     # Simulate trimmed output: provider full, reuser has only suffix (prefix zeroed)
@@ -238,7 +238,7 @@ def test_restore_prefix_last_recomputed_with_provider_logits_and_reuser_label():
             [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long
         ),
     }
-    _, state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    _, state = plan_and_trim_microbatch_fsdp(batch, config)
     plan = state.prefix_sharing_plan
     prefix_len = plan.prefix_lens[1]  # 3
 
@@ -275,7 +275,7 @@ def test_baseline_matches_when_no_sharing():
             [[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long
         ),
     }
-    returned, state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    returned, state = plan_and_trim_microbatch_fsdp(batch, config)
     assert state is None
     assert returned is batch  # exact same object -> no transformation
 
@@ -308,8 +308,8 @@ def test_padding_positions_do_not_contribute():
     }
 
     H, D = 2, 4
-    _, state_unpadded = build_prefix_sharing_micro_batch_fsdp(batch_unpadded, config)
-    _, state_padded = build_prefix_sharing_micro_batch_fsdp(batch_padded, config)
+    _, state_unpadded = plan_and_trim_microbatch_fsdp(batch_unpadded, config)
+    _, state_padded = plan_and_trim_microbatch_fsdp(batch_padded, config)
     assert state_unpadded is not None and state_padded is not None
 
     # Same plan semantics regardless of padding
