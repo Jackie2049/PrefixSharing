@@ -107,12 +107,13 @@ def _load_json_to_dataproto(json_path: str):
     if "sequences" not in outputs:
         batch["sequences"] = torch.cat([batch["prompts"], batch["responses"]], dim=1)
 
-    # verl>=0.8.0 的 trainer.fit() 会硬索引 batch.non_tensor_batch["multi_modal_inputs"]
-    # （ray_trainer.py:1483，纯文本场景也走这行）。纯文本/虚拟注入没有这个字段会 KeyError。
-    # v070 trainer 不碰这个字段，无需添加。这里只在 verl>=0.8.0 时填一个空字典占位
-    # （下游 'image_grid_thw' 检查会对空 dict continue 跳过，行为正确）。
-    # 注意：用 > 0.7.99 而不是 >= 0.8.0，因为 packaging 解析下 "0.8.0.dev" 是
-    # prerelease，严格 < "0.8.0"，直接用 >= 0.8.0 会让 dev 版本漏掉导致 KeyError。
+    # verl>=0.8.0 trainer.fit() hard-indexes batch.non_tensor_batch["multi_modal_inputs"]
+    # (ray_trainer.py:1483, even for text-only). Text-only / fixed injection lacks this field → KeyError.
+    # v070 trainer does not touch this field, so no placeholder needed.
+    # Only fill an empty dict placeholder when verl>=0.8.0
+    # (downstream 'image_grid_thw' check skips empty dicts, correct behavior).
+    # Note: use > 0.7.99 instead of >= 0.8.0, because packaging parses "0.8.0.dev"
+    # as a prerelease strictly < "0.8.0", so >= 0.8.0 would miss dev builds → KeyError.
     non_tensors = None
     try:
         import verl
@@ -129,7 +130,7 @@ def _load_json_to_dataproto(json_path: str):
                 f"[FixedRollout] verl={verl.__version__}, filled empty 'multi_modal_inputs' "
                 f"placeholder for {n_samples} text-only samples."
             )
-    except Exception as e:  # import 失败或版本探测失败，退回到不填占位
+    except Exception as e:  # import or version detection failed → skip placeholder
         print(f"[FixedRollout] skip 'multi_modal_inputs' placeholder: {e}")
 
     data = DataProto.from_dict(batch, non_tensors=non_tensors)

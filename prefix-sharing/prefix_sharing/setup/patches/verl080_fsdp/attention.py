@@ -31,9 +31,11 @@ _SUPPORTED_ATTENTIONS = {
 # ##### [PS-diag] dump helpers ######
 
 def _resolve_num_layers(module: Any) -> int:
-    """从 attention module 推导模型总层数，有 ``module.model.config`` 回退。
+    """Infer the total number of model layers from the attention module, with
+    a fallback to ``module.model.config``.
 
-    ``_dump_attn_output`` 也用了同样的回退逻辑，此处抽取为公共函数。
+    ``_dump_attn_output`` uses the same fallback logic; extracted here as a
+    shared utility function.
     """
     num_layers = int(getattr(getattr(module, "config", None), "num_hidden_layers", 0) or 0)
     if num_layers == 0:
@@ -43,7 +45,9 @@ def _resolve_num_layers(module: Any) -> int:
 
 
 def _pack_off_dense_for_dump(tensor: Any) -> Any:
-    """OFF 路径：将 dense [B,H,L,D] → [T,H,D] 以匹配 dump 函数的 packed 入参约定。"""
+    """OFF path: reshape dense [B,H,L,D] → [T,H,D] to match the packed input
+    convention of the dump functions.
+    """
     import torch as _torch
     B, H, L, D = tensor.shape
     return tensor.transpose(1, 2).reshape(_torch.Size([B * L, H, D]))
@@ -86,7 +90,8 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
     def patched_attention(module: Any, query: Any, key: Any, value: Any,
                           attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
-        # 优先 module 属性（AC recompute 兼容），回退 ContextVar（Megatron 等路径）
+        # Prefer module attribute (AC recompute compatible), fall back to ContextVar
+        # (Megatron and other paths)
         ctx = getattr(module, '_ps_ctx', None)
         if ctx is None:
             from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -112,7 +117,7 @@ def create_attention_wrapper(original_fn: Any) -> Any:
                     profiler.stop_phase(PerfProfiler.PHASE_ATTN_OFF)
             # [PS-perf] end ——————————————————————————————————————
 
-            # ##### [PS-diag] OFF per-layer dump (baseline / context 不激活) #####
+            # ##### [PS-diag] OFF per-layer dump (baseline / context inactive) #####
             if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 _dump_attn_output(result, module)
                 _dump_off_rope_and_kv(module, query, key, value)
@@ -132,8 +137,9 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         key_ld = key.transpose(1, 2)
         value_ld = value.transpose(1, 2)
 
-        # runtime.forward() 内部读 ContextVar；AC recompute 时 ContextVar
-        # 可能已过期，但 ctx 来自 module._ps_ctx 仍然有效。临时注入 ContextVar。
+        # runtime.forward() reads ContextVar internally; during AC recompute the
+        # ContextVar may have expired, but ctx from module._ps_ctx is still valid.
+        # Temporarily inject the ContextVar.
         _ctxvar_token = _current_context.set(ctx)
         # [PS-perf] start — ON attention timing (attn.on = pack+kv+comp+unpack) —
         profiler = PerfProfiler.current()
@@ -153,7 +159,7 @@ def create_attention_wrapper(original_fn: Any) -> Any:
             _current_context.reset(_ctxvar_token)
         # [PS-perf] end ————————————————————————————————————————
 
-        # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
+        # ##### [PS-diag] ON attn output dump (context active = PS path) #####
         if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             _dump_attn_output(output_ld, module)
         return output_ld, None

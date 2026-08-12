@@ -1,15 +1,16 @@
-"""verl080_mcore0161_ms0160 patch set 和配套接口的单元测试。
+"""Unit tests for verl080_mcore0161_ms0160 patch set and supporting interfaces.
 
-本文件测试本地可验证的部分：
+This file tests the locally verifiable parts:
 - PrefixSharingConfig.validate_for_engine()
-- PrefixSharingRuntimeState.kept_position_ids 字段
-- PrefixSharingRuntimeContext.kept_position_ids 传递
-- compat_matrix 新条目版本匹配
-- integrations.verl_mcore.read_ps_config_from_engine_config 读取逻辑
+- PrefixSharingRuntimeState.kept_position_ids field
+- PrefixSharingRuntimeContext.kept_position_ids propagation
+- compat_matrix new entry version matching
+- integrations.verl_mcore.read_ps_config_from_engine_config read logic
 - integrations.megatron_runtime v0.16.1 API helpers
 
-需要 verl/Megatron 运行环境的 patch 联动测试（forward_step → attention → vocab_logprobs）
-属于 integrated_test，本地不可运行，在 NPU/GPU 环境中单独验证。
+Patch integration tests requiring verl/Megatron runtime (forward_step -> attention ->
+vocab_logprobs) belong to integrated_test; they cannot run locally and are validated
+separately in NPU/GPU environments.
 """
 
 import pytest
@@ -100,7 +101,7 @@ def test_runtime_state_is_frozen():
 
 
 # ═══════════════════════════════════════
-# PrefixSharingRuntimeContext.kept_position_ids 传递
+# PrefixSharingRuntimeContext.kept_position_ids propagation
 # ═══════════════════════════════════════
 
 
@@ -117,8 +118,8 @@ def test_context_kept_position_ids_none_when_state_has_none():
 
 
 def test_context_kept_position_ids_none_when_state_has_no_attr():
-    """旧配套的 PrefixSharingRuntimeState 没有 kept_position_ids 字段时，
-    context 应通过 getattr 回退到 None，保持向后兼容。"""
+    """When an older PrefixSharingRuntimeState lacks the kept_position_ids field,
+    context should fall back to None via getattr, maintaining backward compatibility."""
     planner = PrefixSharingPlanner(
         PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     )
@@ -127,8 +128,8 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
         forward_id=1,
         micro_batch_id=1,
     )
-    # 模拟旧版 state（没有 kept_position_ids）
-    # 用 Namespace 模拟，因为 frozen dataclass 不能动态删除字段
+    # Simulate old-version state (without kept_position_ids)
+    # Use SimpleNamespace to mock, since frozen dataclass cannot dynamically remove fields
     import types
 
     old_state = types.SimpleNamespace(
@@ -142,7 +143,7 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
 
 # ═══════════════════════════════════════
-# compat_matrix FSDP-first 匹配
+# compat_matrix FSDP-first matching
 # ═══════════════════════════════════════
 
 
@@ -194,7 +195,7 @@ def test_compat_matrix_no_match_raises_incompatible():
     from prefix_sharing.setup.version_detector import DependencyDetectedVersions
 
     versions = DependencyDetectedVersions(
-        verl="0.7.0",  # 不匹配任何条目
+        verl="0.7.0",  # Does not match any entry
         megatron_core="0.12.0",
         mindspeed="0.12.0",
     )
@@ -203,7 +204,7 @@ def test_compat_matrix_no_match_raises_incompatible():
 
 
 # ═══════════════════════════════════════
-# integrations.verl_mcore.read_ps_config_from_engine_config 读取逻辑
+# integrations.verl_mcore.read_ps_config_from_engine_config read logic
 # ═══════════════════════════════════════
 
 
@@ -300,34 +301,34 @@ def test_get_cp_group_returns_none_without_pg_collection():
 
 
 # ═══════════════════════════════════════
-# __init__.py auto-activation 逻辑
+# __init__.py auto-activation logic
 # ═══════════════════════════════════════
 
 
 def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
-    """patch 始终尝试安装，环境兼容时（verl/Megatron 存在）应成功安装。"""
+    """Patch always attempts installation; when environment is compatible (verl/Megatron present), installation should succeed."""
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    # On server, verl+Megatron are installed; patch installation should succeed
     assert prefix_sharing._patch_handle is not None
     assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
-    """ENABLE_PREFIX_SHARING=0 时仍尝试安装 patch，兼容性错误安全回退。"""
+    """With ENABLE_PREFIX_SHARING=0, patch installation is still attempted; compatibility errors fall back safely."""
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "0")
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    # 服务器上 verl+Megatron 已安装，patch 安装应成功
+    # On server, verl+Megatron are installed; patch installation should succeed
     assert prefix_sharing._patch_handle is not None
     assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
-    """ENABLE_PREFIX_SHARING=1 时尝试安装 patch，兼容性错误安全回退。"""
+    """With ENABLE_PREFIX_SHARING=1, patch installation is attempted; compatibility errors fall back safely."""
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "1")
     import importlib
     import prefix_sharing

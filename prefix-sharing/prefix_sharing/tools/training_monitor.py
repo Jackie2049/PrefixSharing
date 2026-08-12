@@ -63,7 +63,7 @@ from typing import Iterator, Literal
 
 
 # ---------------------------------------------------------------------------
-# ContextVar – 无需修改函数签名即可在嵌套调用链中访问 mon / sw
+# ContextVar — access mon/sw in nested call chains without changing function signatures
 # ---------------------------------------------------------------------------
 
 
@@ -133,8 +133,8 @@ class MemorySnapshot:
     """A single memory-poll sample."""
 
     timestamp: float
-    allocated_gb: float  # memory_allocated()  – tensor 占用
-    reserved_gb: float   # memory_reserved()  – 分配器保留（含缓存）
+    allocated_gb: float  # memory_allocated()  – tensor footprint
+    reserved_gb: float   # memory_reserved()  – allocator reserved (incl. cache)
     mini_batch_idx: int = -1   # -1 = outside any mini/micro-batch window
     micro_batch_idx: int = -1  # -1 = outside a micro-batch (e.g. optimizer update)
     phase: str = ""          # optional attention phase tag (e.g. "attn.on")

@@ -17,23 +17,23 @@ def test_trie_detector_is_instance_of_abstract():
 
 
 def test_common_prefix_len():
-    # 基本情况：多个序列有共同前缀
+    # Basic case: multiple sequences share a common prefix
     assert common_prefix_len([[1, 2, 3], [1, 2, 4], [1, 2]]) == 2
-    # 无共同前缀
+    # No common prefix
     assert common_prefix_len([[1], [2]]) == 0
-    # 空列表
+    # Empty list
     assert common_prefix_len([]) == 0
-    # 只有一个序列：整个序列都是前缀
+    # Single sequence: entire sequence is the prefix
     assert common_prefix_len([[1, 2, 3]]) == 3
-    # 所有序列完全相同
+    # All sequences are identical
     assert common_prefix_len([[1, 2, 3], [1, 2, 3], [1, 2, 3]]) == 3
-    # 前缀长度等于最短序列长度
+    # Prefix length equals the shortest sequence length
     assert common_prefix_len([[1, 2], [1, 2, 3], [1, 2, 4, 5]]) == 2
-    # 较长前缀
+    # Longer prefix
     assert common_prefix_len([[1, 2, 3, 4, 5], [1, 2, 3, 4, 6], [1, 2, 3, 4, 7, 8]]) == 4
-    # 不同长度的序列，只有第一个元素相同
+    # Sequences of different lengths, only first element matches
     assert common_prefix_len([[1], [1, 2], [1, 2, 3]]) == 1
-    # 嵌套列表作为单个 token-like 元素处理，不做 flatten
+    # Nested lists are treated as single token-like elements, not flattened
     assert common_prefix_len([[[1, 2], 3], [[1, 2], 4], [[1, 2], 5, 6]]) == 1
 
 

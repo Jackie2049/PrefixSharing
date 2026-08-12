@@ -1,10 +1,11 @@
 """Patch: Attention.forward — thin wrapper
 
-无 context → 调用原始 forward
-有 context → QKV + THD squeeze → delegate to integrations.prefix_attention
+No context → call original forward
+Has context → QKV + THD squeeze → delegate to integrations.prefix_attention
 
-业务逻辑（RoPE、KV expansion、attention 计算）全部由 integrations 层处理，
-本 patch 只负责 QKV 提取（attention module 交互）和 THD squeeze（格式适配）。
+Business logic (RoPE, KV expansion, attention computation) is entirely
+handled by the integrations layer. This patch only handles QKV extraction
+(attention module interaction) and THD squeeze (format adaptation).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Any
 
 
 def patch_megatron_attention(original_forward: Any) -> Any:
-    """创建 Attention.forward 的 patch wrapper。"""
+    """Create a patch wrapper for Attention.forward."""
 
     def patched_forward(
         self,
@@ -37,7 +38,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
 
         ctx = current_prefix_sharing_context()
         if ctx is None:
-            # ── normal path: 调用原始 forward ──
+            # ── normal path: call original forward ──
             _result = original_forward(
                 self,
                 hidden_states,
@@ -54,13 +55,16 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 inference_params=inference_params,
             )
             # ##### [PS-diag] OFF attn_outputs + rope_freqs_off dump #####
-            # OFF 走原始 forward，不经 prefix_attention/_apply_positioned_rope，
-            # 所以 ON 路径里的 dump_attn_on/dump_rope_freqs_on 不会触发。
-            # 这里在 OFF 分支补 dump，让 cmp_diag 的 attn/RoPE 对比有 OFF ground truth。
-            # v070 是直接改 megatron attention 源码在 forward 内部 dump；v080 用 patch
-            # wrapper 在 forward 返回后 dump output + 入参 rotary_pos_emb 解包出 angle table，
-            # 语义等价（唯一拿不到的是 rope_emb rotated q/k，在 forward 内部，但 rope_freqs
-            # angle table 已够验证 RoPE）。
+            # OFF path calls original forward and does not go through
+            # prefix_attention/_apply_positioned_rope, so dump_attn_on /
+            # dump_rope_freqs_on in the ON path will not fire.
+            # Dump here in the OFF branch so that cmp_diag has OFF ground truth
+            # for attn / RoPE comparison.
+            # v070 modified megatron attention source to dump inside forward;
+            # v080 uses a patch wrapper to dump output + unpack rotary_pos_emb
+            # angle table after forward returns — semantically equivalent (the
+            # only thing unavailable is the rope_emb rotated q/k inside forward,
+            # but the rope_freqs angle table is sufficient for RoPE verification).
             if diagnostic_dump_enabled() is not None:
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs_off,

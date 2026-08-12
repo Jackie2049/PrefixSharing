@@ -147,7 +147,7 @@ def restore_reuser_prefix_columns_2d(
 
 
 # ═══════════════════════════════════════════════════════════════
-# v080 restore 包装：NestedTensor → 2D left-pad → 复用 2D restore → 压回
+# v080 restore wrapper: NestedTensor → 2D left-pad → reuse 2D restore → pack back
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -156,36 +156,43 @@ def restore_via_2d_unfold_verl080(
     vocab_parallel_log_probs_fn: Any,
     vocab_parallel_entropy_fn: Any = None,
 ) -> dict:
-    """v080 restore 包装：NestedTensor → 2D left-pad → 复用 restore_reuser_prefix_columns_2d → 压回。
+    """v080 restore wrapper: NestedTensor → 2D left-pad → reuse restore_reuser_prefix_columns_2d → pack back.
 
-    v080 物理裁剪后 reuser NestedTensor 行只含 suffix 区段，prefix 区段（含
-    prefix-last）被物理删除。本函数在 forward_step 出口（context 仍激活、provider
-    prefix-last logits 已存于 ``ctx.prefix_last_logits_saved``）完成重组：
+    After v080 physical trimming, reuser NestedTensor rows contain only the
+    suffix region; the prefix region (including prefix-last) has been physically
+    removed. This function performs reassembly at the forward_step exit (while
+    the context is still active and provider prefix-last logits have been saved
+    into ``ctx.prefix_last_logits_saved``):
 
-    1. 展开裁剪后 NestedTensor 各行为完整 2D ``[B, L_max]``（reuser prefix 区段
-       left-pad 0，尾部 right-pad 0 到 L_max）
-    2. 复用 :func:`restore_reuser_prefix_columns_2d`：interior 整段从直接
-       provider 的已恢复 2D 行 bulk 切片复制，prefix-last 用存的 logits +
-       ``index.label_value`` 重算
-    3. 按各 ``original_lengths`` 切片压回 NestedTensor (jagged)
+    1. Unfold each trimmed NestedTensor row into a full 2D ``[B, L_max]`` tensor
+       (reuser prefix region left-padded with 0, right-padded with 0 to L_max).
+    2. Reuse :func:`restore_reuser_prefix_columns_2d`: the interior interval is
+       bulk-sliced from the direct provider's already-restored 2D row; the
+       prefix-last position is recomputed from the saved logits +
+       ``index.label_value``.
+    3. Slice and pack back into a NestedTensor (jagged) per ``original_lengths``.
 
-    列映射为 identity：left-pad 后 valid-content 的 0-based 偏移即 2D 列号，
-    ``target_2d_pos`` 直接当列索引用，无需 ``valid_indices`` / 列映射表。
+    Column mapping is identity: after left-padding, the 0-based offset of valid
+    content equals the 2D column index, so ``target_2d_pos`` is used directly as
+    a column index — no ``valid_indices`` / column mapping table needed.
 
     Must be called inside ``prefix_sharing_runtime_context`` (reads
     ``current_prefix_sharing_context``), after the vocab_logprobs patch has saved
     provider prefix-last logits into ``ctx.prefix_last_logits_saved``.
 
     Args:
-        output: forward_step 返回的 output_dict，含 ``"log_probs"`` NestedTensor
-            （裁剪后 jagged），可选 ``"entropy"`` NestedTensor。**不含** tuple 外层
-            （tuple 解包由调用方负责）。
-        vocab_parallel_log_probs_fn: 用于 prefix-last logp 重算。
-        vocab_parallel_entropy_fn: 可选，当前未直接使用（entropy 走复制路径——
-            interior 和 prefix-last 都从 provider 复制，不重算）。
+        output: The output_dict returned by forward_step, containing
+            ``"log_probs"`` NestedTensor (trimmed jagged), and optionally
+            ``"entropy"`` NestedTensor. **Must not** be wrapped in a tuple
+            (tuple unpacking is the caller's responsibility).
+        vocab_parallel_log_probs_fn: Used for prefix-last logp recomputation.
+        vocab_parallel_entropy_fn: Optional; currently unused (entropy follows
+            the copy path — both interior and prefix-last are copied from the
+            provider, never recomputed).
 
     Returns:
-        ``output``（``log_probs``/``entropy`` 被替换为重组后的 NestedTensor）。
+        ``output`` with ``log_probs``/``entropy`` replaced by reassembled
+        NestedTensors.
     """
 
     ctx = current_prefix_sharing_context()
@@ -211,7 +218,7 @@ def restore_via_2d_unfold_verl080(
         return output
     L_max = max(original_lengths)
 
-    # --- Step 1: 展开裁剪后 NestedTensor → 完整 2D [B, L_max] ---
+    # --- Step 1: Unfold trimmed NestedTensor → full 2D [B, L_max] ---
     log_probs_2d, entropy_2d = _unfold_trimmed_nested_to_2d(
         log_probs_nested,
         entropy_nested if has_entropy else None,
@@ -221,10 +228,11 @@ def restore_via_2d_unfold_verl080(
         B,
     )
 
-    # --- Step 2: 复用 restore_reuser_prefix_columns_2d ---
-    # build_kv 式区间拼接：interior 整段从直接 provider 的已恢复 2D 行切片，
-    # prefix-last 用 index.label_value + saved logits 重算。identity 列映射
-    # （target_2d_pos 即 2D 列号，无 left padding）。
+    # --- Step 2: Reuse restore_reuser_prefix_columns_2d ---
+    # build_kv-style interval concatenation: interior is bulk-sliced from the
+    # direct provider's already-restored 2D row; prefix-last is recomputed from
+    # index.label_value + saved logits. Identity column mapping (target_2d_pos
+    # is the 2D column index, no left padding).
     output_2d: dict[str, Any] = {"log_probs": log_probs_2d}
     if entropy_2d is not None:
         output_2d["entropy"] = entropy_2d
@@ -234,7 +242,7 @@ def restore_via_2d_unfold_verl080(
         vocab_parallel_entropy_fn,
     )
 
-    # --- Step 3: 按各 original_lengths 压回 NestedTensor ---
+    # --- Step 3: Pack back into NestedTensor per original_lengths ---
     output["log_probs"] = _fold_2d_to_nested(output_2d["log_probs"], original_lengths)
     if entropy_2d is not None:
         output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
@@ -257,15 +265,17 @@ def _unfold_trimmed_nested_to_2d(
     L_max: int,
     B: int,
 ) -> tuple[Any, Any | None]:
-    """展开裁剪后 NestedTensor → 完整 2D [B, L_max]（reuser prefix left-pad 0）。
+    """Unfold trimmed NestedTensor → full 2D [B, L_max] (reuser prefix left-padded with 0).
 
-    裁剪后各行：
-      - provider (keep_start=0): 完整 [prefix | suffix]，长度 = original_lengths[i]
-      - reuser  (keep_start=prefix_len>0): 仅 [suffix]，长度 = original_lengths[i]-prefix_len
+    After trimming, each row is:
+      - provider (keep_start=0): full [prefix | suffix], length = original_lengths[i]
+      - reuser  (keep_start=prefix_len>0): only [suffix], length = original_lengths[i]-prefix_len
 
-    展开后每行恢复成 [prefix_zeros | suffix]，再 right-pad 0 到 L_max。
-    left-pad 的 zeros 不在 autograd 图里，但 restore 会覆盖 prefix 区段（interior
-    复制 provider、prefix-last 重算），最终值在图里。right-pad 尾部在压回时丢弃。
+    After unfolding, each row becomes [prefix_zeros | suffix], then right-padded
+    with 0 to L_max. The left-padded zeros are not in the autograd graph, but
+    restore overwrites the prefix region (interior copied from provider,
+    prefix-last recomputed), so the final values are in the graph. The right-pad
+    tail is discarded when packing back.
     """
     import torch
 
@@ -297,7 +307,7 @@ def _unfold_trimmed_nested_to_2d(
 def _build_padded_row(
     suffix_data: Any, prefix_len: int, orig_len: int, L_max: int,
 ) -> Any:
-    """构造一行完整 2D ``[prefix_zeros | suffix]`` right-pad 0 到 L_max。"""
+    """Build one full 2D row ``[prefix_zeros | suffix]`` right-padded with 0 to L_max."""
     import torch
 
     device = suffix_data.device
@@ -315,7 +325,7 @@ def _build_padded_row(
 
 
 def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
-    """完整 2D [B, L_max] → NestedTensor (jagged)，按各 original_lengths 切片。"""
+    """Full 2D [B, L_max] → NestedTensor (jagged), sliced per original_lengths."""
     import torch
 
     rows = [tensor_2d[seq_idx, :original_lengths[seq_idx]] for seq_idx in range(len(original_lengths))]
@@ -335,28 +345,29 @@ def build_prefix_sharing_micro_batch_verl080(
     batch: Any,
     ps_config: PrefixSharingConfig,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
-    """verl 0.8.0 engine 架构下的 prefix-sharing micro-batch 构建。
+    """Prefix-sharing micro-batch construction for the verl 0.8.0 engine architecture.
 
-    MCore/THD 路径：NestedTensor 裁剪后按 kept 区段展开为 packed layout，
-    2D 路径：物理裁剪 input_ids/position_ids，通过 attention_mask 标记 valid。
+    MCore/THD path: after NestedTensor trimming, unfold by kept segments into a
+    packed layout. 2D path: physically trim input_ids/position_ids and mark
+    valid positions via attention_mask.
 
-    参数 ps_config 已由调用方通过 PrefixSharingConfig.from_raw() 解析完成，
-    不需要再次 from_raw。
+    The ps_config parameter has already been parsed by the caller via
+    PrefixSharingConfig.from_raw(); no further from_raw call is needed.
 
-    核心原则：2D + attention_mask 为主路径，NestedTensor 路径仅在
-    GPU + use_remove_padding=True 时作为可选优化。
-    NPU 不支持 torch.nested，所有 NPU 场景都走 2D 路径。
+    Core principle: 2D + attention_mask is the primary path; the NestedTensor
+    path is an optional optimization only for GPU + use_remove_padding=True.
+    NPU does not support torch.nested, so all NPU scenarios use the 2D path.
     """
     # ── PATH 1: prefix sharing disabled ──
     if not ps_config.enable_prefix_sharing:
         print("[PS][prepare] PATH 1: prefix sharing disabled")
         return batch, None
 
-    # ── 阶段 1: 配置校验 ──
+    # ── Stage 1: Config validation ──
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
     ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
 
-    # ── 阶段 2: 拒绝不支持的特性 ──
+    # ── Stage 2: Reject unsupported features ──
     try:
         from verl.utils import tensordict_utils as tu
         use_fused = tu.get_non_tensor_data(batch, "use_fused_kernels", default=False)
@@ -367,10 +378,10 @@ def build_prefix_sharing_micro_batch_verl080(
     if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
         raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
 
-    # ── 阶段 3: 从 batch 提取序列 ──
-    # NestedTensor → 从 offsets/values 提取
-    # Plain 2D → 从 attention_mask.nonzero() 提取
-    # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
+    # ── Stage 3: Extract sequences from batch ──
+    # NestedTensor → extract from offsets/values
+    # Plain 2D → extract from attention_mask.nonzero()
+    # Also keep attention_mask_bool for _collect_kept_position_rows in Stage 6.
     input_ids = batch["input_ids"]
     is_nested_tensor = _is_nested_tensor(input_ids)
     attention_mask_bool_for_layout = None
@@ -378,7 +389,7 @@ def build_prefix_sharing_micro_batch_verl080(
     if is_nested_tensor:
         sequences = _extract_seq_from_nested_tensor(input_ids)
     else:
-        # plain 2D tensor（需要 attention_mask）
+        # plain 2D tensor (requires attention_mask)
         attention_mask = batch.get("attention_mask")
         if attention_mask is None:
             print("[PS][prepare] PATH 4: plain 2D batch without attention_mask")
@@ -390,29 +401,30 @@ def build_prefix_sharing_micro_batch_verl080(
         ]
         sequences = _extract_sequences_async(input_ids, valid_indices)
 
-    # ── 阶段 4: 前缀共享规划 ──
+    # ── Stage 4: Prefix sharing planning ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
     if not plan.has_sharing:
         print("[PS][prepare] no prefix sharing detected")
         return batch, None
 
-    # ── 阶段 5: 物理裁剪 batch ──
-    #   NestedTensor path: 裁剪 input_ids/position_ids/loss_mask 以匹配 kept 区段。
-    #   2D path: 只改 attention_mask（Megatron 从 mask 动态重算 packed），
-    #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
-    #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
+    # ── Stage 5: Physically trim batch ──
+    #   NestedTensor path: trim input_ids/position_ids/loss_mask to match kept segments.
+    #   2D path: only modify attention_mask (Megatron dynamically recomputes packed
+    #   from mask); v080 THD path uses preprocess_thd_engine(input_ids) to process
+    #   data directly, ignoring attention_mask. Must physically trim
+    #   input_ids/position_ids.
     if is_nested_tensor:
         trimmed_batch = _trim_nested_batch(batch, plan)
     else:
         trimmed_batch = _trim_plain_batch_thd(batch, plan, valid_indices)
 
-    # layout 计算：从 trimmed 后的实际 kept position rows 构建
+    # Layout computation: build from the actual kept position rows after trimming
     kept_position_rows = _collect_kept_position_rows(
         trimmed_batch, plan, is_nested_tensor,
         valid_indices=valid_indices if not is_nested_tensor else None,
     )
 
-    # ── 阶段 6: 构建 layout ──
+    # ── Stage 6: Build layout ──
     parallel_info = get_megatron_parallel_info()
     align_size = (
         parallel_info.tp_size * parallel_info.cp_size * 2
@@ -424,7 +436,7 @@ def build_prefix_sharing_micro_batch_verl080(
         align_size=int(align_size),
     )
 
-    # ── 阶段 7: 构建 state ──
+    # ── Stage 7: Build state ──
     state = PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
         attention_backend=get_backend_instance(ps_config),

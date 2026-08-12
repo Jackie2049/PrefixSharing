@@ -1,13 +1,14 @@
-"""verl 0.8.0.dev + megatron-core 0.16.1 + mindspeed 0.16.0（Qwen3.5 NPU 配套）
+"""verl 0.8.0.dev + megatron-core 0.16.1 + mindspeed 0.16.0 (Qwen3.5 NPU companion)
 
-Patch 目标：
-1. MegatronEngineWithLMHead.forward_step → 微批次重组 + runtime context 注入
-2. Attention.forward                     → prefix-sharing attention 拦截
-3. vocab_parallel_log_probs_from_logits  → 自动 logprob restore
-4. no_padding_2_padding                  → PS 物理裁剪后修正序列长度
-   (module-level + 所有 from...import 引用)
+Patch targets:
+1. MegatronEngineWithLMHead.forward_step → micro-batch reorg + runtime context injection
+2. Attention.forward                     → prefix-sharing attention intercept
+3. vocab_parallel_log_probs_from_logits  → automatic logprob restore
+4. no_padding_2_padding                  → sequence length correction after PS
+   physical trimming (module-level + all from...import references)
 
-所有业务逻辑由 integrations 层处理，本 patch set 只负责 thin wrapper 编排。
+All business logic is handled by the integrations layer; this patch set
+only orchestrates thin wrappers.
 """
 
 from prefix_sharing.setup.patch_installer import PatchSpec
@@ -16,13 +17,14 @@ from .attention import patch_megatron_attention
 from .vocab_logprobs import patch_megatron_vocab
 from .nopadding import patch_no_padding_2_padding
 
-# no_padding_2_padding 被 3 个模块用 from...import 直接引用：
-#   verl.workers.utils.padding           — 原定义模块
-#   verl.workers.utils.losses            — ppo_loss 内调用
-#   verl.trainer.distillation.losses     — distillation 内调用
-#   verl.trainer.ppo.ray_trainer         — trainer 侧调用
-# from...import 创建的是模块级属性，setattr 可以更新。
-# 必须对每个引用模块都 patch，否则该模块的局部引用仍指向原函数。
+# no_padding_2_padding is directly referenced via from...import in 3 modules:
+#   verl.workers.utils.padding           — original definition module
+#   verl.workers.utils.losses            — called inside ppo_loss
+#   verl.trainer.distillation.losses     — called inside distillation
+#   verl.trainer.ppo.ray_trainer         — called on the trainer side
+# from...import creates module-level attributes; setattr can update them.
+# Each referencing module must be patched individually, otherwise its local
+# reference still points to the original function.
 _NOPADDING_PATCH_MODULES = [
     "verl.workers.utils.padding",
     "verl.workers.utils.losses",
@@ -40,32 +42,38 @@ PATCH_SET: list[PatchSpec] = [
         patch_factory=patch_verl_forward_step,
         description="MegatronEngineWithLMHead.forward_step → "
                     "micro-batch reorg + context (verl 0.8.0 engine)",
-        eager=True,  # verl Megatron engine 在 __init__.py 预加载，import hook 无法拦截
+        eager=True,  # verl Megatron engine is preloaded in __init__.py; import hooks cannot intercept
     ),
     PatchSpec(
         module_name="megatron.core.transformer.attention",
         target_getter=lambda mod: (getattr(mod, "Attention"), "forward"),
         patch_factory=patch_megatron_attention,
         description="Attention.forward → prefix-sharing intercept (mcore 0.16.1)",
-        eager=True,  # megatron.core 在 engine 初始化前已导入
+        eager=True,  # megatron.core is already imported before engine initialization
     ),
-    # verl080 算 logprob 的真正调用点在 transformer_impl 的 logits_processor
-    # 闭包里（transformer_impl.py:932），该名字是模块加载时 from...import 绑定
-    # 的局部引用。只 patch 源模块 verl.utils.megatron.tensor_parallel 无法命中
-    # （setattr 源模块属性不会改 transformer_impl 的局部引用），必须直接 patch
-    # transformer_impl 模块属性。grep 确认 verl080 里仅此一处调用该函数。
+    # The actual logprob call site in verl080 is inside the logits_processor
+    # closure in transformer_impl (transformer_impl.py:932). That name is a
+    # local reference bound at module load time via from...import. Patching
+    # only the source module verl.utils.megatron.tensor_parallel would not
+    # work (setattr on the source module does not change the local reference
+    # in transformer_impl), so we must patch the transformer_impl module
+    # attribute directly. grep confirms this is the only call site for this
+    # function in verl080.
     #
-    # 注意：不要同时 patch 源模块。restore 侧重算 prefix-last logp 时
-    # （forward_step.py 内 from verl.utils.megatron.tensor_parallel import）
-    # 需要拿原始函数；若源模块被 patch，重算会误入 patched_fn——传入 logits 仅
-    # [1, V//tp]，而 index.provider_1d_pos 是全局 packed 偏移，切片为空会触发
-    # vocab_logprobs.py 的 empty-slice RuntimeError。
+    # Note: do NOT patch the source module at the same time. When restore
+    # recomputes prefix-last logp (forward_step.py uses
+    # ``from verl.utils.megatron.tensor_parallel import``), it needs the
+    # original function; if the source module were patched, recomputation
+    # would enter the patched_fn — the incoming logits would be only
+    # [1, V//tp] while index.provider_1d_pos is a global packed offset,
+    # producing an empty slice that triggers the RuntimeError in
+    # vocab_logprobs.py.
     PatchSpec(
         module_name="verl.workers.engine.megatron.transformer_impl",
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
-        eager=True,  # 同 forward_step，模块已预加载
+        eager=True,  # Same as forward_step; module is already preloaded
     ),
 ] + [
     PatchSpec(
@@ -73,7 +81,7 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "no_padding_2_padding"),
         patch_factory=patch_no_padding_2_padding,
         description=f"no_padding_2_padding in {mod_name} → PS trimming-aware",
-        eager=True,  # 这些模块在 PS hook 安装前已被 verl 加载
+        eager=True,  # These modules are already loaded by verl before PS hooks are installed
     )
     for mod_name in _NOPADDING_PATCH_MODULES
 ]
