@@ -304,6 +304,18 @@ def test_get_cp_group_returns_none_without_pg_collection():
 # ═══════════════════════════════════════
 
 
+def _expected_patch_count() -> int:
+    """Compute the expected patch count based on currently installed dependencies."""
+    count = 7  # verl080_fsdp base: 7 PatchSpecs
+    try:
+        import megatron.core  # noqa: F401
+        import mindspeed  # noqa: F401
+        count += 7  # verl080_mcore0161_ms0160 adds 7 more PatchSpecs
+    except ImportError:
+        pass
+    return count
+
+
 def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     """patch 始终尝试安装，环境兼容时（verl/Megatron 存在）应成功安装。"""
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
@@ -312,7 +324,7 @@ def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -323,7 +335,7 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     importlib.reload(prefix_sharing)
     # 服务器上 verl+Megatron 已安装，patch 安装应成功
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -333,4 +345,4 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import prefix_sharing
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
