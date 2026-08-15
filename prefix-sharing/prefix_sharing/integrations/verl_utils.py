@@ -323,9 +323,10 @@ def _copy_tensors_to_cpu_lists(tensors: list[Any]) -> list[list[int]]:
 
 
 def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
-    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。
+    """Extract per-sequence token ID lists from a NestedTensor (jagged layout).
 
-    批量异步 device→CPU 拷贝（CUDA/NPU），单次同步，避免 pipeline stall。
+    Batched async device→CPU copies (CUDA/NPU), single synchronization point
+    to avoid pipeline stalls.
     """
 
     offsets = nested_tensor.offsets()

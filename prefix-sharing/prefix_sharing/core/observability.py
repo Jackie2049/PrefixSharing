@@ -1,8 +1,10 @@
-"""Prefix-sharing 可观测性统计。
+"""Prefix-sharing observability statistics.
 
-本模块只记录诊断所需的轻量计数，不改变 prefix-sharing 的计算语义。
-统计对象绑定在单个 ``PrefixSharingRuntimeContext`` 生命周期内，用来对比
-planner 的理论复用收益和 runtime 的真实 KV 复用行为。
+This module only records lightweight counters needed for diagnostics and does
+not alter the computational semantics of prefix-sharing. Statistics objects
+are bound to the lifetime of a single ``PrefixSharingRuntimeContext`` and are
+used to compare the planner's theoretical reuse benefit against the runtime's
+actual KV reuse behavior.
 """
 
 from __future__ import annotations
@@ -22,64 +24,79 @@ if TYPE_CHECKING:
 
 @dataclass
 class PrefixSharingLayerStats:
-    """单个 attention layer 的真实 KV 复用统计。"""
+    """Per-layer KV reuse statistics for a single attention layer."""
 
     layer_id: int
-    # 本层写入 PrefixAttentionStore 的 KV 条目数，包括 provider 原始 KV 和 reuser 扩展后的 KV。
+    # Number of KV entries written to PrefixAttentionStore for this layer,
+    # including both provider raw KV and reuser expanded KV.
     store_count: int = 0
-    # 本层尝试复用 provider KV 的次数；正常应等于本层 reuser 数。
+    # Number of times this layer attempted to reuse provider KV; should
+    # normally equal the number of reusers in this layer.
     reuse_count: int = 0
-    # 本层成功复用 provider KV 的次数，用于确认真实复用路径是否生效。
+    # Number of times this layer successfully reused provider KV; used to
+    # confirm that the actual reuse path is effective.
     reuse_hit_count: int = 0
-    # 本层复用 provider KV 失败的次数；非 0 通常表示 provider 顺序或 store key 有问题。
+    # Number of times this layer failed to reuse provider KV; non-zero
+    # usually indicates provider ordering or store key issues.
     reuse_miss_count: int = 0
-    # 本层写入 PrefixAttentionStore 的 KV token 总数，只统计有效 token，不统计 TP/CP padding。
+    # Total KV tokens written to PrefixAttentionStore for this layer, counting
+    # only valid tokens (excluding TP/CP padding).
     stored_tokens: int = 0
-    # 本层实际从 provider KV 中复用的 prefix token 总数，是判断复用是否真的发生的核心指标。
+    # Total prefix tokens actually reused from provider KV in this layer; the
+    # key metric for confirming that reuse really happened.
     reused_prefix_tokens: int = 0
-    # 本层 build_kv 后传给 attention 的 expanded KV token 总数，等于各样本原始有效长度之和。
+    # Total expanded KV tokens passed to attention after build_kv in this
+    # layer; equals the sum of each sample's original valid length.
     expanded_kv_tokens: int = 0
-    # 本层裁剪后真实参与 query 计算的有效 token 数，不包含 packed padding 槽位。
+    # Valid tokens that actually participate in query computation in this
+    # layer, excluding packed padding slots.
     valid_q_tokens: int = 0
-    # 本层 packed query tensor 的 token 槽位数，包含 TP/CP padding，可用于判断 padding 是否吞掉收益。
+    # Token slots in the packed query tensor for this layer, including TP/CP
+    # padding; useful for determining whether padding is consuming the benefit.
     padded_q_tokens: int = 0
 
 
 @dataclass
 class PrefixSharingStats:
-    """单个 micro-batch 的 prefix-sharing expected/actual 诊断统计。"""
+    """Per-micro-batch prefix-sharing expected/actual diagnostic statistics."""
 
-    # 当前 forward 的唯一编号，来自 PrefixSharingPlan，用于跨日志关联同一次前向。
+    # Unique identifier for the current forward pass, from PrefixSharingPlan;
+    # used to correlate logs across the same forward pass.
     forward_id: int
-    # 当前 micro-batch 的编号，来自 PrefixSharingPlan，用于定位 batch 级复用效果。
+    # Micro-batch identifier from PrefixSharingPlan; used to locate batch-level
+    # reuse effectiveness.
     micro_batch_id: int
-    # 当前 micro-batch 的样本数量。
+    # Number of samples in the current micro-batch.
     batch_size: int
-    # 原始有效 token 总数，即未裁剪前 attention_mask 为 true 的 token 数。
+    # Total original valid tokens (attention_mask == true before trimming).
     original_tokens: int
-    # 裁剪后实际参与计算的有效 token 总数，不包含 packed padding。
+    # Total valid tokens that participate in computation after trimming,
+    # excluding packed padding.
     kept_valid_tokens: int
-    # TP/CP padding 后 packed tensor 中的 token 槽位总数，包含 padding。
+    # Total token slots in the packed tensor after TP/CP padding, including
+    # padding slots.
     kept_padded_tokens: int
-    # 理论上通过 prefix-sharing 复用的有效 token 数，等于 original_tokens - kept_valid_tokens。
+    # Theoretically reused valid tokens via prefix-sharing; equals
+    # original_tokens - kept_valid_tokens.
     reused_valid_tokens: int
-    # 理论有效 token 复用比例，用于判断性能没有提升是否因为复用比例本身过低。
+    # Theoretical valid-token reuse ratio; useful for determining whether lack
+    # of performance gain is due to a low reuse ratio itself.
     reused_valid_token_ratio: float
-    # 被其他样本复用的 provider 样本数量。
+    # Number of provider samples that are reused by other samples.
     provider_count: int
-    # 复用其他样本 prefix 的 reuser 样本数量。
+    # Number of reuser samples that reuse another sample's prefix.
     reuser_count: int
-    # 当前 micro-batch 内检测到的共享前缀组数量。
+    # Number of shared prefix groups detected in the current micro-batch.
     sharing_group_count: int
-    # 每层理论应发生的 KV load 次数；正常等于 reuser_count。
+    # Expected KV load count per layer; should normally equal reuser_count.
     expected_reused_counts_per_layer: int
-    # 每层理论应从 provider KV 中加载的 prefix token 总数。
+    # Expected total prefix tokens loaded from provider KV per layer.
     expected_reused_prefix_tokens_per_layer: int
-    # 理论需要执行 prefix-last restore 的位置数。
+    # Theoretical number of positions requiring prefix-last restore.
     expected_restore_count: int
-    # runtime 实际执行 prefix-last restore 的位置数。
+    # Number of prefix-last restores actually executed by the runtime.
     actual_restore_count: int = 0
-    # 按 layer_id 聚合的 runtime KV 复用统计。
+    # Per-layer runtime KV reuse statistics, aggregated by layer_id.
     layers: dict[int, PrefixSharingLayerStats] = field(default_factory=dict)
 
     @classmethod

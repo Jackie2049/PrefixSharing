@@ -1,64 +1,65 @@
-"""verl080 精度比较 — ON vs OFF（自包含，不依赖 v070 cmp_diag）。
+"""verl080 precision comparison — ON vs OFF (self-contained, no v070 cmp_diag dependency).
 
-本文件**完全自包含**，不从 ``cmp_diag`` / ``diagnostic_dump`` import 任何东西，
-便于将来独立维护（verl070 对应文件可能被废弃）。
+This file is **fully self-contained** — imports nothing from ``cmp_diag`` /
+``diagnostic_dump``, so it can be maintained independently (the verl070
+counterpart may be deprecated).
 
-对比项分两类：
+Comparison categories:
 
-  **packed（suffix 对齐）**
-    - attention_output per-layer cos   每层 attention 输出余弦相似度
-    - packed_token                      packed[pos]（attn[pos] + logits[pos]，--token 指定 pos，默认 0）
-    - logits packed                     全 packed logits suffix 对齐对比
+  **packed (suffix-aligned)**
+    - attention_output per-layer cos   cosine similarity of per-layer attention output
+    - packed_token                      packed[pos] (attn[pos] + logits[pos], --token sets pos, default 0)
+    - logits packed                     full packed logits suffix-aligned comparison
 
-  **2D（v080 特有，restore 后 ``[B, L_max]``）**
-    - logprobs / entropy                直接逐元素对比（ON/OFF 同坐标系）
+  **2D (v080-specific, after restore ``[B, L_max]``)**
+    - logprobs / entropy                element-wise comparison (ON/OFF share coordinate system)
 
-suffix 对齐逻辑（v080）：ON 物理裁剪后 packed 只含 suffix 区段，OFF 含完整序列。
-用 OFF 的 ``cu_seqlens_q.pt`` + ON 的 ``prefix_lens.pt`` 构建 1D suffix mask，
-从 OFF 完整 packed 提取与 ON 对应的 suffix 段，再逐 token 比对。
+Suffix alignment logic (v080): ON physically trims to suffix-only packed, OFF retains full sequence.
+Uses OFF ``cu_seqlens_q.pt`` + ON ``prefix_lens.pt`` to build a 1D suffix mask,
+extracts the suffix segment from OFF full packed that corresponds to ON, then compares token-by-token.
 
-dump 文件约定（``diagnostic_dump_verl080``）::
+Dump file conventions (``diagnostic_dump_verl080``)::
 
-    logprobs_{tag}.pt       [B, L_max]       restore 后 2D log_probs
+    logprobs_{tag}.pt       [B, L_max]       2D log_probs after restore
     entropy_{tag}.pt        [B, L_max]       2D entropy
-    attention_mask_{tag}.pt [B, L_max] bool  [0,L_i-1) 所有 predict 有效位
-    label_mask_{tag}.pt     [B, L_max] bool  [prompt-last,L_i-1) PPO loss 范围
-    logits.pt               [N, V//tp]       packed logits（ON 裁剪后 / OFF 完整）
+    attention_mask_{tag}.pt [B, L_max] bool  [0,L_i-1) all valid prediction positions
+    label_mask_{tag}.pt     [B, L_max] bool  [prompt-last,L_i-1) PPO loss range
+    logits.pt               [N, V//tp]       packed logits (ON trimmed / OFF full)
     attn_outputs.pt         dict {layer: [N, hidden]}  per-layer packed attn output
-    rope_freqs.pt           dict {layer: [T,1,1,D]}    per-token RoPE 角度（ON/OFF 同款）
-    rope_preqk.pt           dict {layer: [T,H,D]}      旋转前 Q/K（pre-RoPE）
-    rope_postqk.pt          dict {layer: [T,H,D]}      旋转后 Q/K（post-RoPE）
-    prefix_lens.pt          [B]              ON=plan.prefix_lens / OFF=全0
-    cu_seqlens_q.pt         [B+1]            NestedTensor offsets（ON 裁剪后 / OFF 完整）
-    cu_seqlens_q_logits.pt  [B+1]            logits packed 边界（同上）
+    rope_freqs.pt           dict {layer: [T,1,1,D]}    per-token RoPE angles (ON/OFF same format)
+    rope_preqk.pt           dict {layer: [T,H,D]}      pre-rotation Q/K (pre-RoPE)
+    rope_postqk.pt          dict {layer: [T,H,D]}      post-rotation Q/K (post-RoPE)
+    prefix_lens.pt          [B]              ON=plan.prefix_lens / OFF=all zeros
+    cu_seqlens_q.pt         [B+1]            NestedTensor offsets (ON trimmed / OFF full)
+    cu_seqlens_q_logits.pt  [B+1]            logits packed boundaries (same as above)
 
 Usage:
-    # 完整对比（attn per-layer + packed_token + logits + logprobs + entropy）
+    # Full comparison (attn per-layer + packed_token + logits + logprobs + entropy)
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off --tag old
 
-    # 只看某一层 attention（1-indexed）
+    # Compare a specific attention layer (1-indexed)
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --layer 12
 
-    # top-K 误差最大位置（2D + packed_token）
+    # Top-K max error positions (2D + packed_token)
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --topk 20
 
-    # OFF vs OFF baseline（噪声底）
+    # OFF vs OFF baseline (noise floor)
     python cmp_diag_verl080.py --dir-on ./dump_off --dir-off ./dump_off2 \\
         --tag old
 
 Parameters:
-    --dir-on     (必需) ON dump 目录
-    --dir-off    (必需) OFF dump 目录
-    --dir-off2   (可选) 第二个 OFF 目录，OFF-vs-OFF baseline
-    --tag        (必需) 2D 文件标签 old / train
-    --mask       (可选) 2D 对比 mask: label(默认) / attention / none
-    --layer      (可选) 只对比指定层 attention (1-indexed)，不传则所有层
-    --atol       (可选) 2D 对比绝对容差，默认 1e-5
-    --topk       (可选) top-K 误差位置（0=关闭）
-    --sort-err   (可选) top-K 排序: abs(默认) / rel / val
-    -o, --output (可选) JSON 报告
+    --dir-on     (required) ON dump directory
+    --dir-off    (required) OFF dump directory
+    --dir-off2   (optional) Second OFF directory for OFF-vs-OFF baseline
+    --tag        (required) 2D file tag: old / train
+    --mask       (optional) 2D comparison mask: label (default) / attention / none
+    --layer      (optional) Compare specific attn layer (1-indexed), default all layers
+    --atol       (optional) 2D absolute tolerance, default 1e-5
+    --topk       (optional) top-K error positions (0=disabled)
+    --sort-err   (optional) top-K sort: abs (default) / rel / val
+    -o, --output (optional) JSON report output path
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ _SEP_THIN = "─" * 70
 _CHECK = "✓"
 _CROSS = "✗"
 
-# attn per-layer cos 通过阈值（logits/attn 向量级）
+# attn per-layer cos pass threshold (logits/attn vector-level)
 _COS_AVG_PASS = 0.9999
 _COS_MIN_PASS = 0.999
 
@@ -176,7 +177,7 @@ def _load_packed_meta(dir_path: str,
 
 
 def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
-    """加载单层 attn_output（attn_outputs.pt = dict {layer: tensor}）。"""
+    """Load single-layer attn_output (attn_outputs.pt = dict {layer: tensor})."""
     filepath = os.path.join(dir_path, "attn_outputs.pt")
     if not os.path.exists(filepath):
         return None
@@ -185,7 +186,7 @@ def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
 
 
 def _load_attn_grad(dir_path: str, layer: int) -> torch.Tensor | None:
-    """加载单层 attn_grad（attn_grads.pt = dict {layer: tensor}）。"""
+    """Load single-layer attn_grad (attn_grads.pt = dict {layer: tensor})."""
     filepath = os.path.join(dir_path, "attn_grads.pt")
     if not os.path.exists(filepath):
         return None
@@ -208,12 +209,13 @@ def _get_num_layers(dir_path: str) -> int:
 def _build_alignment_mask(cu_seqlens: torch.Tensor,
                           prefix_lens: torch.Tensor,
                           total_tokens: int) -> torch.Tensor:
-    """构建 1D suffix mask ``[total_tokens]``：True = suffix token。
+    """Build 1D suffix mask ``[total_tokens]``: True = suffix token.
 
-    用 OFF 的 cu_seqlens + ON 的 prefix_lens：每行 ``[cu[i]+prefix_len[i] : cu[i+1]]``
-    为 suffix 区段。应用于 OFF 完整 packed 提取与 ON（裁剪后只含 suffix）对应的段。
+    Uses OFF cu_seqlens + ON prefix_lens: each row ``[cu[i]+prefix_len[i] : cu[i+1]]``
+    is the suffix segment. Applied to OFF full packed to extract the segment
+    corresponding to ON (which is trimmed to suffix-only).
 
-    例：cu=[0,7,13], prefix_lens=[3,4], total=13 → [0,0,0,1,1,1,1, 0,0,0,0,1,1]
+    Example: cu=[0,7,13], prefix_lens=[3,4], total=13 → [0,0,0,1,1,1,1, 0,0,0,0,1,1]
     """
     mask = torch.zeros(total_tokens, dtype=torch.bool)
     for seq_idx in range(cu_seqlens.shape[0] - 1):
@@ -227,10 +229,10 @@ def _build_alignment_mask(cu_seqlens: torch.Tensor,
 def _align_packed(on_tensor: torch.Tensor, off_tensor: torch.Tensor,
                   alignment_mask: torch.Tensor
                   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """ON（suffix-only）与 OFF（full-packed）按 alignment_mask 对齐。
+    """Align ON (suffix-only) with OFF (full-packed) using alignment_mask.
 
-    返回 ``(on, off_suffix)``，其中 ``off_suffix = off[alignment_mask]``，
-    shape[0] == on_tensor.shape[0]。
+    Returns ``(on, off_suffix)`` where ``off_suffix = off[alignment_mask]``,
+    shape[0] == on_tensor.shape[0].
     """
     T = off_tensor.shape[0]
     n_suffix = int(alignment_mask.sum())
@@ -254,16 +256,17 @@ def _aligned_vec_at_pos(
     pos: int,
     align_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """ON(suffix-only)/OFF(full-packed) 的 packed 张量 **suffix 对齐后** 取 [pos]。
+    """Extract [pos] from ON(suffix-only)/OFF(full-packed) packed tensors **after suffix alignment**.
 
-    ON 物理裁剪后只含 suffix，OFF 含完整序列，两者 token 不直接对应——必须先用
-    align_mask 把 OFF 的 suffix 段抽出来与 ON 对齐，再取 [pos]。pos 索引的是
-    对齐后的 suffix-packed 空间（ON/OFF 一致，指向同一个 token）。
+    ON is physically trimmed to suffix-only; OFF retains the full sequence — their tokens
+    do not directly correspond. Must first extract OFF's suffix segment via align_mask
+    to align with ON, then index [pos]. pos indexes into the aligned suffix-packed space
+    (shared by ON/OFF, pointing to the same token).
 
-    - is_attn=True：attn_output ``[T,1,hidden]`` → ``[T,hidden]``。
-    - is_attn=False：logits → ``[N, V]``（vocab 恒在最后一维）。
-    返回 (on_vec, off_vec)（同 token、同向量长度），或 None（数据缺失 / pos 越界 /
-    对齐失败）。
+    - is_attn=True: attn_output ``[T,1,hidden]`` → ``[T,hidden]``.
+    - is_attn=False: logits → ``[N, V]`` (vocab always on last dim).
+    Returns (on_vec, off_vec) (same token, same vector length), or None (data missing /
+    pos out of range / alignment failure).
     """
     if on_tensor is None or off_tensor is None:
         return None
@@ -286,7 +289,7 @@ def _aligned_vec_at_pos(
 
 def _logits_ensure_token_major(logits_on: torch.Tensor, logits_off: torch.Tensor
                                ) -> tuple[torch.Tensor, torch.Tensor]:
-    """确保 logits 为 2D [N, V]（token-major），vocab 在最后一维。"""
+    """Ensure logits are 2D [N, V] (token-major), vocab on last dim."""
     return (logits_on.reshape(-1, logits_on.size(-1)).contiguous(),
             logits_off.reshape(-1, logits_off.size(-1)).contiguous())
 
@@ -322,9 +325,10 @@ def _build_attn_align_mask(dir_on: str, dir_off: str) -> torch.Tensor | None:
 
 def cmp_attn_layer(dir_on: str, dir_off: str,
                    layer: int | None) -> CheckResult | None:
-    """attention_output per-layer cos（suffix 对齐）。
+    """attention_output per-layer cosine (suffix aligned).
 
-    单层模式（layer 给定）：返回该层 cos。全层模式：返回所有层 cos 汇总。
+    Single-layer mode (layer given): returns cos for that layer.
+    Full-layer mode: aggregates all layers' cos.
     """
     align_mask = _build_attn_align_mask(dir_on, dir_off)
 
@@ -417,17 +421,19 @@ def cmp_attn_grads(dir_on: str, dir_off: str,
 def cmp_packed_token(dir_on: str, dir_off: str,
                      pos: int = 0, layer: int | None = None,
                      align_mask: torch.Tensor | None = None) -> list[CheckResult]:
-    """packed[pos] 对比（**suffix 对齐后**）：attn[pos]（可指定层）+ logits[pos]（仅最后一层）。
+    """packed[pos] comparison (**after suffix alignment**): attn[pos] (optionally by layer) + logits[pos] (last layer only).
 
-    ON 是裁剪后的 suffix-only packed，OFF 是完整 packed，两者 token **不直接对应**——
-    必须先用 align_mask（OFF cu_seqlens + ON prefix_lens）把 OFF 的 suffix 段抽出来
-    与 ON 对齐，再取 [pos]。pos 索引的是对齐后的 suffix-packed 空间（ON/OFF 一致）。
+    ON is trimmed suffix-only packed; OFF is full packed — their tokens **do not directly
+    correspond**. Must first extract OFF's suffix segment via align_mask (OFF cu_seqlens +
+    ON prefix_lens) to align with ON, then index [pos]. pos indexes into the aligned
+    suffix-packed space (shared by ON/OFF).
 
-    - pos：对齐后 suffix-packed 里的位置（单个 int，默认 0）。
-    - attn：用 *layer*（默认最后一层）。对比第 1 层可区分
-      "结构错（第 1 层就偏）" vs "数值累积（第 1 层完美、深层才偏）"。
-    - logits：永远最后一层。
-    - align_mask：可选，复用调用方已构建的；None 则内部构建。
+    - pos: position in aligned suffix-packed space (single int, default 0).
+    - attn: uses *layer* (default last layer). Comparing layer 1 can distinguish
+      "structural error (layer 1 already diverges)" vs "numerical accumulation
+      (layer 1 is perfect, deep layers diverge)".
+    - logits: always last layer.
+    - align_mask: optional, reuse caller's mask; None builds internally.
     """
     if align_mask is None:
         align_mask = _build_attn_align_mask(dir_on, dir_off)
@@ -442,7 +448,7 @@ def cmp_packed_token(dir_on: str, dir_off: str,
         if vecs is None:
             results.append(CheckResult(
                 name=f"attn_L{attn_layer}_pos{pos}",
-                metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+                metrics={"error": f"alignment failed or pos {pos} out of range"}))
         else:
             results.append(CheckResult(
                 name=f"attn_L{attn_layer}_pos{pos}",
@@ -454,7 +460,7 @@ def cmp_packed_token(dir_on: str, dir_off: str,
     if vecs is None:
         results.append(CheckResult(
             name=f"logits_pos{pos}",
-            metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+            metrics={"error": f"alignment failed or pos {pos} out of range"}))
     else:
         results.append(CheckResult(
             name=f"logits_pos{pos}",
@@ -466,8 +472,8 @@ def cmp_packed_token(dir_on: str, dir_off: str,
 #  Post-RoPE Q/K compare: per-layer + packed_token
 # ══════════════════════════════════════════════════════════════════
 
-# RoPE 对比阶段：**先 pre（旋转前，rope_preqk.pt）后 post（旋转后，rope_postqk.pt）**。
-# (stage, fname, label) — label 用作结果名前缀与打印 section 头。
+# RoPE comparison stages: **pre (before rotation, rope_preqk.pt) then post (after rotation, rope_postqk.pt)**.
+# (stage, fname, label) — label used as result name prefix and section header.
 _ROPE_STAGES: list[tuple[str, str, str]] = [
     ("pre", "rope_preqk.pt", "rope_preqk"),
     ("post", "rope_postqk.pt", "rope_postqk"),
@@ -568,10 +574,10 @@ def _cmp_rope_stage_layer(dir_on: str, dir_off: str, layer: int | None,
 
 def cmp_rope_postqk_layer(dir_on: str, dir_off: str, layer: int | None,
                         stage: str = "post") -> CheckResult | None:
-    """Q/K per-layer cosine（suffix 对齐），单 stage。
+    """Q/K per-layer cosine (suffix aligned), single stage.
 
-    stage="pre" → rope_preqk.pt（旋转前），stage="post" → rope_postqk.pt（旋转后）。
-    调用方按 pre → rope_freqs → post 顺序分别调用，便于定位分歧出现在 RoPE 哪一步。
+    stage="pre" → rope_preqk.pt (before rotation), stage="post" → rope_postqk.pt (after rotation).
+    Caller invokes in pre → rope_freqs → post order to pinpoint where divergence appears in RoPE pipeline.
     """
     if stage == "pre":
         return _cmp_rope_stage_layer(dir_on, dir_off, layer, "rope_preqk.pt", "rope_preqk")
@@ -614,17 +620,17 @@ def _rope_postqk_vec_at_pos(query_on: torch.Tensor | None, key_on: torch.Tensor 
 
 def _diag_rope_pos_fail(q_on: torch.Tensor | None, q_off: torch.Tensor | None,
                         pos: int, align_mask: torch.Tensor | None) -> str:
-    """rope_postqk packed_token 取 [pos] 失败时的诊断串：区分 缺失 / 对齐失败 / pos 越界。"""
+    """Diagnostic string when rope_postqk packed_token [pos] fails: distinguishes missing / alignment failure / pos out of range."""
     if q_on is None or q_off is None:
-        return f"rope_postqk 该层在 {'ON' if q_on is None else 'OFF'} 侧缺失"
+        return f"rope_postqk missing on {'ON' if q_on is None else 'OFF'} side"
     n_on, n_off = q_on.shape[0], q_off.shape[0]
     if align_mask is not None and n_on != n_off:
         msum = int(align_mask.sum())
-        return (f"对齐失败: n_on={n_on} n_off={n_off} "
+        return (f"alignment failed: n_on={n_on} n_off={n_off} "
                 f"align_mask(len={align_mask.shape[0]}, sum={msum}); "
-                f"需 ON tokens==sum({msum}) 且 mask_len==n_off({n_off})")
+                f"need ON tokens==sum({msum}) and mask_len==n_off({n_off})")
     post = min(n_on, n_off)
-    return f"pos {pos} 越界: 对齐后 token 数={post} (n_on={n_on}, n_off={n_off})"
+    return f"pos {pos} out of range: aligned token count={post} (n_on={n_on}, n_off={n_off})"
 
 
 def _cmp_rope_stage_token(dir_on: str, dir_off: str, pos: int, layer: int | None,
@@ -660,11 +666,11 @@ def cmp_rope_postqk_token(dir_on: str, dir_off: str,
                         pos: int = 0, layer: int | None = None,
                         align_mask: torch.Tensor | None = None,
                         stage: str = "post") -> list[CheckResult]:
-    """Q/K packed[pos] 对比（**suffix 对齐后**），单 stage。
+    """Q/K packed[pos] comparison (**after suffix alignment**), single stage.
 
-    stage="pre" → rope_preqk.pt（旋转前），stage="post" → rope_postqk.pt（旋转后）。
-    对 Q、K 分别输出 {label}_L{layer_idx}_Q_pos{pos} / {label}_L{layer_idx}_K_pos{pos}。
-    调用方按 pre → rope_freqs → post 顺序分别调用。
+    stage="pre" → rope_preqk.pt (before rotation), stage="post" → rope_postqk.pt (after rotation).
+    Outputs {label}_L{layer_idx}_Q_pos{pos} / {label}_L{layer_idx}_K_pos{pos} for Q and K separately.
+    Caller invokes in pre → rope_freqs → post order.
     """
     if stage == "pre":
         return _cmp_rope_stage_token(dir_on, dir_off, pos, layer, align_mask,
@@ -674,7 +680,7 @@ def cmp_rope_postqk_token(dir_on: str, dir_off: str,
 
 
 def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
-    """全 packed logits suffix 对齐 + per-token cosine。"""
+    """Full packed logits suffix alignment + per-token cosine."""
     logits_on = _load_logits(dir_on)
     logits_off = _load_logits(dir_off)
     if logits_on is None or logits_off is None:
@@ -708,11 +714,11 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
 def _align_rope_freqs_layer(on_freqs: torch.Tensor, off_freqs: torch.Tensor,
                              align_mask: torch.Tensor
                              ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """单层 rope_freqs（per-token [T,1,1,D]）suffix 对齐。
+    """Single-layer rope_freqs (per-token [T,1,1,D]) suffix alignment.
 
-    返回 (on_aligned, off_aligned) [N,1,1,D]；对齐失败返回 None。
-    供 cmp_rope_freqs（per-layer max_diff）与 cmp_rope_freqs_token（[pos] 角度向量）复用。
-    ON/OFF 现在都是 per-token，直接对齐即可（不再从 raw 表重建）。
+    Returns (on_aligned, off_aligned) [N,1,1,D]; None on alignment failure.
+    Shared by cmp_rope_freqs (per-layer max_diff) and cmp_rope_freqs_token ([pos] angle vector).
+    ON/OFF are both per-token now — direct alignment (no longer rebuilt from raw table).
     """
     try:
         return _align_packed(on_freqs, off_freqs, align_mask)
@@ -723,9 +729,9 @@ def _align_rope_freqs_layer(on_freqs: torch.Tensor, off_freqs: torch.Tensor,
 def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
                                 align_mask: torch.Tensor | None = None
                                 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """加载 rope_freqs 对齐后 [pos] 的角度向量 [D]，返回 (on_vec, off_vec) 或 (None, None)。
+    """Load rope_freqs aligned [pos] angle vector [D], returns (on_vec, off_vec) or (None, None).
 
-    供 top-K 跨 stage 对齐用（freqs dim = Q/K dim % D，角度按 head_dim 共享）。
+    Used for top-K cross-stage alignment (freqs dim = Q/K dim % D, angles shared per head_dim).
     """
     filepath_on = os.path.join(dir_on, "rope_freqs.pt")
     filepath_off = os.path.join(dir_off, "rope_freqs.pt")
@@ -752,11 +758,11 @@ def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
 
 def cmp_rope_freqs(dir_on: str, dir_off: str,
                     layer: int | None = None) -> CheckResult | None:
-    """对比 per-token RoPE 角度 — suffix 对齐，应精确相等 max_diff==0。
+    """Compare per-token RoPE angles — suffix aligned, should be exactly equal max_diff==0.
 
-    ON/OFF 都存 per-token 角度 ``rope_freqs.pt`` {layer: [T,1,1,D]}（cos/sin 之前），
-    suffix 对齐后逐元素比。角度是 RoPE 输入，应精确相等（max_diff==0）。
-    ``layer`` 给定则只比该层。
+    ON/OFF both store per-token angles ``rope_freqs.pt`` {layer: [T,1,1,D]} (before cos/sin),
+    compared element-wise after suffix alignment. Angles are RoPE input and should match exactly
+    (max_diff==0). If ``layer`` is given, only that layer is compared.
     """
     filepath_on = os.path.join(dir_on, "rope_freqs.pt")
     filepath_off = os.path.join(dir_off, "rope_freqs.pt")
@@ -773,12 +779,12 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
     result_name = f"rope_freqs_L{layer}" if layer is not None else "rope_freqs"
     if not layers:
         return CheckResult(name=result_name, passed=False,
-                           metrics={"error": f"layer {layer} 不在双方 rope_freqs 中"})
+                           metrics={"error": f"layer {layer} not found in both sides' rope_freqs"})
 
     align_mask = _build_attn_align_mask(dir_on, dir_off)
     if align_mask is None:
         return CheckResult(name=result_name, passed=False,
-                           metrics={"error": "cu_seqlens/prefix_lens 缺失"})
+                           metrics={"error": "cu_seqlens/prefix_lens missing"})
 
     max_diff_value = 0.0
     mismatches: list[dict] = []
@@ -813,10 +819,10 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
 def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
                           layer: int | None = None,
                           align_mask: torch.Tensor | None = None) -> CheckResult | None:
-    """rope_freqs 在对齐后 suffix-packed 位置 [pos] 的角度向量对比（应精确相等）。
+    """rope_freqs angle vector comparison at aligned suffix-packed position [pos] (should be exactly equal).
 
-    取 ``layer``（默认最后一层）对齐后第 ``pos`` 个 token 的角度向量 [D]，比 ON/OFF。
-    角度是 RoPE 输入，应逐元素相等 → max_abs 应为 0。
+    Takes ``layer`` (default last layer), extracts the [pos]-th token's angle vector [D] after alignment,
+    compares ON/OFF. Angles are RoPE input — element-wise max_abs should be 0.
     """
     filepath_on = os.path.join(dir_on, "rope_freqs.pt")
     filepath_off = os.path.join(dir_off, "rope_freqs.pt")
@@ -830,21 +836,21 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
     rf_layer = layer if layer is not None else (max(common) if common else 0)
     result_name = f"rope_freqs_L{rf_layer}_pos{pos}"
     if rf_layer not in on_dict or rf_layer not in off_dict:
-        return CheckResult(name=result_name, metrics={"error": f"layer {rf_layer} 缺失"})
+        return CheckResult(name=result_name, metrics={"error": f"layer {rf_layer} missing"})
 
     if align_mask is None:
         align_mask = _build_attn_align_mask(dir_on, dir_off)
     if align_mask is None:
-        return CheckResult(name=result_name, metrics={"error": "cu_seqlens/prefix_lens 缺失"})
+        return CheckResult(name=result_name, metrics={"error": "cu_seqlens/prefix_lens missing"})
 
     aligned_result = _align_rope_freqs_layer(on_dict[rf_layer], off_dict[rf_layer], align_mask)
     if aligned_result is None:
-        return CheckResult(name=result_name, metrics={"error": "对齐失败"})
+        return CheckResult(name=result_name, metrics={"error": "alignment failed"})
     on_a, off_a = aligned_result
     n = on_a.shape[0]
     if pos < 0 or pos >= n:
         return CheckResult(name=result_name,
-                           metrics={"error": f"pos {pos} 越界: 对齐后 token 数={n}"})
+                           metrics={"error": f"pos {pos} out of range: aligned token count={n}"})
     on_vec = on_aligned[pos].reshape(-1)
     off_vec = off_aligned[pos].reshape(-1)
     vec_result = _vec_metrics(on_vec, off_vec)
@@ -852,7 +858,7 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
 
 
 # ════════════════════════════════════════════════════════════════
-#  Attention KV: ON expanded_kv vs OFF full_kv（prefix 复用校验）
+#  Attention KV: ON expanded_kv vs OFF full_kv (prefix reuse verification)
 # ════════════════════════════════════════════════════════════════
 
 def _load_attn_kv(dir_path: str, layer: int,
@@ -872,11 +878,12 @@ def _load_attn_kv(dir_path: str, layer: int,
 
 def cmp_attn_kv(dir_on: str, dir_off: str,
                 layer: int | None = None) -> CheckResult | None:
-    """对比 ON expanded_kv vs OFF full_kv（K/V 分别），逐元素 max_diff + cos。
+    """Compare ON expanded_kv vs OFF full_kv (K/V separately), element-wise max_diff + cos.
 
-    两者都应是 full（prefix+suffix）且**逐元素相同**（prefix-sharing 的 KV 展开应精确还原
-    完整 KV）。相同 → attention 输入一致，attention_output 差异必来自 attention 计算/mask；
-    不同 → bug 在 build_kv 的 prefix 复用（store/expand）。
+    Both should be full (prefix+suffix) and **element-wise identical** (prefix-sharing KV
+    expansion should exactly restore full KV). If identical → attention input is consistent,
+    attention_output differences must come from attention computation/mask;
+    if different → bug is in build_kv prefix reuse (store/expand).
     """
     filepath_on = os.path.join(dir_on, "expanded_kv.pt")
     filepath_off = os.path.join(dir_off, "full_kv.pt")
@@ -892,7 +899,7 @@ def cmp_attn_kv(dir_on: str, dir_off: str,
     result_name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
     if not layers:
         return CheckResult(name=result_name, passed=False,
-                           metrics={"error": f"layer {layer} 不在双方 attn_kv 中"})
+                           metrics={"error": f"layer {layer} not found in both sides' attn_kv"})
 
     per_layer: dict = {}
     worst = {"max_diff": 0.0, "cos_min": 1.0}
@@ -904,7 +911,7 @@ def cmp_attn_kv(dir_on: str, dir_off: str,
         entry_result: dict = {}
         for kv_type, (on_kv, off_kv) in [("K", (on_key, off_key)), ("V", (on_value, off_value))]:
             if on_kv is None or off_kv is None:
-                entry_result[kv_type] = {"error": "缺失"}
+                entry_result[kv_type] = {"error": "missing"}
                 continue
             if on_kv.shape != off_kv.shape:
                 entry_result[kv_type] = {
@@ -922,7 +929,7 @@ def cmp_attn_kv(dir_on: str, dir_off: str,
             worst["max_diff"] = max(worst["max_diff"], max_elem_diff)
             worst["cos_min"] = min(worst["cos_min"], float(token_cos.min()))
         per_layer[layer_idx] = entry_result
-    # expanded 应精确等于 full → 阈值极严
+    # expanded should exactly equal full → threshold is very strict
     passed = worst["max_diff"] < 1e-5 and worst["cos_min"] > 0.9999
     return CheckResult(name=result_name, passed=passed,
                        metrics={"layers": per_layer, "max_diff": worst["max_diff"],
@@ -955,7 +962,7 @@ def _print_attn_kv(check_result: CheckResult):
               f"{value_max_diff:>12.3e} {value_cos:>10.6f}  {'OK' if passes_threshold else 'DIFF':>8s}")
     print(f"\n  max_diff={metrics.get('max_diff')}  cos_min={metrics.get('cos_min')}  "
           f"{_CHECK if check_result.passed else _CROSS} "
-          f"{'PASS' if check_result.passed else 'FAIL（KV mismatch → build_kv prefix reuse）'}")
+          f"{'PASS' if check_result.passed else 'FAIL (KV mismatch → build_kv prefix reuse)'}")
     if failing_layers:
         print(f"  ⚠ First KV mismatched layer: {failing_layers[0]}")
     print()
@@ -963,11 +970,12 @@ def _print_attn_kv(check_result: CheckResult):
 
 def cmp_build_kv_input_v(dir_on: str, dir_off: str,
                          layer: int | None = None) -> CheckResult | None:
-    """对比 ON build_kv_input_v vs OFF build_kv_input_v（suffix 对齐）。
+    """Compare ON build_kv_input_v vs OFF build_kv_input_v (suffix aligned).
 
-    两边都存 get_qkv 后、build_kv/RoPE 前的 raw V（``{layer: tensor}``）。同源对比，
-    应逐元素相同——若不同则问题在 QKV 投影阶段（hidden_states / QKV 权重）。
-    ON_T vs OFF_T 还能看出 ON 有没有把 hidden_states 裁成 suffix-only。
+    Both store raw V after get_qkv, before build_kv/RoPE (``{layer: tensor}``). Same-source
+    comparison — should be element-wise identical. If different, the issue is in the QKV
+    projection stage (hidden_states / QKV weights). ON_T vs OFF_T also reveals whether ON
+    trims hidden_states to suffix-only.
     """
     filepath_on = os.path.join(dir_on, "build_kv_input_v.pt")
     filepath_off = os.path.join(dir_off, "build_kv_input_v.pt")
@@ -1038,7 +1046,7 @@ def _print_build_kv_input_v(check_result: CheckResult):
               f"{'OK' if passes_threshold else 'DIFF':>8s}{cropped_label}")
     print(f"\n  max_diff={metrics.get('max_diff')}  cos_min={metrics.get('cos_min')}  "
           f"{_CHECK if check_result.passed else _CROSS} "
-          f"{'PASS' if check_result.passed else 'FAIL（V diverged before build_kv → root cause in get_qkv/hidden_states）'}")
+          f"{'PASS' if check_result.passed else 'FAIL (V diverged before build_kv → root cause in get_qkv/hidden_states)'}")
     print()
 
 
@@ -1117,7 +1125,7 @@ def _print_hidden_states(check_result: CheckResult):
               f"{'OK' if passes_threshold else 'DIFF':>8s}")
     print(f"\n  max_diff={metrics.get('max_diff')}  cos_min={metrics.get('cos_min')}  "
           f"{_CHECK if check_result.passed else _CROSS} "
-          f"{'PASS（hidden_states match → V difference in GEMM）' if check_result.passed else 'FAIL（hidden_states mismatch → root cause upstream）'}")
+          f"{'PASS (hidden_states match → V difference in GEMM)' if check_result.passed else 'FAIL (hidden_states mismatch → root cause upstream)'}")
     print()
 
 
@@ -1126,7 +1134,7 @@ def _print_hidden_states(check_result: CheckResult):
 # ════════════════════════════════════════════════════════════════
 
 def _load_mask_2d(dir_path: str, mask_kind: str, tag: str) -> torch.Tensor | None:
-    """加载 2D mask：``label_mask_{tag}.pt`` / ``attention_mask_{tag}.pt``。"""
+    """Load 2D mask: ``label_mask_{tag}.pt`` / ``attention_mask_{tag}.pt``."""
     if mask_kind == "none":
         return None
     fname = f"{mask_kind}_mask_{tag}.pt"  # label_mask_{tag} / attention_mask_{tag}
@@ -1138,9 +1146,9 @@ def _load_mask_2d(dir_path: str, mask_kind: str, tag: str) -> torch.Tensor | Non
 
 def _resolve_mask(dir_off: str, mask_kind: str, tag: str,
                   ref_shape: tuple[int, ...]) -> torch.Tensor | None:
-    """加载 mask（取 OFF 侧 = ground truth 坐标系）并校验 shape。
+    """Load mask (from OFF side = ground truth coordinate system) and validate shape.
 
-    若 mask 与 logprobs shape 不一致，打印警告并返回 None（回退到全位置对比）。
+    If mask shape mismatches logprobs, prints warning and returns None (falls back to all-position comparison).
     """
     if mask_kind == "none":
         return None
@@ -1205,9 +1213,9 @@ def _shape_of(dir_path: str, filename: str) -> str:
     try:
         obj = torch.load(filepath, weights_only=True)
         if isinstance(obj, dict):
-            # per-layer dict（attn_outputs / rope_freqs_*）：显示层数 + 首层 shape
+            # per-layer dict (attn_outputs / rope_freqs_*): show layer count + first layer shape
             sample = next(iter(obj.values())) if obj else None
-            # rope_postqk.pt：每层值是 {"query","key"[,"positions"]} dict，取 query 的 shape 代表
+            # rope_postqk.pt: each entry is a {"query","key"[,"positions"]} dict, use query shape as representative
             if isinstance(sample, dict):
                 query_tensor = sample.get("query")
                 sample_shape = f",Q{tuple(query_tensor.shape)}" if query_tensor is not None else ""
@@ -1422,9 +1430,9 @@ def _print_2d_result(check_result: CheckResult):
 
 def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
                     topk: int, sort_by: str, label: str, show_rel: bool = True):
-    """1D 向量 top-K（packed_token per-dim）。
+    """1D vector top-K (packed_token per-dim).
 
-    show_rel=False 时省略 REL_ERR 列（用于 logits 表，只看 val/abs）。
+    show_rel=False omits REL_ERR column (used for logits table, only val/abs shown).
     """
     abs_err = (on_vec - off_vec).abs()
     rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
@@ -1432,10 +1440,11 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
         sort_key = abs_err
     elif sort_by == "rel":
         sort_key = rel_err
-    else:  # "val" —— 带符号的实际值，不是绝对值
-        # 对 logits：绝对值大但符号为负的 logit，softmax 后概率极低、不会被选中。
-        # 按 abs 排会把这种"必不选"的 token 顶到表头，掩盖真正的高 logit 候选。
-        # 改用 max(on, off) 带符号值，让真正的高 logit（候选 token）排前面。
+    else:  # "val" — signed actual value, not absolute
+        # For logits: a large-magnitude negative logit has very low softmax probability
+        # and would never be selected. Sorting by abs would push these "never-chosen"
+        # tokens to the top, masking the real high-logit candidates.
+        # Use max(on, off) signed value so truly high logits (candidate tokens) rank first.
         sort_key = torch.maximum(on_vec, off_vec)
     _, idx = sort_key.topk(min(topk, sort_key.numel()))
     idx = idx.to(torch.long)
@@ -1455,10 +1464,10 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
 
 def _print_vec_at_dims(on_vec: torch.Tensor, off_vec: torch.Tensor,
                        dims, label: str, show_rel: bool = True):
-    """在指定 dims 上打印 ON/OFF/ABS_ERR（不排序），跨 stage 对齐同一批 dim。
+    """Print ON/OFF/ABS_ERR at specified dims (unsorted), aligning the same dim set across stages.
 
-    供 rope 流水线 top-K 对齐：dims 取自 rope_postqk 的 sort-err top-K，
-    在 rope_preqk / rope_freqs 上显示同样的 dim，逐 dim 追溯误差来源。
+    Used for RoPE pipeline top-K alignment: dims come from rope_postqk sort-err top-K,
+    displayed on rope_preqk / rope_freqs at the same dims to trace error source per-dim.
     """
     abs_err = (on_vec - off_vec).abs()
     rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
@@ -1478,7 +1487,7 @@ def _print_vec_at_dims(on_vec: torch.Tensor, off_vec: torch.Tensor,
 def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
                    mask: torch.Tensor | None, topk: int, sort_by: str,
                    label: str):
-    """2D [B, L_max] top-K 位置（logp/entropy）。"""
+    """2D [B, L_max] top-K positions (logp/entropy)."""
     abs_err = (on_t - off_t).abs()
     rel_err = abs_err / torch.maximum(on_t.abs(), off_t.abs()).clamp(min=1e-8)
     if sort_by == "abs":
@@ -1630,9 +1639,9 @@ def main():
         all_results.append(check_result)
         _print_per_layer(check_result)
 
-    # ── packed: packed_token（attn[pos] + logits[pos]，suffix 对齐后） ──
-    # pos 由 --token 指定（默认 0，索引对齐后的 suffix-packed 空间）；
-    # attn 用 --layer 指定的层（默认最后一层）；logits 永远最后一层。
+    # ── packed: packed_token (attn[pos] + logits[pos], after suffix alignment) ──
+    # pos specified by --token (default 0, indexing aligned suffix-packed space);
+    # attn uses layer from --layer (default last layer); logits always last layer.
     pos = args.token
     align_mask = _build_attn_align_mask(args.dir_on, args.dir_off)
     packed_token_results = cmp_packed_token(args.dir_on, args.dir_off, pos, args.layer,
@@ -1675,8 +1684,8 @@ def main():
     for rope_result in cmp_rope_postqk_token(args.dir_on, args.dir_off, pos, args.layer,
                                 align_mask=align_mask, stage="post"):
         all_results.append(rope_result); rope_packed_token_results.append(rope_result); _print_packed_token(rope_result)
-    # rope packed_token top-K —— dim 跨 stage 对齐：以 rope_postqk 的 sort-err top-K dim 为基准，
-    # rope_preqk 显示同样 dim，rope_freqs 显示 dim%D（角度按 head_dim 共享），逐 dim 追溯误差。
+    # rope packed_token top-K — dims aligned across stages: using rope_postqk sort-err top-K dims as reference,
+    # rope_preqk shows the same dims, rope_freqs shows dim%D (angles shared per head_dim), tracing error per-dim.
     if args.topk > 0 and rope_packed_token_results:
         rope_layer = args.layer if args.layer is not None else (
             _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off))
@@ -1691,7 +1700,7 @@ def main():
                 args.dir_on, args.dir_off, rope_layer, pos, align_mask)
             if post_vecs is not None:
                 pqo, pqf, pko, pkf = post_vecs
-                # Q: postqk sort-err top-K → preqk / freqs 同 dim
+                # Q: postqk sort-err top-K → preqk / freqs same dims
                 q_dims = _print_topk_vec(pqo.cpu(), pqf.cpu(), args.topk, args.sort_err,
                                          f"rope_postqk_L{rope_layer}_Q_pos{pos}")
                 if pre_vecs is not None:
@@ -1702,7 +1711,7 @@ def main():
                     _print_vec_at_dims(freq_on.cpu(), freq_off.cpu(),
                                        [dim_idx % head_dim for dim_idx in q_dims],
                                        f"rope_freqs_L{rope_layer}_Q_pos{pos} (dim%D)")
-                # K: 同样
+                # K: same approach
                 if pko is not None and pkf is not None:
                     k_dims = _print_topk_vec(pko.cpu(), pkf.cpu(), args.topk, args.sort_err,
                                              f"rope_postqk_L{rope_layer}_K_pos{pos}")

@@ -1,12 +1,13 @@
 """verl 0.8.0 FSDP patch set.
 
-Patch 目标：
+Patch targets:
 1. FSDPEngineWithLMHead.forward_step → dense FSDP PrefixSharing forward helper
-2. 性能验证相关 profiler 注入（不修改 verl 源码）
-3. rollout/fixed-data 注入辅助
+2. Profiler injection for performance validation (without modifying verl source)
+3. Rollout / fixed-data injection helpers
 
-当前 patch set 是 FSDP 开源线的默认入口，可通过兼容矩阵自动选择，也可通过
-``prefix_sharing.setup.install("verl080_fsdp")`` 显式安装。
+This patch set is the default entry point for the FSDP open-source line.
+It can be auto-selected via the compatibility matrix, or explicitly installed
+via ``prefix_sharing.setup.install("verl080_fsdp")``.
 """
 
 from prefix_sharing.setup.patch_installer import PatchSpec
@@ -26,7 +27,7 @@ from .rollout_patch import patch_ray_trainer_fit
 
 PATCH_SET: list[PatchSpec] = [
     # ═══════════════════════════════════════════════════════════════
-    # 一、fix / feature 注入：PrefixSharing 核心功能与调试辅助
+    # 1. Fix / feature injection: PrefixSharing core functionality and debug helpers
     # ═══════════════════════════════════════════════════════════════
     PatchSpec(
         module_name="verl.workers.engine.fsdp.transformer_impl",
@@ -36,7 +37,7 @@ PATCH_SET: list[PatchSpec] = [
         ),
         patch_factory=patch_fsdp_forward_step,
         description="FSDPEngineWithLMHead.forward_step → PrefixSharing dense FSDP helper",
-        eager=True,  # verl FSDP engine 仅在 actor 实例化时 lazy-load，必须 eager 触发
+        eager=True,  # verl FSDP engine is lazy-loaded only when actor is instantiated; must trigger eagerly
     ),
     PatchSpec(
         module_name="verl.trainer.ppo.ray_trainer",
@@ -49,7 +50,8 @@ PATCH_SET: list[PatchSpec] = [
         eager=True,  # ray_trainer is imported by main_ppo at startup; eager ensures patch is in place
     ),
     # ═══════════════════════════════════════════════════════════════
-    # 二、性能验证：ProfilerScope 分层 profiling（对应原 verl 源码中的侵入式修改）
+    # 2. Performance validation: ProfilerScope layered profiling (replaces
+    #    invasive source modifications in the original verl codebase)
     # ═══════════════════════════════════════════════════════════════
     PatchSpec(
         module_name="verl.workers.engine.base",

@@ -335,7 +335,7 @@ def _flush_rope_buffer(dump_dir: str) -> None:
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
-    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    # DP shard: all ranks write their own _dp{r} files, bypass _rank0_only gate
     if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         _ROPE_BUFFER = None
         return
@@ -350,7 +350,7 @@ def _flush_rope_buffer(dump_dir: str) -> None:
 
 def _flush_dict_buffer(filename: str, buffer: dict, dump_dir: str) -> None:
     """torch.save a dict buffer. PP + DP-aware gating and suffix."""
-    # DP shard: 所有 rank 各自写 _dp{r} 文件，不透传 _rank0_only gate
+    # DP shard: all ranks write their own _dp{r} files, bypass _rank0_only gate
     if _get_dp_size() <= 1 and not _should_write_for_scope("pp_stage"):
         return
     try:
@@ -544,7 +544,7 @@ def dump_rope_postqk_verl080(layer_number: int,
         return
     _add_to_rope_buffer(layer_number, rotated_query, rotated_key, positions)
     if layer_number == _stage_last_layer(num_layers):
-        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        # Guard against residual forward overwriting correct file with only last 1 layer (same as dump_fsdp_attn_output)
         if _ROPE_BUFFER is None or len(_ROPE_BUFFER) < num_layers:
             _ROPE_BUFFER = None
             return
@@ -591,7 +591,7 @@ def dump_expanded_kv_on(layer_number: int, expanded_key: torch.Tensor,
         "value": expanded_value.detach().cpu().clone(),
     }
     if layer_number == _stage_last_layer(num_layers):
-        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        # Guard against residual forward overwriting correct file with only last 1 layer (same as dump_fsdp_attn_output)
         if _EXPANDED_KV_BUFFER is None or len(_EXPANDED_KV_BUFFER) < num_layers:
             _EXPANDED_KV_BUFFER = None
             return
@@ -634,7 +634,7 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
         _BUILD_KV_INPUT_V_BUFFER = {}
     _BUILD_KV_INPUT_V_BUFFER[layer_number] = value.detach().cpu().clone()
     if layer_number == _stage_last_layer(num_layers):
-        # 防残余 forward 只用最后 1 层覆盖正确文件（同 dump_fsdp_attn_output）
+        # Guard against residual forward overwriting correct file with only last 1 layer (same as dump_fsdp_attn_output)
         if _BUILD_KV_INPUT_V_BUFFER is None or len(_BUILD_KV_INPUT_V_BUFFER) < num_layers:
             _BUILD_KV_INPUT_V_BUFFER = None
             return
@@ -950,7 +950,7 @@ def dump_fsdp_attn_output(
     if num_layers == 0:
         return
 
-    # 首次 forward 已保存 → 屏蔽 recompute 覆盖
+    # First forward already saved → block recompute overwrite
     if _FSDP_ATTN_BUFFER_SAVED:
         return
 
@@ -962,7 +962,7 @@ def dump_fsdp_attn_output(
     _FSDP_ATTN_BUFFER[layer_number] = output_2d
 
     if layer_number == num_layers:
-        # 防止训练结束后的残余 forward 只用最后 1 层覆盖正确文件
+        # Prevent residual forward after training from overwriting correct file with only last 1 layer
         if len(_FSDP_ATTN_BUFFER) < num_layers:
             _FSDP_ATTN_BUFFER.clear()
             return
@@ -1013,9 +1013,9 @@ def dump_attn_grad_verl080(
     if num_layers == 0:
         return
 
-    # grad_output[0] 来自 module.register_full_backward_hook，是 post-o_proj
-    # 的 [B, L, hidden]，只有一个尾部维度是 hidden dim。对比 dump_fsdp_attn_output
-    # 的 pre-o_proj [B, L, H, D] 需要 shape[-2]*shape[-1]。
+    # grad_output[0] comes from module.register_full_backward_hook, which is post-o_proj
+    # [B, L, hidden] with only the trailing dimension as hidden dim. Compare with dump_fsdp_attn_output
+    # which uses pre-o_proj [B, L, H, D] requiring shape[-2]*shape[-1].
     if grad.dim() == 4:
         hidden_dim = grad.shape[-1] * grad.shape[-2]
     else:
@@ -1023,14 +1023,14 @@ def dump_attn_grad_verl080(
     grad_2d = grad.reshape(-1, hidden_dim).detach().cpu().contiguous()
 
     global _ATTN_GRAD_BUFFER
-    # 注意：backward 时 hook 按 layer 逆序触发（24→23→...→1）。
-    # 最高层最先触发 = 清旧 buffer；最低层最后触发 = flush。
+    # Note: during backward, hooks fire in reverse layer order (24→23→...→1).
+    # Highest layer fires first = clear old buffer; lowest layer fires last = flush.
     if layer_number == num_layers:
         _ATTN_GRAD_BUFFER.clear()
     _ATTN_GRAD_BUFFER[layer_number] = grad_2d
 
     if layer_number == 1:
-        # 所有层的 grad 已收集完毕
+        # All layer grads collected
         if len(_ATTN_GRAD_BUFFER) < num_layers:
             _ATTN_GRAD_BUFFER.clear()
             return
