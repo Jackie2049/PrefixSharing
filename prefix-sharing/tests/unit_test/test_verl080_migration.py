@@ -305,6 +305,18 @@ def test_get_cp_group_returns_none_without_pg_collection():
 # ═══════════════════════════════════════
 
 
+def _expected_patch_count() -> int:
+    """Compute the expected patch count based on currently installed dependencies."""
+    count = 7  # verl080_fsdp base: 7 PatchSpecs
+    try:
+        import megatron.core  # noqa: F401
+        import mindspeed  # noqa: F401
+        count += 7  # verl080_mcore0161_ms0160 adds 7 more PatchSpecs
+    except ImportError:
+        pass
+    return count
+
+
 def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     """Patch always attempts installation; when environment is compatible (verl/Megatron present), installation should succeed."""
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
@@ -313,7 +325,7 @@ def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
     importlib.reload(prefix_sharing)
     # On server, verl+Megatron are installed; patch installation should succeed
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_false(monkeypatch):
@@ -324,7 +336,7 @@ def test_auto_activation_handles_env_var_false(monkeypatch):
     importlib.reload(prefix_sharing)
     # On server, verl+Megatron are installed; patch installation should succeed
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
 
 
 def test_auto_activation_handles_env_var_true(monkeypatch):
@@ -334,4 +346,4 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     import prefix_sharing
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is not None
-    assert "PatchHandle (ACTIVE, 7 patches):" in prefix_sharing._patch_handle.describe()
+    assert f"PatchHandle (ACTIVE, {_expected_patch_count()} patches):" in prefix_sharing._patch_handle.describe()
