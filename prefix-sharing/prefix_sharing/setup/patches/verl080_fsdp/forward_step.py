@@ -171,7 +171,7 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    trimmed_micro_batch, ps_state = prepare_for_prefix_sharing_fsdp(
+    micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config={
@@ -193,8 +193,8 @@ def _forward_step_with_engine_prepare(
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
 
-    if ps_state is None:
-        return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
+    if prefix_sharing_runtime_state is None:
+        return _call_original_like_engine(self, micro_batch_modified, loss_function, forward_only)
 
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
@@ -202,7 +202,7 @@ def _forward_step_with_engine_prepare(
         diagnostic_tag = "train" if self.module.training else "old"
         dump_fsdp_on_metadata_verl080(
             micro_batch,
-            ps_state.prefix_sharing_plan,
+            prefix_sharing_runtime_state.prefix_sharing_plan,
             diagnostic_tag,
         )
 
@@ -211,7 +211,7 @@ def _forward_step_with_engine_prepare(
         getattr(getattr(self, "module", None), "config", None),
         "num_hidden_layers", 0)) or 0
 
-    model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
+    model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch_modified)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
     model_inputs["prefix_sharing_runtime"].num_layers = _diag_num_layers
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
@@ -222,7 +222,7 @@ def _forward_step_with_engine_prepare(
         else torch.autocast(device_type=device_name, dtype=autocast_dtype)
     )
     # ── Create PS context with manual lifecycle (survives backward for AC) ──
-    ctx, ctx_cleanup = create_prefix_sharing_context(ps_state)
+    ctx, ctx_cleanup = create_prefix_sharing_context(prefix_sharing_runtime_state)
 
     # Set _ps_ctx on every attention module so the attention patch reads
     # the context from the module itself rather than ContextVar (compatible
@@ -261,7 +261,7 @@ def _forward_step_with_engine_prepare(
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
-            micro_batch=trimmed_micro_batch,
+            micro_batch=micro_batch_modified,
             logits_processor_func=loss_function,
         )
 
@@ -276,7 +276,7 @@ def _forward_step_with_engine_prepare(
 
             dump_fsdp_model_output_2d_verl080(
                 model_output,
-                list(ps_state.prefix_sharing_plan.original_lengths),
+                list(prefix_sharing_runtime_state.prefix_sharing_plan.original_lengths),
                 diagnostic_tag,
             )
 
@@ -529,7 +529,7 @@ def _read_temperature(micro_batch: Any) -> float:
 def _dump_full_input_ids_only(micro_batch: Any, tag: str) -> None:
     """Dump the original (full) input_ids before prefix sharing trimming.
 
-    The ON path dumps ``input_ids_train.pt`` from the ``trimmed_micro_batch``,
+    The ON path dumps ``input_ids_train.pt`` from the ``micro_batch_modified``,
     which has shared prefix tokens removed.  This helper saves the **original**
     ``micro_batch`` input_ids so that ``cmp_diag_verl080`` can compare the
     full input against the OFF baseline, rather than reporting 186+ differing
