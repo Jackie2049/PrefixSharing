@@ -151,7 +151,7 @@ def create_prefix_sharing_context(
     the ContextVar is left set until the caller invokes the returned cleanup
     function.  This is required for activation‑checkpointing compatibility: AC
     recompute runs inside ``backward()`` and reads the PS context from
-    ``module._ps_ctx`` (set independently by the caller), while the store must
+    ``module._prefix_sharing_context`` (set independently by the caller), while the store must
     still contain the per‑layer KV populated during the first forward.
 
     Returns:
@@ -164,12 +164,12 @@ def create_prefix_sharing_context(
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
     ctxvar_token = _current_context.set(ctx)
 
-    def cleanup() -> None:
+    def cleanup_context() -> None:
         _current_context.reset(ctxvar_token)
         _log_prefix_sharing_audit(ctx)
         ctx.store.close()
 
-    return ctx, cleanup
+    return ctx, cleanup_context
 
 
 def _log_prefix_sharing_audit(ctx: PrefixSharingRuntimeContext) -> None:

@@ -16,6 +16,9 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.context import create_prefix_sharing_context
 from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
 from prefix_sharing.integrations.verl_fsdp import prepare_for_prefix_sharing_fsdp
+from prefix_sharing.integrations.verl_fsdp import restore_prefix_sharing_outputs_2d
+from prefix_sharing.integrations.verl_utils import restore_via_2d_unfold_verl080
+from prefix_sharing.integrations.verl_utils import is_nested_tensor
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
@@ -45,11 +48,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             # path records only the model-forward phase.
             profiler = ProfilerScope.current()
             if profiler is not None:
-                forward_phase = (
-                    PerfProfiler.PHASE_FORWARD_OLD
-                    if forward_only
-                    else PerfProfiler.PHASE_FORWARD
-                )
+                forward_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
                 profiler.start_phase(forward_phase)
 
             # Without diagnostics this path must delegate directly to verl.
@@ -147,6 +146,11 @@ def _forward_step_with_engine_prepare(
     ps_config: Any,
     model_config: Any,
 ) -> Any:
+
+    #########################################################
+    # STEP 1: pre-processing inputs for PrefixSharing
+    #########################################################
+
     profiler = ProfilerScope.current()
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
@@ -157,14 +161,12 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    #########################################################
-    # STEP 1: pre-processing inputs for PrefixSharing
-    #########################################################
     micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config=model_config,
     )
+
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
     
@@ -181,6 +183,10 @@ def _forward_step_with_engine_prepare(
             diagnostic_tag,
         )
 
+    #########################################################
+    # STEP 2: pre-processing inputs for the model
+    #########################################################
+
     # Read layer count for per-layer diagnostic dumps.
     _diag_num_layers = int(getattr(
         getattr(getattr(self, "module", None), "config", None),
@@ -195,16 +201,20 @@ def _forward_step_with_engine_prepare(
         if autocast_dtype == torch.float32
         else torch.autocast(device_type=_read_device_name(), dtype=autocast_dtype)
     )
-    # ── Create PS context with manual lifecycle (survives backward for AC) ──
-    ctx, ctx_cleanup = create_prefix_sharing_context(prefix_sharing_runtime_state)
 
-    # Set _ps_ctx on every attention module so the attention patch reads
+    #########################################################
+    # STEP 3: create PrefixSharing runtime context
+    #########################################################
+
+    prefix_sharing_context, cleanup_prefix_sharing_context = create_prefix_sharing_context(prefix_sharing_runtime_state)
+
+    # Set _prefix_sharing_context on every attention module so the attention patch reads
     # the context from the module itself rather than ContextVar (compatible
     # with activation-checkpointing recompute, which bypasses the context
     # manager that set the ContextVar).
     for attention_module in self.module.modules():
         if hasattr(attention_module, "layer_idx") and hasattr(attention_module, "q_proj"):
-            attention_module._ps_ctx = ctx
+            attention_module._prefix_sharing_context = prefix_sharing_context
 
     # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
@@ -212,15 +222,15 @@ def _forward_step_with_engine_prepare(
     # Attach cleanup callback so the forward_backward_batch wrapper can release
     # PrefixSharing state after backward.  The root full-backward hook is
     # unreliable here because ``self.module`` returns a CausalLMOutput dataclass.
-    self.module._ps_ctx_cleanup = ctx_cleanup
+    self.module._cleanup_prefix_sharing_context = cleanup_prefix_sharing_context
+
+    #########################################################
+    # STEP 4: call the model with PrefixSharing+FSDP attention runtime
+    #########################################################
 
     with autocast_ctx:
         if profiler is not None:
-            forward_phase = (
-                PerfProfiler.PHASE_FORWARD_OLD
-                if forward_only
-                else PerfProfiler.PHASE_FORWARD
-            )
+            forward_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
             profiler.start_phase(forward_phase)
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
@@ -231,6 +241,10 @@ def _forward_step_with_engine_prepare(
 
             dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
 
+        #########################################################
+        # STEP 5: post-processing outputs for the model
+        #########################################################
+
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
@@ -238,6 +252,10 @@ def _forward_step_with_engine_prepare(
             micro_batch=micro_batch_modified,
             logits_processor_func=loss_function,
         )
+
+        #########################################################
+        # STEP 6: post-processing outputs for PrefixSharing
+        #########################################################
 
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
@@ -253,6 +271,10 @@ def _forward_step_with_engine_prepare(
                 list(prefix_sharing_runtime_state.prefix_sharing_plan.original_lengths),
                 diagnostic_tag,
             )
+
+        #########################################################
+        # STEP 7: compute loss & metrics
+        #########################################################
 
         if loss_function is not None:
             if profiler is not None:
@@ -357,11 +379,7 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
 
     profiler = ProfilerScope.current()
     if profiler is not None:
-        forward_phase = (
-            profiler.PHASE_FORWARD_OLD
-            if forward_only
-            else profiler.PHASE_FORWARD
-        )
+        forward_phase = profiler.PHASE_FORWARD_OLD if forward_only else profiler.PHASE_FORWARD
         profiler.start_phase(forward_phase)
 
     with autocast_ctx:
@@ -432,10 +450,6 @@ def _restore_engine_model_output(model_output: dict[str, Any]) -> dict[str, Any]
         from verl.utils.torch_functional import entropy_from_logits
     except Exception:
         entropy_from_logits = None
-
-    from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
-    from prefix_sharing.integrations.verl_utils import is_nested_tensor
-    from prefix_sharing.integrations.verl_fsdp import restore_prefix_sharing_outputs_2d
 
     restored = restore_via_2d_unfold_verl080(
         model_output,
@@ -555,10 +569,10 @@ def patch_forward_backward_batch_for_diag_dump(
         # 之前该清理被误关在 PREFIX_SHARING_DIAG_DUMP 条件块内，导致正常训练时
         # audit 日志不输出、KV store 不 close（多步训练存在内存累积风险）。
         if not forward_only:
-            ctx_cleanup = getattr(self.module, "_ps_ctx_cleanup", None)
-            if ctx_cleanup is not None:
-                ctx_cleanup()
-                delattr(self.module, "_ps_ctx_cleanup")
+            cleanup_prefix_sharing_context = getattr(self.module, "_cleanup_prefix_sharing_context", None)
+            if cleanup_prefix_sharing_context is not None:
+                cleanup_prefix_sharing_context()
+                delattr(self.module, "_cleanup_prefix_sharing_context")
 
         # 诊断 dump 专用：dump weight gradients + 清理 per-layer attention grad hooks。
         if not forward_only and os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
@@ -575,7 +589,7 @@ def patch_forward_backward_batch_for_diag_dump(
             # Remove per-layer attention gradient hooks.
             for module in self.module.modules():
                 try:
-                    del module._ps_ctx
+                    del module._prefix_sharing_context
                 except AttributeError:
                     pass
 

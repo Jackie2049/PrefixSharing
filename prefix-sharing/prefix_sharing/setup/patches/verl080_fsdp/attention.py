@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from prefix_sharing.integrations.context import _current_context
+from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
 from prefix_sharing.tools.perf_profiler import PerfProfiler
 
 _SUPPORTED_ATTENTIONS = {
@@ -86,14 +88,19 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
     def patched_attention(module: Any, query: Any, key: Any, value: Any,
                           attention_mask: Any, *args: Any, **kwargs: Any) -> Any:
+
+        #########################################################
+        # STEP 1: get prefix sharing context
+        #########################################################
+
         # 优先 module 属性（AC recompute 兼容），回退 ContextVar（Megatron 等路径）
-        ctx = getattr(module, '_ps_ctx', None)
-        if ctx is None:
+        prefix_sharing_context = getattr(module, '_prefix_sharing_context', None)
+        if prefix_sharing_context is None:
             from prefix_sharing.integrations.context import current_prefix_sharing_context
-            ctx = current_prefix_sharing_context()
+            prefix_sharing_context = current_prefix_sharing_context()
 
         # ── OFF path: no prefix sharing context → transparent passthrough ──
-        if ctx is None:
+        if prefix_sharing_context is None:
             # [PS-perf] start — OFF attention timing (cross-layer + per-layer) —
             profiler = PerfProfiler.current()
             _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
@@ -119,22 +126,23 @@ def create_attention_wrapper(original_fn: Any) -> Any:
             # ##### [PS-diag] end #####
             return result
 
-        # ── ON path: route through PrefixSharing attention runtime ──
-        from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
-        from prefix_sharing.integrations.context import _current_context
+        #########################################################
+        # STEP 2: call PrefixSharing attention runtime
+        #########################################################
 
+        # ── ON path: route through PrefixSharing attention runtime ──
         layer_id = int(getattr(module, "layer_idx", 0) or 0)
         _num_layers = _resolve_num_layers(module)
-        runtime = PrefixSharingFSDPAttentionRuntime(layer_id=layer_id, num_layers=_num_layers)
+        attention_runtime = PrefixSharingFSDPAttentionRuntime(layer_id=layer_id, num_layers=_num_layers)
 
-        # HF attention interface expects [B, H, L, D]; runtime works in [B, L, H, D]
-        query_ld = query.transpose(1, 2)
-        key_ld = key.transpose(1, 2)
-        value_ld = value.transpose(1, 2)
+        # HF attention interface expects [B, H, L, D]; attention_runtime works in [B, L, H, D]
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
-        # runtime.forward() 内部读 ContextVar；AC recompute 时 ContextVar
-        # 可能已过期，但 ctx 来自 module._ps_ctx 仍然有效。临时注入 ContextVar。
-        _ctxvar_token = _current_context.set(ctx)
+        # attention_runtime.forward() 内部读 ContextVar；AC recompute 时 ContextVar
+        # 可能已过期，但 prefix_sharing_context 来自 module._prefix_sharing_context 仍然有效。临时注入 ContextVar。
+        _ctxvar_token = _current_context.set(prefix_sharing_context)
         # [PS-perf] start — ON attention timing (attn.on = pack+kv+comp+unpack) —
         profiler = PerfProfiler.current()
         _per_layer_ok = profiler is not None and getattr(profiler, "per_layer_enabled", False)
@@ -143,7 +151,7 @@ def create_attention_wrapper(original_fn: Any) -> Any:
         if _per_layer_ok:
             profiler.start_phase(f"attn.on.l{layer_id}")
         try:
-            output_ld = runtime.forward(None, query_ld, key_ld, value_ld)
+            output = attention_runtime.forward(None, query, key, value)
         finally:
             if _per_layer_ok:
                 _on_elapsed = profiler.stop_phase(f"attn.on.l{layer_id}")
@@ -155,8 +163,8 @@ def create_attention_wrapper(original_fn: Any) -> Any:
 
         # ##### [PS-diag] ON attn output dump（context 激活 = PS 路径） #####
         if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-            _dump_attn_output(output_ld, module)
-        return output_ld, None
+            _dump_attn_output(output, module)
+        return output, None
 
     return patched_attention
 

@@ -54,6 +54,11 @@ class PrefixSharingFSDPAttentionRuntime:
         from prefix_sharing.tools.perf_profiler import PerfProfiler
         profiler = PerfProfiler.current()
         # [PS-perf] end ——————————————————————————————————————
+
+        #########################################################
+        # handle THD format input
+        #########################################################
+
         if query.shape[0] == 1 and key.shape[0] == 1 and value.shape[0] == 1:
             packed_query = query.squeeze(0)
             packed_key = key.squeeze(0)
@@ -69,6 +74,10 @@ class PrefixSharingFSDPAttentionRuntime:
             return packed_output.unsqueeze(0)
         if query.shape[:2] != key.shape[:2] or query.shape[:2] != value.shape[:2]:
             raise RuntimeError("query, key, and value must share dense batch/sequence dimensions")
+
+        #########################################################
+        # handle BSHD format input
+        #########################################################
 
         plan = ctx.prefix_sharing_plan
         # [PS-perf] start — attn.pack ———————————————————————
@@ -374,6 +383,10 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
+
+    #########################################################
+    # STEP 1: build key and value tensors
+    #########################################################
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
         packed_key,
         packed_value,
@@ -398,6 +411,10 @@ def _run_packed_attention_runtime(
         dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
     # ##### [PS-diag] end #####
 
+    #########################################################
+    # STEP 2: compute attention
+    #########################################################
+    
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
     # [PS-perf] start — per-layer compute ——————————————————
