@@ -22,8 +22,8 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import (
-    PrefixSharingRuntimeState,
+from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_utils import (
     _fold_2d_to_nested,
     _unfold_trimmed_nested_to_2d,
     restore_via_2d_unfold_verl080,

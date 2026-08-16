@@ -202,7 +202,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
             # 会检查 context / restore_indices，无 restore 需求时 early return。
             if ps_state is not None:
-                from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
+                from prefix_sharing.integrations.verl_utils import restore_via_2d_unfold_verl080
                 from prefix_sharing.integrations.context import current_prefix_sharing_context
                 from verl.utils.megatron.tensor_parallel import (
                     vocab_parallel_entropy,

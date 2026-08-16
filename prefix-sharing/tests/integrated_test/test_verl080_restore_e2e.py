@@ -23,10 +23,8 @@ verl = pytest.importorskip("verl")
 megatron = pytest.importorskip("megatron")
 torch = pytest.importorskip("torch")
 
-from prefix_sharing.integrations.verl_mcore import (
-    build_prefix_sharing_micro_batch_verl080,
-    restore_via_2d_unfold_verl080,
-)
+from prefix_sharing.integrations.verl_mcore import build_prefix_sharing_micro_batch_verl080
+from prefix_sharing.integrations.verl_utils import restore_via_2d_unfold_verl080
 
 
 # ═══════════════════════════════════════
