@@ -150,7 +150,7 @@ def forward_prefix_sharing_fsdp_micro_batch(
 
     with context as ctx, autocast:
         #########################################################
-        # STEP 2: call the model with PrefixSharing r
+        # STEP 2: call the model with PrefixSharing runtime context
         #########################################################
         model_output = _call_fsdp_model(
             model,
@@ -223,12 +223,16 @@ def prepare_for_prefix_sharing_fsdp(
         ]
         sequences = extract_seq_from_dense_tensor(input_ids, valid_indices)
 
-    # plan for PrefixSharing
+    #########################################################
+    # STEP 1: plan for PrefixSharing
+    #########################################################
     prefix_sharing_plan = PrefixSharingPlanner(ps_config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
         return micro_batch, None
 
-    # trim the micro-batch
+    #########################################################
+    # STEP 2: trim the micro-batch
+    #########################################################
     if input_ids_is_nested: # nested tensor
         trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_nested_tensor(
             micro_batch, prefix_sharing_plan
@@ -238,8 +242,14 @@ def prepare_for_prefix_sharing_fsdp(
             micro_batch, prefix_sharing_plan, valid_indices
         )
 
-    # build layout and runtime state for the trimmed micro-batch
+    #########################################################
+    # STEP 3: build batch layout for the micro-batch
+    #########################################################
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows)
+
+    #########################################################
+    # STEP 4: build runtime state for the micro-batch
+    #########################################################
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=get_backend_instance(ps_config, backend),
@@ -247,6 +257,7 @@ def prepare_for_prefix_sharing_fsdp(
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
     )
+
     return trimmed_micro_batch, runtime_state
 
 
