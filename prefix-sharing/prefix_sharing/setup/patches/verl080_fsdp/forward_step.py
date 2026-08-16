@@ -80,30 +80,19 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 # Local unit tests use plain dict / fake engine without verl device helpers.
                 pass
 
-        ulysses_sp_size = _read_runtime_value(
-            self.engine_config,
-            micro_batch,
-            "ulysses_sequence_parallel_size",
-            default=1,
-        )
-        use_fused_kernels = _read_runtime_value(
-            self.engine_config,
-            micro_batch,
-            "use_fused_kernels",
-            default=False,
-        )
+        model_config = {
+            "model_type": "text_only_causal_lm",
+            "ulysses_sequence_parallel_size": _read_runtime_value(self.engine_config, micro_batch, "ulysses_sequence_parallel_size", default=1),
+            "use_fused_kernels": _read_runtime_value(self.engine_config, micro_batch, "use_fused_kernels", default=False),
+        }
         ps_config.validate(
-            model_config={
-                "model_type": "text_only_causal_lm",
-                "ulysses_sequence_parallel_size": ulysses_sp_size,
-                "use_fused_kernels": use_fused_kernels,
-            },
+            model_config=model_config,
             integrate_mode="verl_fsdp",
         )
 
         if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
             return _forward_step_with_engine_prepare(
-                self, micro_batch, loss_function, forward_only, ps_config,
+                self, micro_batch, loss_function, forward_only, ps_config, model_config,
             )
 
         from prefix_sharing.integrations.verl_fsdp import forward_step_without_engine_prepare
@@ -116,11 +105,7 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
             micro_batch,
             self.module,
             ps_config,
-            model_config={
-                "model_type": "text_only_causal_lm",
-                "ulysses_sequence_parallel_size": ulysses_sp_size,
-                "use_fused_kernels": use_fused_kernels,
-            },
+            model_config=model_config,
             temperature=temperature,
             calculate_entropy=calculate_entropy,
             entropy_fn=getattr(self, "compute_entropy_from_logits", None),
@@ -160,6 +145,7 @@ def _forward_step_with_engine_prepare(
     loss_function: Any,
     forward_only: bool,
     ps_config: Any,
+    model_config: Any,
 ) -> Any:
     profiler = ProfilerScope.current()
     if profiler is not None:
@@ -177,11 +163,7 @@ def _forward_step_with_engine_prepare(
     micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
-        model_config={
-            "model_type": "text_only_causal_lm",
-            "ulysses_sequence_parallel_size": _read_runtime_value(self.engine_config, micro_batch, "ulysses_sequence_parallel_size", default=1),
-            "use_fused_kernels": _read_runtime_value(self.engine_config, micro_batch, "use_fused_kernels", default=False),
-        },
+        model_config=model_config,
     )
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
