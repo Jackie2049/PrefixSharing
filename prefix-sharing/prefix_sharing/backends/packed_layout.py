@@ -57,7 +57,7 @@ class PackedBatchLayout:
         cls,
         kept_position_rows: Sequence[Any],
         *,
-        align_size: int,
+        align_size: int = 1,
     ) -> "PackedBatchLayout":
         if align_size < 1:
             raise ValueError("align_size must be >= 1")

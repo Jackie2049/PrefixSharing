@@ -130,9 +130,9 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 build_attention_mask_2d, build_label_mask_2d,
                 nested_offsets_to_cu,
             )
-            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+            from prefix_sharing.integrations.verl_utils import is_nested_tensor
             _ids_nested = batch_for_forward["input_ids"]
-            if _is_nested_tensor(_ids_nested):
+            if is_nested_tensor(_ids_nested):
                 if ps_state is not None:
                     _plan = ps_state.prefix_sharing_plan
                     _prefix_lens = list(_plan.prefix_lens)
@@ -160,7 +160,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 # loss_mask 行 sum，与坐标系无关，据此推 prompt_len 最稳（2D/NestedTensor 均适用）。
                 _lm = original_batch.get("loss_mask")
                 if _lm is not None:
-                    if _is_nested_tensor(_lm):
+                    if is_nested_tensor(_lm):
                         _lm_off = _lm.offsets()
                         _lm_val = _lm.values()
                         _response_lens = [
@@ -228,7 +228,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 from prefix_sharing.tools.diagnostic_dump import (
                     nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
                 )
-                from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+                from prefix_sharing.integrations.verl_utils import is_nested_tensor
                 # 对齐 v070: tag = "old" if forward_only else "train"。
                 # forward_step 拿不到 forward_only，用 model.training 等价区分
                 # （eval_mode→training=False→"old" 对应 old_logp 阶段；
@@ -237,7 +237,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 _tag = "train" if model.training else "old"
                 _out_dict, _ = output
                 _lp = _out_dict.get("log_probs")
-                if _is_nested_tensor(_lp):
+                if is_nested_tensor(_lp):
                     if ps_state is not None:
                         _ol = list(ps_state.prefix_sharing_plan.original_lengths)
                     else:
@@ -245,7 +245,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _Lmax = max(_ol) if _ol else 0
                     dump_logprobs_2d_verl080(nested_to_2d_full(_lp, _ol, _Lmax), _tag)
                     _ent = _out_dict.get("entropy")
-                    if _is_nested_tensor(_ent):
+                    if is_nested_tensor(_ent):
                         dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
             # ##### [PS-diag] dump 2D logprobs/entropy end #####
         _ps_forward_step_probe("after_original_forward_step")

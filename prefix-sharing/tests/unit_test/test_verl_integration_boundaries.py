@@ -22,10 +22,10 @@ def test_verl_fsdp_does_not_import_shared_helpers_from_mcore():
     source = inspect.getsource(verl_fsdp)
     forbidden_imports = (
         "from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState",
-        "from prefix_sharing.integrations.verl_mcore import _collect_kept_position_rows",
-        "from prefix_sharing.integrations.verl_mcore import _extract_seq_from_nested_tensor",
-        "from prefix_sharing.integrations.verl_mcore import _is_nested_tensor",
-        "from prefix_sharing.integrations.verl_mcore import _trim_nested_batch",
+        "from prefix_sharing.integrations.verl_mcore import collect_kept_position_rows",
+        "from prefix_sharing.integrations.verl_mcore import extract_seq_from_nested_tensor",
+        "from prefix_sharing.integrations.verl_mcore import is_nested_tensor",
+        "from prefix_sharing.integrations.verl_mcore import trim_redundant_prefix_in_nested_tensor",
     )
     for forbidden_import in forbidden_imports:
         assert forbidden_import not in source

@@ -464,7 +464,7 @@ def _restore_engine_model_output(model_output: dict[str, Any]) -> dict[str, Any]
         entropy_from_logits = None
 
     from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
-    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+    from prefix_sharing.integrations.verl_utils import is_nested_tensor
     from prefix_sharing.integrations.verl_fsdp import restore_prefix_sharing_outputs_2d
 
     restored = restore_via_2d_unfold_verl080(
@@ -473,7 +473,7 @@ def _restore_engine_model_output(model_output: dict[str, Any]) -> dict[str, Any]
         entropy_from_logits,
     )
     log_probs = restored.get("log_probs")
-    if log_probs is not None and not _is_nested_tensor(log_probs):
+    if log_probs is not None and not is_nested_tensor(log_probs):
         return restore_prefix_sharing_outputs_2d(restored, logprobs_from_logits)
     return restored
 

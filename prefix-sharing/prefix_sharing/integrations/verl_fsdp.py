@@ -22,12 +22,12 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_utils import _clone_batch
-from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
-from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
-from prefix_sharing.integrations.verl_utils import _extract_sequences_async
-from prefix_sharing.integrations.verl_utils import _is_nested_tensor
-from prefix_sharing.integrations.verl_utils import _trim_nested_batch
+from prefix_sharing.integrations.verl_utils import clone_batch
+from prefix_sharing.integrations.verl_utils import extract_seq_from_dense_tensor
+from prefix_sharing.integrations.verl_utils import extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import is_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_redundant_prefix_in_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_redundant_prefix_in_dense_tensor
 
 class PrefixSharingFSDPAttentionRuntime:
     """Standalone FSDP attention runtime for PrefixSharing.
@@ -190,69 +190,49 @@ def plan_and_trim_microbatch_fsdp(
     prefix sharing is disabled or no reusable prefix is detected.
     """
 
+    # skip if PrefixSharing is disabled
     if not ps_config.enable_prefix_sharing:
         return micro_batch, None
+
+    # validate the config
     ps_config.validate(model_config=model_config, integrate_mode="verl_fsdp")
 
+    # extract input_ids from micro-batch and convert it into sequences (Python List)
+    # for subsequent PrefixSharing planning, which is purely done on CPU
     input_ids = micro_batch["input_ids"]
-    is_nested_input = _is_nested_tensor(input_ids)
-    if is_nested_input:
-        sequences = _extract_seq_from_nested_tensor(input_ids)
+    input_ids_is_nested = is_nested_tensor(input_ids)
+    if input_ids_is_nested: # nested tensor
+        sequences = extract_seq_from_nested_tensor(input_ids)
         valid_indices = None
         attention_mask = None
-    else:
+    else: # dense tensor
         attention_mask = micro_batch["attention_mask"].to(bool)
         if input_ids.dim() != 2 or attention_mask.dim() != 2:
-            raise RuntimeError("prefix sharing FSDP path expects 2D or jagged NestedTensor input_ids")
+            raise RuntimeError("PrefixSharing + FSDP expects 2D or jagged NestedTensor input_ids")
         if input_ids.shape != attention_mask.shape:
             raise RuntimeError("input_ids and attention_mask must have the same shape")
-
         valid_indices = [
             attention_mask[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = _extract_sequences_async(input_ids, valid_indices)
+        sequences = extract_seq_from_dense_tensor(input_ids, valid_indices)
+
+    # plan for PrefixSharing
     prefix_sharing_plan = PrefixSharingPlanner(ps_config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
         return micro_batch, None
 
-    if is_nested_input:
-        trimmed_micro_batch = _trim_nested_batch(micro_batch, prefix_sharing_plan)
-        kept_position_rows = _collect_kept_position_rows(
-            trimmed_micro_batch,
-            prefix_sharing_plan,
-            is_nested_tensor=True,
+    # trim the micro-batch
+    if input_ids_is_nested: # nested tensor
+        trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_nested_tensor(
+            micro_batch, prefix_sharing_plan
         )
-    else:
-        trimmed_micro_batch = _clone_batch(micro_batch)
-        trimmed_attention_mask = attention_mask.clone()
-        trimmed_attention_mask[:] = False
-
-        for row, indices in enumerate(valid_indices):
-            keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
-            kept_indices = indices[keep_start:keep_end]
-            trimmed_attention_mask[row, kept_indices] = True
-
-        trimmed_micro_batch["attention_mask"] = trimmed_attention_mask
-
-        if "loss_mask" in trimmed_micro_batch:
-            trimmed_loss_mask = trimmed_micro_batch["loss_mask"].to(bool).clone()
-            trimmed_loss_mask[:] = False
-            for row, indices in enumerate(valid_indices):
-                keep_start, keep_end = prefix_sharing_plan.loss_mask_keep_ranges[row]
-                trimmed_loss_mask[row, indices[keep_start:keep_end]] = micro_batch["loss_mask"][row, indices[keep_start:keep_end]].to(bool)
-            trimmed_micro_batch["loss_mask"] = trimmed_loss_mask
-        kept_position_rows = _collect_kept_position_rows(
-            trimmed_micro_batch,
-            prefix_sharing_plan,
-            is_nested_tensor=False,
-            valid_indices=valid_indices,
+    else: # dense tensor
+        trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_dense_tensor(
+            micro_batch, prefix_sharing_plan, valid_indices
         )
 
-    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
-        kept_position_rows,
-        align_size=1,
-    )
+    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows)
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=get_backend_instance(ps_config, backend),

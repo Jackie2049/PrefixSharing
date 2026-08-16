@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from prefix_sharing.core.planner import PrefixSharingPlan
 
 
@@ -64,7 +66,7 @@ def read_ps_config_from_prefix_grouper(engine_config: Any) -> dict[str, Any] | N
     return values
 
 
-def _clone_batch(batch: Any) -> Any:
+def clone_batch(batch: Any) -> Any:
     if hasattr(batch, "clone"):
         try:
             return batch.clone()
@@ -98,23 +100,32 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
     return current
 
 
-def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
-    """Physically trim a NestedTensor batch for verl 0.8 THD paths."""
+def trim_redundant_prefix_in_nested_tensor(
+    batch: Any, prefix_sharing_plan: PrefixSharingPlan
+) -> tuple[Any, list[Any]]:
+    """Trim redundant prefix tokens in NestedTensor inputs so that their computation
+    are skipped and not performed.
 
-    import torch
+    Args:
+        batch: Input batch with NestedTensor ``input_ids``.
+        prefix_sharing_plan: PrefixSharingPlan with keep ranges.
 
-    trimmed_batch = _clone_batch(batch)
+    Returns:
+        ``(trimmed_batch, kept_position_rows)``. ``kept_position_rows`` is the
+        per-row position-id slice used to build the trimmed NestedTensor, so
+        callers do not need to unpack it again.
+    """
 
+    trimmed_batch = clone_batch(batch)
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
+    
+    # trim input_ids
+    trimmed_batch["input_ids"] = _trim_nested_tensor(input_ids, prefix_sharing_plan)
 
-    trimmed_ids_seqs = _slice_nested_sequences(input_ids, plan)
-    new_input_ids = torch.nested.as_nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
-    trimmed_batch["input_ids"] = new_input_ids
-
-    if _is_nested_tensor(position_ids):
-        trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
-        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+    # trim position_ids
+    if is_nested_tensor(position_ids):
+        kept_position_rows = _trim_nested_rows(position_ids, prefix_sharing_plan)
     else:
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
@@ -124,23 +135,74 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
                 position_ids.shape[0], position_ids.shape[1],
                 dtype=torch.bool, device=position_ids.device,
             )
-        trimmed_pos_seqs = _slice_2d_position_rows(
-            position_ids, plan, attention_mask_bool,
+        kept_position_rows = _trim_2d_tensor(
+            position_ids, prefix_sharing_plan, attention_mask_bool
         )
-        new_position_ids = torch.nested.as_nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
-    trimmed_batch["position_ids"] = new_position_ids
+    trimmed_batch["position_ids"] = torch.nested.as_nested_tensor(
+        kept_position_rows, layout=torch.jagged
+    )
 
+    # trim loss_mask
     loss_mask = batch.get("loss_mask")
-    if loss_mask is not None and _is_nested_tensor(loss_mask):
-        trimmed_loss_seqs = _slice_nested_sequences(loss_mask, plan)
-        trimmed_batch["loss_mask"] = torch.nested.as_nested_tensor(
-            trimmed_loss_seqs, layout=torch.jagged
-        )
+    if loss_mask is not None and is_nested_tensor(loss_mask):
+        trimmed_batch["loss_mask"] = _trim_nested_tensor(loss_mask, prefix_sharing_plan)
 
-    return trimmed_batch
+    return trimmed_batch, kept_position_rows
 
 
-def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: list[Any] | None = None) -> Any:
+def trim_redundant_prefix_in_dense_tensor(
+    batch: Any,
+    prefix_sharing_plan: PrefixSharingPlan,
+    valid_indices: list[Any],
+) -> tuple[Any, list[Any]]:
+    """Trim redundant prefix tokens from a dense 2D batch by masking.
+
+    Unlike ``trim_plain_batch_thd`` which physically removes kept tokens,
+    this helper keeps ``input_ids`` and ``position_ids`` dense and only
+    masks the kept positions in ``attention_mask`` and ``loss_mask``.
+    The position-id rows are trimmed to jagged tensors for packed layout
+    construction, but the original 2D ``position_ids`` tensor is left
+    unchanged so downstream dense-path code can still index it.
+
+    Args:
+        batch: Input batch with 2D ``input_ids``, ``position_ids`` and
+            ``attention_mask``.
+        prefix_sharing_plan: Prefix sharing plan with keep ranges.
+        valid_indices: Pre-computed nonzero indices from ``attention_mask``.
+
+    Returns:
+        ``(trimmed_batch, kept_position_rows)``.
+    """
+
+    trimmed_batch = clone_batch(batch)
+    attention_mask = batch["attention_mask"].to(bool)
+    trimmed_attention_mask = attention_mask.clone()
+    trimmed_attention_mask[:] = False
+
+    for row, indices in enumerate(valid_indices):
+        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        trimmed_attention_mask[row, kept_indices] = True
+    trimmed_batch["attention_mask"] = trimmed_attention_mask
+
+    if "loss_mask" in trimmed_batch:
+        trimmed_loss_mask = trimmed_batch["loss_mask"].to(bool).clone()
+        trimmed_loss_mask[:] = False
+        for row, indices in enumerate(valid_indices):
+            keep_start, keep_end = prefix_sharing_plan.loss_mask_keep_ranges[row]
+            trimmed_loss_mask[row, indices[keep_start:keep_end]] = (
+                batch["loss_mask"][row, indices[keep_start:keep_end]].to(bool)
+            )
+        trimmed_batch["loss_mask"] = trimmed_loss_mask
+
+    kept_position_rows = _trim_2d_tensor(
+        batch["position_ids"], prefix_sharing_plan, attention_mask
+    )
+
+    return trimmed_batch, kept_position_rows
+
+
+def trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: list[Any] | None = None) -> Any:
     """Physically trim a plain 2D tensor batch for verl 0.8 THD paths.
 
     Args:
@@ -149,8 +211,6 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: li
         valid_indices: Pre-computed nonzero indices from attention_mask.
             If None, will compute from batch["attention_mask"].
     """
-
-    import torch
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
@@ -179,7 +239,7 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: li
         kept_id_rows.append(input_ids[row, kept_indices])
         kept_pos_rows.append(position_ids[row, kept_indices])
 
-    trimmed_batch = _clone_batch(batch)
+    trimmed_batch = clone_batch(batch)
     trimmed_batch["input_ids"] = torch.nested.as_nested_tensor(kept_id_rows, layout=torch.jagged)
     trimmed_batch["position_ids"] = torch.nested.as_nested_tensor(kept_pos_rows, layout=torch.jagged)
 
@@ -198,37 +258,55 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan, valid_indices: li
     return trimmed_batch
 
 
-def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list[Any]:
+def _trim_nested_rows(nested_tensor: Any, prefix_sharing_plan: PrefixSharingPlan) -> list[Any]:
+    """Trim each sequence of a NestedTensor to its keep range in the plan.
+
+    Returns a list of 1D tensors (one per sequence), not packed into NestedTensor.
+    """
+
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()
 
     sliced = []
-    for i in range(len(plan.input_keep_ranges)):
+    for i in range(len(prefix_sharing_plan.input_keep_ranges)):
         seq_values = values[offsets[i]:offsets[i + 1]]
-        keep_start, keep_end = plan.input_keep_ranges[i]
+        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[i]
         sliced.append(seq_values[keep_start:keep_end])
 
     return sliced
 
 
-def _slice_2d_position_rows(
-    position_ids: Any,
-    plan: PrefixSharingPlan,
+def _trim_nested_tensor(nested_tensor: Any, prefix_sharing_plan: PrefixSharingPlan) -> Any:
+    """Trim each sequence of a NestedTensor and pack into a jagged NestedTensor."""
+
+    return torch.nested.as_nested_tensor(
+        _trim_nested_rows(nested_tensor, prefix_sharing_plan), layout=torch.jagged
+    )
+
+
+def _trim_2d_tensor(
+    tensor_2d: Any,
+    prefix_sharing_plan: PrefixSharingPlan,
     attention_mask_bool: Any,
 ) -> list[Any]:
+    """Trim each row of a 2D dense tensor to its keep range in the plan.
+
+    Returns a list of 1D tensors (one per row), not packed into NestedTensor.
+    """
+
     kept_rows = []
-    for row in range(position_ids.shape[0]):
+    for row in range(tensor_2d.shape[0]):
         indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-        keep_start, keep_end = plan.input_keep_ranges[row]
+        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
         kept_indices = indices[keep_start:keep_end]
-        kept_rows.append(position_ids[row, kept_indices])
+        kept_rows.append(tensor_2d[row, kept_indices])
     return kept_rows
 
 
-def _collect_kept_position_rows(
+def collect_kept_position_rows(
     trimmed_batch: Any,
-    plan: PrefixSharingPlan,
-    is_nested_tensor: bool,
+    prefix_sharing_plan: PrefixSharingPlan,
+    is_nested_input: bool,
     attention_mask_bool: Any | None = None,
     valid_indices: list[Any] | None = None,
 ) -> list[Any]:
@@ -237,7 +315,7 @@ def _collect_kept_position_rows(
     Args:
         trimmed_batch: Batch after trimming.
         plan: Prefix sharing plan.
-        is_nested_tensor: Whether position_ids is a NestedTensor.
+        is_nested_input: Whether position_ids is a NestedTensor.
         attention_mask_bool: Boolean attention mask (deprecated, use valid_indices).
         valid_indices: Pre-computed nonzero indices. If provided, skips
             attention_mask_bool computation.
@@ -245,10 +323,10 @@ def _collect_kept_position_rows(
 
     position_ids = trimmed_batch["position_ids"]
 
-    if is_nested_tensor or _is_nested_tensor(position_ids):
+    if is_nested_input or is_nested_tensor(position_ids):
         offsets = position_ids.offsets()
         values = position_ids.values()
-        return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
+        return [values[offsets[i]:offsets[i + 1]] for i in range(len(prefix_sharing_plan.input_keep_ranges))]
 
     # 2D tensor — need valid_indices to locate valid column indices
     if valid_indices is None:
@@ -259,19 +337,19 @@ def _collect_kept_position_rows(
             )
         valid_indices = [
             attention_mask_bool[i].nonzero(as_tuple=False).flatten()
-            for i in range(len(plan.input_keep_ranges))
+            for i in range(len(prefix_sharing_plan.input_keep_ranges))
         ]
 
     rows = []
-    for i in range(len(plan.input_keep_ranges)):
+    for i in range(len(prefix_sharing_plan.input_keep_ranges)):
         indices = valid_indices[i]
-        keep_start, keep_end = plan.input_keep_ranges[i]
+        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[i]
         kept_indices = indices[keep_start:keep_end]
         rows.append(position_ids[i, kept_indices])
     return rows
 
 
-def _is_nested_tensor(tensor: Any) -> bool:
+def is_nested_tensor(tensor: Any) -> bool:
     return (
         hasattr(tensor, "offsets")
         and callable(tensor.offsets)
@@ -283,7 +361,7 @@ def _is_nested_tensor(tensor: Any) -> bool:
 def _copy_tensors_to_cpu_lists(tensors: list[Any]) -> list[list[int]]:
     """Copy device tensors to Python int lists with a single sync point.
 
-    Fast path (CUDA / NPU): stage all slices into pinned host buffers with
+    Fast path (GPU / NPU): stage all slices into pinned host buffers with
     non-blocking copies, then synchronize the source device once — avoiding
     one pipeline stall per tensor. Backends without pinned-memory support
     (older torch_npu, CPU, …) fall back to plain per-tensor copies: correct
@@ -292,8 +370,6 @@ def _copy_tensors_to_cpu_lists(tensors: list[Any]) -> list[list[int]]:
     Device handling is dispatched via ``getattr(torch, device.type)`` so this
     works on any accelerator backend without hardcoding ``torch.cuda``.
     """
-
-    import torch
 
     if not tensors:
         return []
@@ -322,31 +398,29 @@ def _copy_tensors_to_cpu_lists(tensors: list[Any]) -> list[list[int]]:
     return [buf.tolist() for buf in pinned_buffers]
 
 
-def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
-    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。
-
-    批量异步 device→CPU 拷贝（CUDA/NPU），单次同步，避免 pipeline stall。
-    """
+def extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
+    """Extract token sequences from a NestedTensor (jagged layout)."""
 
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()
 
-    slices = [
+    tensor_slices = [
         values[offsets[i]:offsets[i + 1]].detach()
         for i in range(offsets.numel() - 1)
     ]
-    return _copy_tensors_to_cpu_lists(slices)
+    return _copy_tensors_to_cpu_lists(tensor_slices)
 
 
-def _extract_sequences_async(
+def extract_seq_from_dense_tensor(
     input_ids: Any,
     valid_indices: list[Any],
 ) -> list[list[int]]:
-    """Extract token sequences from a device tensor with batched async copy.
+    """Extract token sequences from a dense 2D device tensor with batched async copy.
 
-    Instead of calling .cpu().tolist() per row (which syncs each time),
-    all device→CPU copies are queued non-blocking, then synchronized once
-    (CUDA/NPU fast path; other backends fall back to plain copies).
+    Uses a batched async copy: instead of calling .cpu().tolist() per row
+    (which syncs each time), all device→CPU copies are queued non-blocking,
+    then synchronized once (CUDA/NPU fast path; other backends fall back to
+    plain copies).
 
     Args:
         input_ids: 2D device tensor of shape [batch_size, seq_len].
@@ -356,8 +430,8 @@ def _extract_sequences_async(
         List of token ID lists (CPU Python ints).
     """
 
-    tensors = [
+    tensor_slices = [
         input_ids[row, indices].detach()
         for row, indices in enumerate(valid_indices)
     ]
-    return _copy_tensors_to_cpu_lists(tensors)
+    return _copy_tensors_to_cpu_lists(tensor_slices)

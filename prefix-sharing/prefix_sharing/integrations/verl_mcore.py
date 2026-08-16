@@ -23,13 +23,12 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_utils import _clone_batch
-from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
-from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
-from prefix_sharing.integrations.verl_utils import _extract_sequences_async
-from prefix_sharing.integrations.verl_utils import _is_nested_tensor
-from prefix_sharing.integrations.verl_utils import _trim_nested_batch
-from prefix_sharing.integrations.verl_utils import _trim_plain_batch_thd
+from prefix_sharing.integrations.verl_utils import collect_kept_position_rows
+from prefix_sharing.integrations.verl_utils import extract_seq_from_dense_tensor
+from prefix_sharing.integrations.verl_utils import extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import is_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_redundant_prefix_in_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_plain_batch_thd
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 
 
@@ -199,10 +198,10 @@ def restore_via_2d_unfold_verl080(
         return output
 
     log_probs_nested = output.get("log_probs")
-    if log_probs_nested is None or not _is_nested_tensor(log_probs_nested):
+    if log_probs_nested is None or not is_nested_tensor(log_probs_nested):
         return output
     entropy_nested = output.get("entropy")
-    has_entropy = entropy_nested is not None and _is_nested_tensor(entropy_nested)
+    has_entropy = entropy_nested is not None and is_nested_tensor(entropy_nested)
 
     original_lengths = plan.original_lengths
     input_keep_ranges = plan.input_keep_ranges
@@ -368,15 +367,15 @@ def build_prefix_sharing_micro_batch_verl080(
         raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
 
     # ── 阶段 3: 从 batch 提取序列 ──
-    # NestedTensor → 从 offsets/values 提取
-    # Plain 2D → 从 attention_mask.nonzero() 提取
-    # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
+    # NestedTensor → 从 offsets/values 提取；kept_position_rows 由 trim 直接返回。
+    # Plain 2D → 从 attention_mask.nonzero() 提取，并保留 valid_indices
+    # 供 trim 后的 collect_kept_position_rows 使用。
     input_ids = batch["input_ids"]
-    is_nested_tensor = _is_nested_tensor(input_ids)
+    is_nested_input = is_nested_tensor(input_ids)
     attention_mask_bool_for_layout = None
 
-    if is_nested_tensor:
-        sequences = _extract_seq_from_nested_tensor(input_ids)
+    if is_nested_input:
+        sequences = extract_seq_from_nested_tensor(input_ids)
     else:
         # plain 2D tensor（需要 attention_mask）
         attention_mask = batch.get("attention_mask")
@@ -388,7 +387,7 @@ def build_prefix_sharing_micro_batch_verl080(
             attention_mask_bool[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = _extract_sequences_async(input_ids, valid_indices)
+        sequences = extract_seq_from_dense_tensor(input_ids, valid_indices)
 
     # ── 阶段 4: 前缀共享规划 ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
@@ -401,16 +400,14 @@ def build_prefix_sharing_micro_batch_verl080(
     #   2D path: 只改 attention_mask（Megatron 从 mask 动态重算 packed），
     #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
     #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
-    if is_nested_tensor:
-        trimmed_batch = _trim_nested_batch(batch, plan)
+    if is_nested_input:
+        trimmed_batch, kept_position_rows = trim_redundant_prefix_in_nested_tensor(batch, plan)
     else:
-        trimmed_batch = _trim_plain_batch_thd(batch, plan, valid_indices)
-
-    # layout 计算：从 trimmed 后的实际 kept position rows 构建
-    kept_position_rows = _collect_kept_position_rows(
-        trimmed_batch, plan, is_nested_tensor,
-        valid_indices=valid_indices if not is_nested_tensor else None,
-    )
+        trimmed_batch = trim_plain_batch_thd(batch, plan, valid_indices)
+        kept_position_rows = collect_kept_position_rows(
+            trimmed_batch, plan, is_nested_input,
+            valid_indices=valid_indices,
+        )
 
     # ── 阶段 6: 构建 layout ──
     parallel_info = get_megatron_parallel_info()
