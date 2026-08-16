@@ -6,11 +6,16 @@ forward_step wrapper for PrefixSharing under verl 0.8.0 + FSDP.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import Any, Callable
 
+import torch
 import torch.utils.checkpoint as _ckpt
 
 from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.integrations.context import create_prefix_sharing_context
+from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
+from prefix_sharing.integrations.verl_fsdp import prepare_for_prefix_sharing_fsdp
 from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
 from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
@@ -156,15 +161,6 @@ def _forward_step_with_engine_prepare(
     forward_only: bool,
     ps_config: Any,
 ) -> Any:
-    import torch
-    from contextlib import nullcontext
-
-    from prefix_sharing.integrations.context import create_prefix_sharing_context
-    from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
-    from prefix_sharing.integrations.verl_fsdp import prepare_for_prefix_sharing_fsdp
-
-    from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
-
     profiler = ProfilerScope.current()
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_PLAN)
