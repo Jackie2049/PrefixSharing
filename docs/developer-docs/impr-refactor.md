@@ -270,11 +270,11 @@ integrations/verl_fsdp.py         # FSDP 专属流程
 - `build_prefix_sharing_micro_batch_fsdp()`
 - `PrefixSharingFSDPAttentionRuntime`
 - `restore_prefix_sharing_outputs_2d()`
-- `forward_prefix_sharing_micro_batch_fsdp()`
+- `forward_step_without_engine_prepare()`
 
 问题：
 
-- `forward_prefix_sharing_micro_batch_fsdp()` 更像测试/fake engine helper，不一定是合入 verl 的主路径，应避免让 reviewer 误以为这是生产接入方式。
+- `forward_step_without_engine_prepare()` 更像测试/fake engine helper，不一定是合入 verl 的主路径，应避免让 reviewer 误以为这是生产接入方式。
 - `PrefixSharingFSDPAttentionRuntime.forward()` 直接忽略 `attn_func/attention_mask/kwargs`，对 HF attention 接口兼容性说明不足。
 - dense `[B,L,H,D]` 与 packed `[1,T,H,D]` 两种路径混在同一个 runtime，缺少清晰的 input contract。
 - FSDP restore 的 logits/log_probs/entropy/attention_output copy 语义复杂，需要更强测试和更小函数。

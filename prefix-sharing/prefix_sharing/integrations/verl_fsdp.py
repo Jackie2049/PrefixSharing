@@ -113,7 +113,7 @@ class PrefixSharingFSDPAttentionRuntime:
         return dense_output
 
 
-def forward_prefix_sharing_micro_batch_fsdp(
+def forward_step_without_engine_prepare(
     micro_batch: Any,
     model: Any,
     ps_config: PrefixSharingConfig,
@@ -160,11 +160,10 @@ def forward_prefix_sharing_micro_batch_fsdp(
         #########################################################
         # STEP 4: post-processing outputs for PrefixSharing
         #########################################################
+        output = {}
         logits = _extract_logits(model_output) / float(temperature)
-        output = {
-            "model_output": model_output,
-            "logits": logits.clone(),
-        }
+        output["model_output"] = model_output
+        output["logits"] = logits.clone()
         labels = _labels_for_log_probs(micro_batch)
         if labels is not None:
             output["log_probs"] = _compute_log_probs(logits, labels, log_probs_fn)

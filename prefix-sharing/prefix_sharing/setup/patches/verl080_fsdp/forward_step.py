@@ -106,13 +106,13 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
                 self, micro_batch, loss_function, forward_only, ps_config,
             )
 
-        from prefix_sharing.integrations.verl_fsdp import forward_prefix_sharing_micro_batch_fsdp
+        from prefix_sharing.integrations.verl_fsdp import forward_step_without_engine_prepare
 
         calculate_entropy = bool(
             _read_runtime_value(self.engine_config, micro_batch, "calculate_entropy", default=False)
         )
         temperature = _read_temperature(micro_batch)
-        output = forward_prefix_sharing_micro_batch_fsdp(
+        output = forward_step_without_engine_prepare(
             micro_batch,
             self.module,
             ps_config,
