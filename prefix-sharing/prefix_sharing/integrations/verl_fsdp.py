@@ -113,7 +113,7 @@ class PrefixSharingFSDPAttentionRuntime:
         return dense_output
 
 
-def forward_prefix_sharing_fsdp_micro_batch(
+def forward_prefix_sharing_micro_batch_fsdp(
     micro_batch: Any,
     model: Any,
     ps_config: PrefixSharingConfig,
@@ -126,40 +126,40 @@ def forward_prefix_sharing_fsdp_micro_batch(
     entropy_fn: Any | None = None,
     autocast_context: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one dense verl/FSDP-style micro-batch with PrefixSharing.
-
-    This is the executable helper used by fake/local FSDP tests and by engines
-    that do not expose prepare hooks:
-    prepare the micro-batch, open the runtime context, run the model with a
-    PrefixSharing attention runtime, compute token-level outputs, then restore
-    reuser prefix columns. Real verl FSDP patching should prefer the engine's
-    own ``prepare_model_inputs`` / ``prepare_model_outputs`` path.
-    """
+    """Run one forward pass of a verl/FSDP-style micro-batch with PrefixSharing."""
 
     #########################################################
-    # STEP 1: prepare for prefix sharing
+    # STEP 1: pre-processing inputs for PrefixSharing
     #########################################################
-    trimmed_micro_batch, runtime_state = prepare_for_prefix_sharing_fsdp(
+    micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config=model_config,
         backend=backend,
     )
-    context = prefix_sharing_runtime_context(runtime_state) if runtime_state is not None else nullcontext(None)
-    autocast = autocast_context if autocast_context is not None else nullcontext()
 
+    #########################################################
+    # STEP 2: create PrefixSharing runtime context
+    #########################################################
+    context = prefix_sharing_runtime_context(prefix_sharing_runtime_state) if prefix_sharing_runtime_state is not None else nullcontext(None)
+    autocast = autocast_context if autocast_context is not None else nullcontext()
     with context as ctx, autocast:
+
         #########################################################
-        # STEP 2: call the model with PrefixSharing runtime context
+        # STEP 3: call the model with PrefixSharing+FSDP attention runtime
         #########################################################
         model_output = _call_fsdp_model(
             model,
-            trimmed_micro_batch,
+            micro_batch_modified,
             prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(
                 num_layers=model.config.num_hidden_layers if hasattr(model, "config") else 0,
             ),
-            enable_prefix_sharing=runtime_state is not None,
+            enable_prefix_sharing=prefix_sharing_runtime_state is not None,
         )
+
+        #########################################################
+        # STEP 4: post-processing outputs for PrefixSharing
+        #########################################################
         logits = _extract_logits(model_output) / float(temperature)
         output = {
             "model_output": model_output,
@@ -231,7 +231,7 @@ def prepare_for_prefix_sharing_fsdp(
         return micro_batch, None
 
     #########################################################
-    # STEP 2: trim the micro-batch
+    # STEP 2: trim redundant prefix of reusers in the micro-batch
     #########################################################
     if input_ids_is_nested: # nested tensor
         trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_nested_tensor(
@@ -243,14 +243,14 @@ def prepare_for_prefix_sharing_fsdp(
         )
 
     #########################################################
-    # STEP 3: build batch layout for the micro-batch
+    # STEP 3: build batch layout for the trimmed micro-batch
     #########################################################
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows)
 
     #########################################################
-    # STEP 4: build runtime state for the micro-batch
+    # STEP 4: build runtime state for the trimmed micro-batch
     #########################################################
-    runtime_state = PrefixSharingRuntimeState(
+    prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=get_backend_instance(ps_config, backend),
         packed_batch_layout=packed_batch_layout,
@@ -258,7 +258,7 @@ def prepare_for_prefix_sharing_fsdp(
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
     )
 
-    return trimmed_micro_batch, runtime_state
+    return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
 def restore_prefix_sharing_outputs_2d(

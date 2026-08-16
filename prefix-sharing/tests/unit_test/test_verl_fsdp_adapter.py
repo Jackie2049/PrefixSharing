@@ -10,7 +10,7 @@ from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
     prepare_for_prefix_sharing_fsdp,
-    forward_prefix_sharing_fsdp_micro_batch,
+    forward_prefix_sharing_micro_batch_fsdp,
     restore_prefix_sharing_outputs_2d,
 )
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
@@ -368,7 +368,7 @@ def test_prefix_sharing_fsdp_attention_runtime_scatter_dense_outputs():
     assert not torch.allclose(dense_output[1, 3:6], torch.zeros_like(dense_output[1, 3:6]))
 
 
-def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline():
+def test_forward_prefix_sharing_micro_batch_fsdp_matches_tiny_hf_model_baseline():
     torch.manual_seed(2026)
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
@@ -403,7 +403,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline(
     baseline_log_probs = _mock_log_probs_fn(baseline_logits, labels)
     baseline_entropy = _entropy_from_logits(baseline_logits)
 
-    prefix_output = forward_prefix_sharing_fsdp_micro_batch(
+    prefix_output = forward_prefix_sharing_micro_batch_fsdp(
         batch,
         model,
         config,
@@ -418,7 +418,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline(
     assert torch.allclose(prefix_output["attention_output"], baseline.attention_output, atol=1e-5)
 
 
-def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path():
+def test_forward_prefix_sharing_micro_batch_fsdp_keeps_provider_prefix_grad_path():
     torch.manual_seed(2027)
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
@@ -443,7 +443,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
     batch["labels"] = labels
 
     model = _TinyHFStyleModel(vocab_size=32)
-    output = forward_prefix_sharing_fsdp_micro_batch(
+    output = forward_prefix_sharing_micro_batch_fsdp(
         batch,
         model,
         config,
