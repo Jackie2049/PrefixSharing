@@ -151,7 +151,7 @@ def forward_prefix_sharing_micro_batch_fsdp(
         model_output = _call_fsdp_model(
             model,
             micro_batch_modified,
-            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(
+            attention_runtime=PrefixSharingFSDPAttentionRuntime(
                 num_layers=model.config.num_hidden_layers if hasattr(model, "config") else 0,
             ),
             enable_prefix_sharing=prefix_sharing_runtime_state is not None,
@@ -426,7 +426,7 @@ def _call_fsdp_model(
     model: Any,
     micro_batch: Any,
     *,
-    prefix_sharing_runtime: PrefixSharingFSDPAttentionRuntime,
+    attention_runtime: PrefixSharingFSDPAttentionRuntime,
     enable_prefix_sharing: bool,
 ) -> Any:
     model_inputs = {
@@ -436,7 +436,7 @@ def _call_fsdp_model(
     }
     model_inputs["use_cache"] = False
     if enable_prefix_sharing:
-        model_inputs["prefix_sharing_runtime"] = prefix_sharing_runtime
+        model_inputs["prefix_sharing_runtime"] = attention_runtime
     try:
         return model(**model_inputs)
     except TypeError:
