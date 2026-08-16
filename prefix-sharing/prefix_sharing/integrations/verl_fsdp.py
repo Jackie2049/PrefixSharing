@@ -3,7 +3,7 @@
 verl FSDP integration helpers for PrefixSharing.
 
 The FSDP path follows the same public shape as the Megatron integration:
-``plan_and_trim_microbatch_fsdp`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
+``prepare_for_prefix_sharing_fsdp`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
 The helpers stay framework-light enough for CPU tests, while the explicit
 ``verl080_fsdp`` patch set wires them into ``FSDPEngineWithLMHead.forward_step``.
 """
@@ -136,7 +136,10 @@ def forward_prefix_sharing_fsdp_micro_batch(
     own ``prepare_model_inputs`` / ``prepare_model_outputs`` path.
     """
 
-    trimmed_micro_batch, runtime_state = plan_and_trim_microbatch_fsdp(
+    #########################################################
+    # STEP 1: prepare for prefix sharing
+    #########################################################
+    trimmed_micro_batch, runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config=model_config,
@@ -146,6 +149,9 @@ def forward_prefix_sharing_fsdp_micro_batch(
     autocast = autocast_context if autocast_context is not None else nullcontext()
 
     with context as ctx, autocast:
+        #########################################################
+        # STEP 2: call the model with PrefixSharing r
+        #########################################################
         model_output = _call_fsdp_model(
             model,
             trimmed_micro_batch,
@@ -175,7 +181,7 @@ def forward_prefix_sharing_fsdp_micro_batch(
         return output
 
 
-def plan_and_trim_microbatch_fsdp(
+def prepare_for_prefix_sharing_fsdp(
     micro_batch: Any,
     ps_config: PrefixSharingConfig,
     model_config: Any | None = None,
@@ -232,6 +238,7 @@ def plan_and_trim_microbatch_fsdp(
             micro_batch, prefix_sharing_plan, valid_indices
         )
 
+    # build layout and runtime state for the trimmed micro-batch
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows)
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,

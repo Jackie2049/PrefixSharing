@@ -161,7 +161,7 @@ def _forward_step_with_engine_prepare(
 
     from prefix_sharing.integrations.context import create_prefix_sharing_context
     from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
-    from prefix_sharing.integrations.verl_fsdp import plan_and_trim_microbatch_fsdp
+    from prefix_sharing.integrations.verl_fsdp import prepare_for_prefix_sharing_fsdp
 
     from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
@@ -175,7 +175,7 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    trimmed_micro_batch, ps_state = plan_and_trim_microbatch_fsdp(
+    trimmed_micro_batch, ps_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config={

@@ -21,7 +21,7 @@ from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigE
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
-    plan_and_trim_microbatch_fsdp,
+    prepare_for_prefix_sharing_fsdp,
     restore_prefix_sharing_outputs_2d,
 )
 
@@ -52,7 +52,7 @@ def test_scenario1_two_samples_share_arbitrary_prefix():
     """A B C D E / A B C X Y -> provider=0, reuser=1, prefix_len=3."""
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     batch = _make_batch([[1, 2, 3, 4, 5], [1, 2, 3, 10, 11]])
-    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
+    trimmed, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert state is not None
     plan = state.prefix_sharing_plan
@@ -76,7 +76,7 @@ def test_scenario2_multiple_reusers_different_prefix_and_suffix_lens():
             [1, 2, 20, 21],           # reuser, prefix 2, suffix 2 (len 4)
         ]
     )
-    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
+    trimmed, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert state is not None
     plan = state.prefix_sharing_plan
@@ -106,7 +106,7 @@ def test_scenario3_same_provider_serves_multiple_reusers():
             [1, 2, 30, 40, 50, 60],   # reuser 3 (prefix 2)
         ]
     )
-    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
+    trimmed, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert state is not None
     plan = state.prefix_sharing_plan
@@ -128,7 +128,7 @@ def test_scenario4_chain_reuse_reuser_becomes_provider():
             [1, 2, 3, 4, 10, 20, 30],   # row2: reuser of row1 (prefix 5)
         ]
     )
-    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
+    trimmed, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert state is not None
     plan = state.prefix_sharing_plan
@@ -146,7 +146,7 @@ def test_scenario5_no_shareable_prefix_returns_none():
     """Completely different sequences -> fallback."""
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     batch = _make_batch([[1, 2, 3, 4], [5, 6, 7, 8]])
-    returned, state = plan_and_trim_microbatch_fsdp(batch, config)
+    returned, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert returned is batch
     assert state is None
@@ -156,7 +156,7 @@ def test_scenario5b_single_sample_returns_none():
     """Single sample cannot share -> fallback."""
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     batch = _make_batch([[1, 2, 3, 4, 5]])
-    returned, state = plan_and_trim_microbatch_fsdp(batch, config)
+    returned, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert returned is batch
     assert state is None
@@ -205,7 +205,7 @@ def test_scenario7_position_ids_preserve_absolute_positions():
     """Reuser suffix position_ids must reflect original absolute positions."""
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     batch = _make_batch([[1, 2, 3, 4, 5, 6, 7], [1, 2, 3, 10, 11, 12, 13]])
-    trimmed, state = plan_and_trim_microbatch_fsdp(batch, config)
+    trimmed, state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert state is not None
     plan = state.prefix_sharing_plan
@@ -224,7 +224,7 @@ def test_scenario7_position_ids_preserve_absolute_positions():
 def test_attention_runtime_records_stats_per_layer():
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     batch = _make_batch([[1, 2, 3, 4, 5], [1, 2, 3, 10, 11]])
-    _, state = plan_and_trim_microbatch_fsdp(batch, config)
+    _, state = prepare_for_prefix_sharing_fsdp(batch, config)
     assert state is not None
 
     torch.manual_seed(42)

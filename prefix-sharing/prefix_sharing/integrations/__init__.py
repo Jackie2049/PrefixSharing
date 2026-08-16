@@ -16,7 +16,7 @@ from prefix_sharing.integrations.verl_mcore import (
 )
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
-    plan_and_trim_microbatch_fsdp,
+    prepare_for_prefix_sharing_fsdp,
     forward_prefix_sharing_fsdp_micro_batch,
     restore_prefix_sharing_outputs_2d,
 )
@@ -38,7 +38,7 @@ __all__ = [
     "prefix_attention",
     "get_megatron_parallel_info",
     "PrefixSharingFSDPAttentionRuntime",
-    "plan_and_trim_microbatch_fsdp",
+    "prepare_for_prefix_sharing_fsdp",
     "forward_prefix_sharing_fsdp_micro_batch",
     "restore_prefix_sharing_outputs_2d",
 ]
