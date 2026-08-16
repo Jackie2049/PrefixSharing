@@ -185,7 +185,7 @@ def _forward_step_with_engine_prepare(
     )
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
-
+    
     if prefix_sharing_runtime_state is None:
         return _call_original_like_engine(self, micro_batch_modified, loss_function, forward_only)
 
@@ -208,11 +208,10 @@ def _forward_step_with_engine_prepare(
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
     model_inputs["prefix_sharing_runtime"].num_layers = _diag_num_layers
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
-    device_name = _read_device_name()
     autocast_ctx = (
         nullcontext()
         if autocast_dtype == torch.float32
-        else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+        else torch.autocast(device_type=_read_device_name(), dtype=autocast_dtype)
     )
     # ── Create PS context with manual lifecycle (survives backward for AC) ──
     ctx, ctx_cleanup = create_prefix_sharing_context(prefix_sharing_runtime_state)
