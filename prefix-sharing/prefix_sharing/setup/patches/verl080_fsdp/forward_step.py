@@ -171,23 +171,16 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
+    #########################################################
+    # STEP 1: pre-processing inputs for PrefixSharing
+    #########################################################
     micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
         model_config={
             "model_type": "text_only_causal_lm",
-            "ulysses_sequence_parallel_size": _read_runtime_value(
-                self.engine_config,
-                micro_batch,
-                "ulysses_sequence_parallel_size",
-                default=1,
-            ),
-            "use_fused_kernels": _read_runtime_value(
-                self.engine_config,
-                micro_batch,
-                "use_fused_kernels",
-                default=False,
-            ),
+            "ulysses_sequence_parallel_size": _read_runtime_value(self.engine_config, micro_batch, "ulysses_sequence_parallel_size", default=1),
+            "use_fused_kernels": _read_runtime_value(self.engine_config, micro_batch, "use_fused_kernels", default=False),
         },
     )
     if profiler is not None:
