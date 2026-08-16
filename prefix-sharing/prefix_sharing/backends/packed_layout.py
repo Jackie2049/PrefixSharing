@@ -65,18 +65,19 @@ class PackedBatchLayout:
             return cls.from_valid_lengths([])
 
         first = kept_position_rows[0]
+        device = first.device
         valid_lengths = [int(row.shape[0]) for row in kept_position_rows]
         padded_lengths = [_pad_to_multiple(length, align_size) for length in valid_lengths]
         packed_position_rows = []
         valid_mask_rows = []
         for row, valid_length, padded_length in zip(kept_position_rows, valid_lengths, padded_lengths):
-            row = row.to(first.device)
+            row = row.to(device)
             pad_length = padded_length - valid_length
             valid_mask_rows.append(
                 torch.cat(
                     [
-                        torch.ones(valid_length, dtype=torch.bool, device=first.device),
-                        torch.zeros(pad_length, dtype=torch.bool, device=first.device),
+                        torch.ones(valid_length, dtype=torch.bool, device=device),
+                        torch.zeros(pad_length, dtype=torch.bool, device=device),
                     ],
                     dim=0,
                 )
@@ -84,7 +85,7 @@ class PackedBatchLayout:
             if pad_length == 0:
                 packed_position_rows.append(row)
                 continue
-            padding = torch.zeros(pad_length, dtype=row.dtype, device=first.device)
+            padding = torch.zeros(pad_length, dtype=row.dtype, device=device)
             packed_position_rows.append(torch.cat([row, padding], dim=0))
 
         return cls(
