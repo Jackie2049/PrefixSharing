@@ -50,9 +50,21 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
     assert patch_set[1].module_name == "verl.trainer.ppo.ray_trainer"
     assert "RayPPOTrainer.fit" in patch_set[1].description
-    # Diag-dump wrapper is installed on top of the profiler wrapper.
-    assert patch_set[4].module_name == "verl.workers.engine.fsdp.transformer_impl"
-    assert "dump weight gradients" in patch_set[4].description
+    forward_backward_specs = [
+        spec
+        for spec in patch_set
+        if spec.module_name == "verl.workers.engine.fsdp.transformer_impl"
+        and "forward_backward_batch" in spec.description
+    ]
+    # The diagnostic wrapper must wrap the profiler wrapper.
+    assert [spec.description for spec in forward_backward_specs] == [
+        "FSDPEngine.forward_backward_batch → "
+        "verl080_fsdp.patch_forward_backward_batch: "
+        "patch forward_backward_batch() for micro-batch performance profiling",
+        "FSDPEngine.forward_backward_batch → "
+        "verl080_fsdp.patch_forward_backward_batch_for_diag_dump: "
+        "patch forward_backward_batch() for weight-gradient diagnostic dumps",
+    ]
 
 
 

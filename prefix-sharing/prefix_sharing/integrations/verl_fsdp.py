@@ -1,7 +1,9 @@
-"""verl FSDP integration helpers for PrefixSharing.
+"""prefix_sharing.integrations.verl_fsdp
+
+verl FSDP integration helpers for PrefixSharing.
 
 The FSDP path follows the same public shape as the Megatron integration:
-``build_*`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
+``prepare_for_prefix_sharing_fsdp`` returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
 The helpers stay framework-light enough for CPU tests, while the explicit
 ``verl080_fsdp`` patch set wires them into ``FSDPEngineWithLMHead.forward_step``.
 """
@@ -20,12 +22,12 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_utils import _clone_batch
-from prefix_sharing.integrations.verl_utils import _collect_kept_position_rows
-from prefix_sharing.integrations.verl_utils import _extract_seq_from_nested_tensor
-from prefix_sharing.integrations.verl_utils import _extract_sequences_async
-from prefix_sharing.integrations.verl_utils import _is_nested_tensor
-from prefix_sharing.integrations.verl_utils import _trim_nested_batch
+from prefix_sharing.integrations.verl_utils import clone_batch
+from prefix_sharing.integrations.verl_utils import extract_seq_from_dense_tensor
+from prefix_sharing.integrations.verl_utils import extract_seq_from_nested_tensor
+from prefix_sharing.integrations.verl_utils import is_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_redundant_prefix_in_nested_tensor
+from prefix_sharing.integrations.verl_utils import trim_redundant_prefix_in_dense_tensor
 
 class PrefixSharingFSDPAttentionRuntime:
     """Standalone FSDP attention runtime for PrefixSharing.
@@ -52,6 +54,11 @@ class PrefixSharingFSDPAttentionRuntime:
         from prefix_sharing.tools.perf_profiler import PerfProfiler
         profiler = PerfProfiler.current()
         # [PS-perf] end ——————————————————————————————————————
+
+        #########################################################
+        # handle THD format input
+        #########################################################
+
         if query.shape[0] == 1 and key.shape[0] == 1 and value.shape[0] == 1:
             packed_query = query.squeeze(0)
             packed_key = key.squeeze(0)
@@ -67,6 +74,10 @@ class PrefixSharingFSDPAttentionRuntime:
             return packed_output.unsqueeze(0)
         if query.shape[:2] != key.shape[:2] or query.shape[:2] != value.shape[:2]:
             raise RuntimeError("query, key, and value must share dense batch/sequence dimensions")
+
+        #########################################################
+        # handle BSHD format input
+        #########################################################
 
         plan = ctx.prefix_sharing_plan
         # [PS-perf] start — attn.pack ———————————————————————
@@ -111,10 +122,10 @@ class PrefixSharingFSDPAttentionRuntime:
         return dense_output
 
 
-def forward_prefix_sharing_fsdp_micro_batch(
+def forward_step_without_engine_prepare(
     micro_batch: Any,
     model: Any,
-    config: PrefixSharingConfig,
+    ps_config: PrefixSharingConfig,
     *,
     model_config: Any | None = None,
     backend: Any | None = None,
@@ -124,39 +135,44 @@ def forward_prefix_sharing_fsdp_micro_batch(
     entropy_fn: Any | None = None,
     autocast_context: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one dense verl/FSDP-style micro-batch with PrefixSharing.
+    """Run one forward pass of a verl/FSDP-style micro-batch with PrefixSharing."""
 
-    This is the executable helper used by fake/local FSDP tests and by engines
-    that do not expose prepare hooks:
-    prepare the micro-batch, open the runtime context, run the model with a
-    PrefixSharing attention runtime, compute token-level outputs, then restore
-    reuser prefix columns. Real verl FSDP patching should prefer the engine's
-    own ``prepare_model_inputs`` / ``prepare_model_outputs`` path.
-    """
-
-    trimmed_micro_batch, runtime_state = build_prefix_sharing_micro_batch_fsdp(
+    #########################################################
+    # STEP 1: pre-processing inputs for PrefixSharing
+    #########################################################
+    micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
-        config,
+        ps_config,
         model_config=model_config,
         backend=backend,
     )
-    context = prefix_sharing_runtime_context(runtime_state) if runtime_state is not None else nullcontext(None)
-    autocast = autocast_context if autocast_context is not None else nullcontext()
 
+    #########################################################
+    # STEP 2: create PrefixSharing runtime context
+    #########################################################
+    context = prefix_sharing_runtime_context(prefix_sharing_runtime_state) if prefix_sharing_runtime_state is not None else nullcontext(None)
+    autocast = autocast_context if autocast_context is not None else nullcontext()
     with context as ctx, autocast:
+
+        #########################################################
+        # STEP 3: call the model with PrefixSharing+FSDP attention runtime
+        #########################################################
         model_output = _call_fsdp_model(
             model,
-            trimmed_micro_batch,
-            prefix_sharing_runtime=PrefixSharingFSDPAttentionRuntime(
+            micro_batch_modified,
+            attention_runtime=PrefixSharingFSDPAttentionRuntime(
                 num_layers=model.config.num_hidden_layers if hasattr(model, "config") else 0,
             ),
-            enable_prefix_sharing=runtime_state is not None,
+            enable_prefix_sharing=prefix_sharing_runtime_state is not None,
         )
+
+        #########################################################
+        # STEP 4: post-processing outputs for PrefixSharing
+        #########################################################
+        output = {}
         logits = _extract_logits(model_output) / float(temperature)
-        output = {
-            "model_output": model_output,
-            "logits": logits.clone(),
-        }
+        output["model_output"] = model_output
+        output["logits"] = logits.clone()
         labels = _labels_for_log_probs(micro_batch)
         if labels is not None:
             output["log_probs"] = _compute_log_probs(logits, labels, log_probs_fn)
@@ -173,92 +189,84 @@ def forward_prefix_sharing_fsdp_micro_batch(
         return output
 
 
-def build_prefix_sharing_micro_batch_fsdp(
-    batch: Any,
-    config: PrefixSharingConfig,
-    *,
+def prepare_for_prefix_sharing_fsdp(
+    micro_batch: Any,
+    ps_config: PrefixSharingConfig,
     model_config: Any | None = None,
     backend: Any | None = None,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
-    """Build a trimmed FSDP micro-batch and PrefixSharing runtime state.
+    """Plan prefix sharing and trim one FSDP micro-batch.
 
+    Returns ``(trimmed_micro_batch, PrefixSharingRuntimeState | None)``.
     This helper is intentionally framework-light: it accepts dense 2D
     ``input_ids``/``attention_mask`` or jagged NestedTensor ``input_ids`` from
-    verl remove-padding, and returns the original batch unchanged when prefix
-    sharing is disabled or no reusable prefix is detected.
+    verl remove-padding, and returns the original micro-batch unchanged when
+    prefix sharing is disabled or no reusable prefix is detected.
     """
 
-    if not config.enable_prefix_sharing:
-        return batch, None
-    config.validate(model_config=model_config, integrate_mode="verl_fsdp")
+    # skip if PrefixSharing is disabled
+    if not ps_config.enable_prefix_sharing:
+        return micro_batch, None
 
-    input_ids = batch["input_ids"]
-    is_nested_input = _is_nested_tensor(input_ids)
-    if is_nested_input:
-        sequences = _extract_seq_from_nested_tensor(input_ids)
+    # validate the config
+    ps_config.validate(model_config=model_config, integrate_mode="verl_fsdp")
+
+    # extract input_ids from micro-batch and convert it into sequences (Python List)
+    # for subsequent PrefixSharing planning, which is purely done on CPU
+    input_ids = micro_batch["input_ids"]
+    input_ids_is_nested = is_nested_tensor(input_ids)
+    if input_ids_is_nested: # nested tensor
+        sequences = extract_seq_from_nested_tensor(input_ids)
         valid_indices = None
         attention_mask = None
-    else:
-        attention_mask = batch["attention_mask"].to(bool)
+    else: # dense tensor
+        attention_mask = micro_batch["attention_mask"].to(bool)
         if input_ids.dim() != 2 or attention_mask.dim() != 2:
-            raise RuntimeError("prefix sharing FSDP path expects 2D or jagged NestedTensor input_ids")
+            raise RuntimeError("PrefixSharing + FSDP expects 2D or jagged NestedTensor input_ids")
         if input_ids.shape != attention_mask.shape:
             raise RuntimeError("input_ids and attention_mask must have the same shape")
-
         valid_indices = [
             attention_mask[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
         ]
-        sequences = _extract_sequences_async(input_ids, valid_indices)
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+        sequences = extract_seq_from_dense_tensor(input_ids, valid_indices)
+
+    #########################################################
+    # STEP 1: plan for PrefixSharing
+    #########################################################
+    prefix_sharing_plan = PrefixSharingPlanner(ps_config).plan(sequences)
     if not prefix_sharing_plan.has_sharing:
-        return batch, None
+        return micro_batch, None
 
-    if is_nested_input:
-        trimmed_micro_batch = _trim_nested_batch(batch, prefix_sharing_plan)
-        kept_position_rows = _collect_kept_position_rows(
-            trimmed_micro_batch,
-            prefix_sharing_plan,
-            is_nested_tensor=True,
+    #########################################################
+    # STEP 2: trim redundant prefix of reusers in the micro-batch
+    #########################################################
+    if input_ids_is_nested: # nested tensor
+        trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_nested_tensor(
+            micro_batch, prefix_sharing_plan
         )
-    else:
-        trimmed_micro_batch = _clone_batch(batch)
-        trimmed_attention_mask = attention_mask.clone()
-        trimmed_attention_mask[:] = False
-
-        for row, indices in enumerate(valid_indices):
-            keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
-            kept_indices = indices[keep_start:keep_end]
-            trimmed_attention_mask[row, kept_indices] = True
-
-        trimmed_micro_batch["attention_mask"] = trimmed_attention_mask
-
-        if "loss_mask" in trimmed_micro_batch:
-            trimmed_loss_mask = trimmed_micro_batch["loss_mask"].to(bool).clone()
-            trimmed_loss_mask[:] = False
-            for row, indices in enumerate(valid_indices):
-                keep_start, keep_end = prefix_sharing_plan.loss_mask_keep_ranges[row]
-                trimmed_loss_mask[row, indices[keep_start:keep_end]] = batch["loss_mask"][row, indices[keep_start:keep_end]].to(bool)
-            trimmed_micro_batch["loss_mask"] = trimmed_loss_mask
-        kept_position_rows = _collect_kept_position_rows(
-            trimmed_micro_batch,
-            prefix_sharing_plan,
-            is_nested_tensor=False,
-            valid_indices=valid_indices,
+    else: # dense tensor
+        trimmed_micro_batch, kept_position_rows = trim_redundant_prefix_in_dense_tensor(
+            micro_batch, prefix_sharing_plan, valid_indices
         )
 
-    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
-        kept_position_rows,
-        align_size=1,
-    )
-    runtime_state = PrefixSharingRuntimeState(
+    #########################################################
+    # STEP 3: build batch layout for the trimmed micro-batch
+    #########################################################
+    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(kept_position_rows)
+
+    #########################################################
+    # STEP 4: build runtime state for the trimmed micro-batch
+    #########################################################
+    prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        attention_backend=get_backend_instance(config, backend),
+        attention_backend=get_backend_instance(ps_config, backend),
         packed_batch_layout=packed_batch_layout,
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=trimmed_micro_batch.get("position_ids"),
     )
-    return trimmed_micro_batch, runtime_state
+
+    return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
 def restore_prefix_sharing_outputs_2d(
@@ -375,6 +383,10 @@ def _run_packed_attention_runtime(
     if _per_layer_ok:
         profiler.start_phase(f"attn.kv.l{layer_id}")
     # [PS-perf] end ————————————————————————————————————————
+
+    #########################################################
+    # STEP 1: build key and value tensors
+    #########################################################
     expanded_key, expanded_value = ctx.attention_backend.build_kv(
         packed_key,
         packed_value,
@@ -399,6 +411,10 @@ def _run_packed_attention_runtime(
         dump_expanded_kv_on(layer_number, expanded_key, expanded_value, num_layers)
     # ##### [PS-diag] end #####
 
+    #########################################################
+    # STEP 2: compute attention
+    #########################################################
+    
     if profiler is not None:
         profiler.start_phase(PerfProfiler.PHASE_ATTN_COMPUTE)
     # [PS-perf] start — per-layer compute ——————————————————
@@ -426,7 +442,7 @@ def _call_fsdp_model(
     model: Any,
     micro_batch: Any,
     *,
-    prefix_sharing_runtime: PrefixSharingFSDPAttentionRuntime,
+    attention_runtime: PrefixSharingFSDPAttentionRuntime,
     enable_prefix_sharing: bool,
 ) -> Any:
     model_inputs = {
@@ -436,7 +452,7 @@ def _call_fsdp_model(
     }
     model_inputs["use_cache"] = False
     if enable_prefix_sharing:
-        model_inputs["prefix_sharing_runtime"] = prefix_sharing_runtime
+        model_inputs["prefix_sharing_runtime"] = attention_runtime
     try:
         return model(**model_inputs)
     except TypeError:

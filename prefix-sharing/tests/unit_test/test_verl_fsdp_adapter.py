@@ -9,8 +9,8 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
-    build_prefix_sharing_micro_batch_fsdp,
-    forward_prefix_sharing_fsdp_micro_batch,
+    prepare_for_prefix_sharing_fsdp,
+    forward_step_without_engine_prepare,
     restore_prefix_sharing_outputs_2d,
 )
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
@@ -132,7 +132,7 @@ def _baseline_attention(query, key, value):
     return torch.einsum("blmh,bmhd->blhd", probs, value)
 
 
-def test_build_prefix_sharing_micro_batch_fsdp_returns_trimmed_batch_and_runtime_state():
+def test_prepare_for_prefix_sharing_fsdp_returns_trimmed_batch_and_runtime_state():
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
         "input_ids": torch.tensor(
@@ -172,7 +172,7 @@ def test_build_prefix_sharing_micro_batch_fsdp_returns_trimmed_batch_and_runtime
         ),
     }
 
-    trimmed_batch, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    trimmed_batch, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert runtime_state is not None
     assert isinstance(runtime_state, PrefixSharingRuntimeState)
@@ -193,7 +193,7 @@ def test_build_prefix_sharing_micro_batch_fsdp_returns_trimmed_batch_and_runtime
     assert torch.equal(trimmed_batch["position_ids"][1, 3:6], torch.tensor([3, 4, 5]))
 
 
-def test_build_prefix_sharing_micro_batch_fsdp_returns_none_when_no_sharing():
+def test_prepare_for_prefix_sharing_fsdp_returns_none_when_no_sharing():
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long),
@@ -201,13 +201,13 @@ def test_build_prefix_sharing_micro_batch_fsdp_returns_none_when_no_sharing():
         "position_ids": torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
     }
 
-    returned_batch, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    returned_batch, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert returned_batch is batch
     assert runtime_state is None
 
 
-def test_build_prefix_sharing_micro_batch_fsdp_trims_nested_remove_padding_batch():
+def test_prepare_for_prefix_sharing_fsdp_trims_nested_remove_padding_batch():
     if not hasattr(torch, "nested"):
         pytest.skip("torch.nested is unavailable")
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
@@ -235,7 +235,7 @@ def test_build_prefix_sharing_micro_batch_fsdp_trims_nested_remove_padding_batch
         ),
     }
 
-    trimmed_batch, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    trimmed_batch, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
 
     assert runtime_state is not None
     plan = runtime_state.prefix_sharing_plan
@@ -273,7 +273,7 @@ def test_restore_prefix_sharing_outputs_2d_restores_interior_last_logits_entropy
             dtype=torch.long,
         ),
     }
-    _, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    _, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
     assert runtime_state is not None
 
     vocab = 5
@@ -345,7 +345,7 @@ def test_prefix_sharing_fsdp_attention_runtime_scatter_dense_outputs():
             dtype=torch.long,
         ),
     }
-    _, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    _, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
     assert runtime_state is not None
 
     torch.manual_seed(1)
@@ -368,7 +368,7 @@ def test_prefix_sharing_fsdp_attention_runtime_scatter_dense_outputs():
     assert not torch.allclose(dense_output[1, 3:6], torch.zeros_like(dense_output[1, 3:6]))
 
 
-def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline():
+def test_forward_step_without_engine_prepare_matches_tiny_hf_model_baseline():
     torch.manual_seed(2026)
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
@@ -403,7 +403,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline(
     baseline_log_probs = _mock_log_probs_fn(baseline_logits, labels)
     baseline_entropy = _entropy_from_logits(baseline_logits)
 
-    prefix_output = forward_prefix_sharing_fsdp_micro_batch(
+    prefix_output = forward_step_without_engine_prepare(
         batch,
         model,
         config,
@@ -418,7 +418,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_matches_tiny_hf_model_baseline(
     assert torch.allclose(prefix_output["attention_output"], baseline.attention_output, atol=1e-5)
 
 
-def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path():
+def test_forward_step_without_engine_prepare_keeps_provider_prefix_grad_path():
     torch.manual_seed(2027)
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
     batch = {
@@ -443,7 +443,7 @@ def test_forward_prefix_sharing_fsdp_micro_batch_keeps_provider_prefix_grad_path
     batch["labels"] = labels
 
     model = _TinyHFStyleModel(vocab_size=32)
-    output = forward_prefix_sharing_fsdp_micro_batch(
+    output = forward_step_without_engine_prepare(
         batch,
         model,
         config,
@@ -686,7 +686,7 @@ def test_prefix_sharing_fsdp_attention_runtime_supports_packed_single_batch_shap
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
         "position_ids": torch.tensor([[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long),
     }
-    _, runtime_state = build_prefix_sharing_micro_batch_fsdp(batch, config)
+    _, runtime_state = prepare_for_prefix_sharing_fsdp(batch, config)
     assert runtime_state is not None
 
     torch.manual_seed(2031)

@@ -1,11 +1,9 @@
-"""Patch: MegatronEngineWithLMHead.forward_step — verl 0.8.0 engine architecture
+"""Patch: MegatronEngineWithLMHead.forward_step — verl 0.8.0 engine 架构
 
-Thin wrapper: consume batch → read config → build state → set context → feed
-back to original forward_step.
+thin wrapper：消费 batch → 读 config → 构建状态 → 设 context → 喂回原始 forward_step。
 
-All business logic (config reading, batch construction, layout computation)
-is handled by the integrations layer. This patch only orchestrates the call
-sequence and sets up the runtime context.
+所有业务逻辑（config 读取、batch 构建、layout 计算）由 integrations 层处理，
+本 patch 只负责编排调用顺序和设置 runtime context。
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ def _describe_batch(batch: Any) -> str:
 
 
 def patch_verl_forward_step(original_forward_step: Any) -> Any:
-    """Create a patch wrapper for MegatronEngineWithLMHead.forward_step."""
+    """创建 MegatronEngineWithLMHead.forward_step 的 patch wrapper。"""
 
     def patched_forward_step(
         self,
@@ -64,18 +62,17 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         logits_processor_func,
         postprocess_micro_batch_func,
     ):
-        # ── Retrieve original micro-batch ──
-        # batch_iter comes from the outer engine's forward_step caller.
-        # Consume the batch; build_prefix_sharing_micro_batch_verl080 performs
-        # physical trimming. Returns trimmed_batch (physically trimmed
-        # micro-batch) and ps_state.
+        # ── 获取原始 micro-batch ──
+        # batch_iter 来自外层 engine 的 forward_step 调用方。
+        # 消费 batch，由 build_prefix_sharing_micro_batch_verl080 进行物理裁剪
+        # 返回 trimmed_batch（物理裁剪后的 micro-batch）和 ps_state。
         _ps_forward_step_probe("enter")
         _ps_forward_step_probe("before_next_batch")
         original_batch = next(batch_iter)
         _ps_forward_step_probe("after_next_batch", batch=_describe_batch(original_batch))
         batch_for_forward = original_batch
 
-        # ── Read configuration ──
+        # ── 读取配置 ──
         _ps_forward_step_probe("before_read_config")
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
         from prefix_sharing.core.config import PrefixSharingConfig
@@ -89,16 +86,15 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
 
         ps_state = None
         if ps_config.enable_prefix_sharing:
-            # batch.to(device) ensures tensors are on the target device.
-            # The original forward_step will call batch.to(device) again
-            # (idempotent).
+            # batch.to(device) 使 tensor 在目标设备上，
+            # 原始 forward_step 会再次 batch.to(device)（幂等）
             from verl.utils.megatron_utils import get_device_id
             device_id = get_device_id()
             _ps_forward_step_probe("before_batch_to_device", device_id=device_id)
             batch_on_device = original_batch.to(device_id)
             _ps_forward_step_probe("after_batch_to_device")
 
-            # Batch trimming
+            # batch裁剪
             _ps_forward_step_probe("before_prepare_micro_batch")
             from prefix_sharing.integrations.verl_mcore import build_prefix_sharing_micro_batch_verl080
             batch_for_forward, ps_state = build_prefix_sharing_micro_batch_verl080(
@@ -121,13 +117,11 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         else:
             _ps_forward_step_probe("skip_prepare_prefix_sharing_disabled")
 
-        # ##### [PS-diag] dump metadata + attention_mask + label_mask (shared by ON/OFF) #####
-        # Only triggered when PREFIX_SHARING_DIAG_DUMP is set; zero overhead otherwise.
-        # ON: prefix_lens / original_lengths are taken from the plan;
-        # OFF: prefix_lens are all-zero, original_lengths derived from
-        #      input_ids NestedTensor offsets diff.
-        # cu_seqlens are taken from the input_ids NestedTensor offsets fed into
-        # forward (ON = trimmed packed boundaries, OFF = full).
+        # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
+        # 仅当 PREFIX_SHARING_DIAG_DUMP 设定时触发，否则零开销。
+        # ON: prefix_lens / original_lengths 取自 plan；
+        # OFF: prefix_lens 全0、original_lengths 从 input_ids NestedTensor offsets diff 推。
+        # cu_seqlens 取送进 forward 的 input_ids NestedTensor offsets（ON=裁剪后 packed 边界, OFF=完整）。
         import os as _os
         if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump import (
@@ -136,9 +130,9 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 build_attention_mask_2d, build_label_mask_2d,
                 nested_offsets_to_cu,
             )
-            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+            from prefix_sharing.integrations.verl_utils import is_nested_tensor
             _ids_nested = batch_for_forward["input_ids"]
-            if _is_nested_tensor(_ids_nested):
+            if is_nested_tensor(_ids_nested):
                 if ps_state is not None:
                     _plan = ps_state.prefix_sharing_plan
                     _prefix_lens = list(_plan.prefix_lens)
@@ -148,47 +142,40 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _orig_lens = [int(d) for d in _diffs]
                     _prefix_lens = [0] * len(_orig_lens)
                 dump_meta_verl080(_prefix_lens, nested_offsets_to_cu(_ids_nested))
-                # attention_mask + label_mask: two comparison ranges for log_probs,
-                # both excluding the out-of-bounds prediction position (POS L_i-1,
-                # whose logp predicts the non-existent token[L_i]). Aligned to the
-                # compact [B, L_max] coordinate system of restored log_probs.
-                #   attention_mask: [0:L_i-1) prompt region + prompt-last + response
-                #                   region (full restore verification)
-                #   label_mask:     [prompt-last:L_i-1) prompt-last + response region
-                #                   (PPO loss scope)
+                # attention_mask + label_mask：两种 log_probs 对比范围，都不含越界预测位
+                # （POS L_i-1，其 logp 预测不存在的 token[L_i]）。对齐 restore 后 log_probs
+                # 的 [B, L_max] 紧凑坐标系。
+                #   attention_mask：[0:L_i-1) prompt 区+prompt-last+response 区（整体 restore 验证）
+                #   label_mask：[prompt-last:L_i-1) prompt-last+response 区（PPO loss 范围）
                 _Lmax_lm = max(_orig_lens) if _orig_lens else 0
-                # tag aligned with logprobs (entry point 2 uses model.training to
-                # distinguish old/train), ensuring mask and logprobs_{tag} come from
-                # the same forward pass (same batch, same L_max).
+                # tag 与 logprobs 一致（接入点2 用 model.training 区分 old/train），
+                # 保证 mask 和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max）。
                 _tag_lm = "train" if model.training else "old"
-                # attention_mask only depends on _orig_lens; no loss_mask needed.
+                # attention_mask 仅依赖 _orig_lens，不需要 loss_mask。
                 dump_attention_mask_verl080(
                     build_attention_mask_2d(_orig_lens, _Lmax_lm), _tag_lm)
-                # label_mask uses response_lens (number of response tokens per row).
-                # After verl080 padding, loss_mask = response_mask is 2D left-right
-                # padded (not a NestedTensor, see verl padding.py:71), so it cannot
-                # go through nested_to_2d_full; however the response token count =
-                # loss_mask row sum is coordinate-system agnostic, making it the
-                # most robust way to derive prompt_len (works for both 2D and
-                # NestedTensor).
+                # label_mask 用 response_lens（每行 response token 数）。verl080 padding 后
+                # loss_mask = response_mask 是 2D left-right padded（非 NestedTensor，见
+                # verl padding.py:71），不能走 nested_to_2d_full；但 response token 数 =
+                # loss_mask 行 sum，与坐标系无关，据此推 prompt_len 最稳（2D/NestedTensor 均适用）。
                 _lm = original_batch.get("loss_mask")
                 if _lm is not None:
-                    if _is_nested_tensor(_lm):
+                    if is_nested_tensor(_lm):
                         _lm_off = _lm.offsets()
                         _lm_val = _lm.values()
                         _response_lens = [
                             int(_lm_val[_lm_off[i]:_lm_off[i + 1]].sum())
                             for i in range(len(_orig_lens))]
                     else:
-                        # .long() avoids importing torch (not imported at file top);
-                        # .cpu() guards against on-device tensor .tolist()
+                        # .long() 免 import torch（本文件顶部未导入 torch）；
+                        # .cpu() 防御 on-device tensor 的 tolist()
                         _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
                     dump_label_mask_verl080(
                         build_label_mask_2d(_response_lens, _orig_lens, _Lmax_lm),
                         _tag_lm)
-        # ##### [PS-diag] dump metadata + masks end #####
+        # ##### [PS-diag] dump 元数据 + masks end #####
 
-        # ── Build modified iterator to feed back into original forward_step ──
+        # ── 构造修改后的 iterator 喂回原始 forward_step ──
         modified_iter = iter([batch_for_forward])
 
         # ── runtime context ──
@@ -210,14 +197,12 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 logits_processor_func,
                 postprocess_micro_batch_func,
             )
-            # v080 restore: reassemble reuser prefix segments while context is
-            # still active. forward_step returns (output_dict,
-            # partial(postprocess_func)); unpack, process output_dict, then
-            # repackage. restore_via_2d_unfold_verl080 internally checks
-            # context / restore_indices and does an early return when no
-            # restore is needed.
+            # v080 restore：在 context 仍激活时重组 reuser prefix 区段。
+            # forward_step 返回 (output_dict, partial(postprocess_func))，
+            # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
+            # 会检查 context / restore_indices，无 restore 需求时 early return。
             if ps_state is not None:
-                from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
+                from prefix_sharing.integrations.verl_utils import restore_via_2d_unfold_verl080
                 from prefix_sharing.integrations.context import current_prefix_sharing_context
                 from verl.utils.megatron.tensor_parallel import (
                     vocab_parallel_entropy,
@@ -229,36 +214,30 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     vocab_parallel_log_probs_from_logits,
                     vocab_parallel_entropy,
                 )
-                # Release vocab-dimension logits (high memory usage; only held
-                # during context lifetime — restore has already consumed them).
-                # The clear responsibility belongs here, not in the wrapper
-                # function.
+                # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
+                # restore 已消费完毕）。clear 职责在此，不在包装函数内。
                 ctx = current_prefix_sharing_context()
                 if ctx is not None:
                     ctx.prefix_last_logits_saved.clear()
                 output = (output_dict, postprocess_fn)
-            # ##### [PS-diag] dump 2D logprobs/entropy (ON=post-restore, OFF=original) #####
-            # After restore (ON) or from original forward (OFF), log_probs / entropy
-            # are both NestedTensors with per-row length = original_lengths[i].
-            # Expand to a uniform [B, L_max] for cmp_diag.cmp_2d element-wise
-            # comparison.
+            # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
+            # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
+            # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
             import os as _os2
             if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.tools.diagnostic_dump import (
                     nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
                 )
-                from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-                # Aligned with v070: tag = "old" if forward_only else "train".
-                # forward_step does not have access to forward_only, so use
-                # model.training as an equivalent distinction:
-                #   eval_mode → training=False → "old"  (old_logp phase)
-                #   train_mode → training=True → "train" (update_actor phase)
-                # A single run thus produces logprobs_old + logprobs_train without
-                # overwriting each other.
+                from prefix_sharing.integrations.verl_utils import is_nested_tensor
+                # 对齐 v070: tag = "old" if forward_only else "train"。
+                # forward_step 拿不到 forward_only，用 model.training 等价区分
+                # （eval_mode→training=False→"old" 对应 old_logp 阶段；
+                #  train_mode→training=True→"train" 对应 update_actor 阶段）。
+                # 这样一次 run 自动产出 logprobs_old + logprobs_train 两份，不互相覆盖。
                 _tag = "train" if model.training else "old"
                 _out_dict, _ = output
                 _lp = _out_dict.get("log_probs")
-                if _is_nested_tensor(_lp):
+                if is_nested_tensor(_lp):
                     if ps_state is not None:
                         _ol = list(ps_state.prefix_sharing_plan.original_lengths)
                     else:
@@ -266,7 +245,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _Lmax = max(_ol) if _ol else 0
                     dump_logprobs_2d_verl080(nested_to_2d_full(_lp, _ol, _Lmax), _tag)
                     _ent = _out_dict.get("entropy")
-                    if _is_nested_tensor(_ent):
+                    if is_nested_tensor(_ent):
                         dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
             # ##### [PS-diag] dump 2D logprobs/entropy end #####
         _ps_forward_step_probe("after_original_forward_step")

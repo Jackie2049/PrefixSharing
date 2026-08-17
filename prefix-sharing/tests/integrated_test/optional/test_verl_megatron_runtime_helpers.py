@@ -18,7 +18,7 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context, 
 from prefix_sharing.integrations.megatron_runtime import prefix_attention
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import restore_reuser_prefix_columns_2d
+from prefix_sharing.integrations.verl_utils import restore_reuser_prefix_columns_2d
 
 
 def _make_state() -> tuple[PrefixSharingRuntimeState, list]:

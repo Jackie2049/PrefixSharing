@@ -9,15 +9,15 @@ from prefix_sharing.integrations.context import (
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo, get_megatron_parallel_info
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.runtime_state import PrefixSharingRuntimeState
-from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
-from prefix_sharing.integrations.verl_mcore import (
-    build_prefix_sharing_micro_batch_verl080,
+from prefix_sharing.integrations.verl_utils import (
+    read_ps_config_from_engine_config,
     restore_reuser_prefix_columns_2d,
 )
+from prefix_sharing.integrations.verl_mcore import build_prefix_sharing_micro_batch_verl080
 from prefix_sharing.integrations.verl_fsdp import (
     PrefixSharingFSDPAttentionRuntime,
-    build_prefix_sharing_micro_batch_fsdp,
-    forward_prefix_sharing_fsdp_micro_batch,
+    prepare_for_prefix_sharing_fsdp,
+    forward_step_without_engine_prepare,
     restore_prefix_sharing_outputs_2d,
 )
 from prefix_sharing.integrations.megatron_runtime import (
@@ -38,7 +38,7 @@ __all__ = [
     "prefix_attention",
     "get_megatron_parallel_info",
     "PrefixSharingFSDPAttentionRuntime",
-    "build_prefix_sharing_micro_batch_fsdp",
-    "forward_prefix_sharing_fsdp_micro_batch",
+    "prepare_for_prefix_sharing_fsdp",
+    "forward_step_without_engine_prepare",
     "restore_prefix_sharing_outputs_2d",
 ]

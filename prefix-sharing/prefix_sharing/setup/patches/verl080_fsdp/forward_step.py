@@ -1,22 +1,29 @@
-"""Patch: FSDPEngineWithLMHead.forward_step — verl 0.8.0 FSDP path.
+"""patch: FSDPEngineWithLMHead.forward_step → verl080_fsdp.patch_fsdp_forward_step
 
-Thin wrapper: reads prefix_sharing_config, preferentially reuses the real
-engine's ``prepare_model_inputs`` / ``prepare_model_outputs``, injects a
-PrefixSharing runtime during forward, and performs interior / prefix-last
-restore on the output side.
-This patch covers dense 2D and verl remove-padding jagged NestedTensor
-formats; unverified formats such as Ulysses SP and fused kernels are
-explicitly rejected during config validation.
+forward_step wrapper for PrefixSharing under verl 0.8.0 + FSDP.
 """
 
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import Any, Callable
+
+import torch
+import torch.utils.checkpoint as _ckpt
+
+from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.integrations.context import create_prefix_sharing_context
+from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
+from prefix_sharing.integrations.verl_fsdp import prepare_for_prefix_sharing_fsdp
+from prefix_sharing.integrations.verl_fsdp import restore_prefix_sharing_outputs_2d
+from prefix_sharing.integrations.verl_utils import restore_via_2d_unfold_verl080
+from prefix_sharing.integrations.verl_utils import is_nested_tensor
+from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
+from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
 
 def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
-    """Create a patch wrapper for FSDPEngineWithLMHead.forward_step."""
 
     # Patch _CheckpointFrame.check_recomputed_tensors_match and
     # _internal_assert to no-op.
@@ -24,7 +31,6 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
     # computation graph, causing the saved-tensor count mismatch detected by
     # these methods.  The recomputed values are numerically correct — the count
     # difference is benign.  Bypass both checks so ON-path training completes.
-    import torch.utils.checkpoint as _ckpt
     # Apply once, globally.
     if not getattr(patch_fsdp_forward_step, "_cp_patched", False):
         _ckpt._CheckpointFrame.check_recomputed_tensors_match = lambda self, gid: None  # type: ignore[method-assign]
@@ -33,22 +39,16 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
         patch_fsdp_forward_step._cp_patched = True
 
     def patched_forward_step(self: Any, micro_batch: Any, loss_function: Any, forward_only: bool):
-        from prefix_sharing.core.config import PrefixSharingConfig
-        from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
-        from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
 
-        raw_config = read_ps_config_from_engine_config(self.engine_config)
-        ps_config = PrefixSharingConfig.from_raw(raw_config)
+        raw_config = read_ps_config_from_engine_config(self.engine_config) # framework-level config
+        ps_config = PrefixSharingConfig.from_raw(raw_config) # PrefixSharing-level config
+        
         if not ps_config.enable_prefix_sharing:
             # Memory sampling is managed by the step-level ProfilerScope; this
             # path records only the model-forward phase.
             profiler = ProfilerScope.current()
             if profiler is not None:
-                forward_phase = (
-                    PerfProfiler.PHASE_FORWARD_OLD
-                    if forward_only
-                    else PerfProfiler.PHASE_FORWARD
-                )
+                forward_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
                 profiler.start_phase(forward_phase)
 
             # Without diagnostics this path must delegate directly to verl.
@@ -76,50 +76,35 @@ def patch_fsdp_forward_step(original_forward_step: Any) -> Any:
 
                 micro_batch = micro_batch.to(get_device_id())
             except Exception:
-                # Local unit tests use plain dict / fake engine; no dependency on verl device helper.
+                # Local unit tests use plain dict / fake engine without verl device helpers.
                 pass
 
-        ulysses_sp_size = _read_runtime_value(
-            self.engine_config,
-            micro_batch,
-            "ulysses_sequence_parallel_size",
-            default=1,
-        )
-        use_fused_kernels = _read_runtime_value(
-            self.engine_config,
-            micro_batch,
-            "use_fused_kernels",
-            default=False,
-        )
+        model_config = {
+            "model_type": "text_only_causal_lm",
+            "ulysses_sequence_parallel_size": _read_runtime_value(self.engine_config, micro_batch, "ulysses_sequence_parallel_size", default=1),
+            "use_fused_kernels": _read_runtime_value(self.engine_config, micro_batch, "use_fused_kernels", default=False),
+        }
         ps_config.validate(
-            model_config={
-                "model_type": "text_only_causal_lm",
-                "ulysses_sequence_parallel_size": ulysses_sp_size,
-                "use_fused_kernels": use_fused_kernels,
-            },
+            model_config=model_config,
             integrate_mode="verl_fsdp",
         )
 
         if hasattr(self, "prepare_model_inputs") and hasattr(self, "prepare_model_outputs"):
             return _forward_step_with_engine_prepare(
-                self, micro_batch, loss_function, forward_only, ps_config,
+                self, micro_batch, loss_function, forward_only, ps_config, model_config,
             )
 
-        from prefix_sharing.integrations.verl_fsdp import forward_prefix_sharing_fsdp_micro_batch
+        from prefix_sharing.integrations.verl_fsdp import forward_step_without_engine_prepare
 
         calculate_entropy = bool(
             _read_runtime_value(self.engine_config, micro_batch, "calculate_entropy", default=False)
         )
         temperature = _read_temperature(micro_batch)
-        output = forward_prefix_sharing_fsdp_micro_batch(
+        output = forward_step_without_engine_prepare(
             micro_batch,
             self.module,
             ps_config,
-            model_config={
-                "model_type": "text_only_causal_lm",
-                "ulysses_sequence_parallel_size": ulysses_sp_size,
-                "use_fused_kernels": use_fused_kernels,
-            },
+            model_config=model_config,
             temperature=temperature,
             calculate_entropy=calculate_entropy,
             entropy_fn=getattr(self, "compute_entropy_from_logits", None),
@@ -159,15 +144,12 @@ def _forward_step_with_engine_prepare(
     loss_function: Any,
     forward_only: bool,
     ps_config: Any,
+    model_config: Any,
 ) -> Any:
-    import torch
-    from contextlib import nullcontext
 
-    from prefix_sharing.integrations.context import create_prefix_sharing_context
-    from prefix_sharing.integrations.verl_fsdp import PrefixSharingFSDPAttentionRuntime
-    from prefix_sharing.integrations.verl_fsdp import build_prefix_sharing_micro_batch_fsdp
-
-    from prefix_sharing.tools.perf_profiler import PerfProfiler, ProfilerScope
+    #########################################################
+    # STEP 1: pre-processing inputs for PrefixSharing
+    #########################################################
 
     profiler = ProfilerScope.current()
     if profiler is not None:
@@ -179,30 +161,17 @@ def _forward_step_with_engine_prepare(
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    trimmed_micro_batch, ps_state = build_prefix_sharing_micro_batch_fsdp(
+    micro_batch_modified, prefix_sharing_runtime_state = prepare_for_prefix_sharing_fsdp(
         micro_batch,
         ps_config,
-        model_config={
-            "model_type": "text_only_causal_lm",
-            "ulysses_sequence_parallel_size": _read_runtime_value(
-                self.engine_config,
-                micro_batch,
-                "ulysses_sequence_parallel_size",
-                default=1,
-            ),
-            "use_fused_kernels": _read_runtime_value(
-                self.engine_config,
-                micro_batch,
-                "use_fused_kernels",
-                default=False,
-            ),
-        },
+        model_config=model_config,
     )
+
     if profiler is not None:
         profiler.stop_phase(PerfProfiler.PHASE_PLAN)  # Detect, plan, and trim on CPU.
-
-    if ps_state is None:
-        return _call_original_like_engine(self, trimmed_micro_batch, loss_function, forward_only)
+    
+    if prefix_sharing_runtime_state is None:
+        return _call_original_like_engine(self, micro_batch_modified, loss_function, forward_only)
 
     if os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         from prefix_sharing.tools.diagnostic_dump import dump_fsdp_on_metadata_verl080
@@ -210,35 +179,42 @@ def _forward_step_with_engine_prepare(
         diagnostic_tag = "train" if self.module.training else "old"
         dump_fsdp_on_metadata_verl080(
             micro_batch,
-            ps_state.prefix_sharing_plan,
+            prefix_sharing_runtime_state.prefix_sharing_plan,
             diagnostic_tag,
         )
 
-    # Retrieve the number of model layers for per-layer diagnostic dump
+    #########################################################
+    # STEP 2: pre-processing inputs for the model
+    #########################################################
+
+    # Read layer count for per-layer diagnostic dumps.
     _diag_num_layers = int(getattr(
         getattr(getattr(self, "module", None), "config", None),
         "num_hidden_layers", 0)) or 0
 
-    model_inputs, output_args = self.prepare_model_inputs(micro_batch=trimmed_micro_batch)
+    model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch_modified)
     model_inputs["prefix_sharing_runtime"] = PrefixSharingFSDPAttentionRuntime()
     model_inputs["prefix_sharing_runtime"].num_layers = _diag_num_layers
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
-    device_name = _read_device_name()
     autocast_ctx = (
         nullcontext()
         if autocast_dtype == torch.float32
-        else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+        else torch.autocast(device_type=_read_device_name(), dtype=autocast_dtype)
     )
-    # ── Create PS context with manual lifecycle (survives backward for AC) ──
-    ctx, ctx_cleanup = create_prefix_sharing_context(ps_state)
 
-    # Set _ps_ctx on every attention module so the attention patch reads
+    #########################################################
+    # STEP 3: create PrefixSharing runtime context
+    #########################################################
+
+    prefix_sharing_context, cleanup_prefix_sharing_context = create_prefix_sharing_context(prefix_sharing_runtime_state)
+
+    # Set _prefix_sharing_context on every attention module so the attention patch reads
     # the context from the module itself rather than ContextVar (compatible
     # with activation-checkpointing recompute, which bypasses the context
     # manager that set the ContextVar).
     for attention_module in self.module.modules():
         if hasattr(attention_module, "layer_idx") and hasattr(attention_module, "q_proj"):
-            attention_module._ps_ctx = ctx
+            attention_module._prefix_sharing_context = prefix_sharing_context
 
     # Register diagnostic gradient hooks when the diagnostic dump is enabled.
     _register_grad_dump_hooks(self.module, forward_only)
@@ -246,15 +222,15 @@ def _forward_step_with_engine_prepare(
     # Attach cleanup callback so the forward_backward_batch wrapper can release
     # PrefixSharing state after backward.  The root full-backward hook is
     # unreliable here because ``self.module`` returns a CausalLMOutput dataclass.
-    self.module._ps_ctx_cleanup = ctx_cleanup
+    self.module._cleanup_prefix_sharing_context = cleanup_prefix_sharing_context
+
+    #########################################################
+    # STEP 4: call the model with PrefixSharing+FSDP attention runtime
+    #########################################################
 
     with autocast_ctx:
         if profiler is not None:
-            forward_phase = (
-                PerfProfiler.PHASE_FORWARD_OLD
-                if forward_only
-                else PerfProfiler.PHASE_FORWARD
-            )
+            forward_phase = PerfProfiler.PHASE_FORWARD_OLD if forward_only else PerfProfiler.PHASE_FORWARD
             profiler.start_phase(forward_phase)
         raw_output = self.module(**model_inputs, use_cache=False)
         if profiler is not None:
@@ -265,13 +241,21 @@ def _forward_step_with_engine_prepare(
 
             dump_raw_logits_verl080(raw_output, dp_aware=_get_dp_size() > 1)
 
+        #########################################################
+        # STEP 5: post-processing outputs for the model
+        #########################################################
+
         _save_prefix_last_logits_from_raw_output(raw_output)
         model_output = self.prepare_model_outputs(
             output=raw_output,
             output_args=output_args,
-            micro_batch=trimmed_micro_batch,
+            micro_batch=micro_batch_modified,
             logits_processor_func=loss_function,
         )
+
+        #########################################################
+        # STEP 6: post-processing outputs for PrefixSharing
+        #########################################################
 
         if profiler is not None:
             profiler.start_phase(PerfProfiler.PHASE_RESTORE)
@@ -284,9 +268,13 @@ def _forward_step_with_engine_prepare(
 
             dump_fsdp_model_output_2d_verl080(
                 model_output,
-                list(ps_state.prefix_sharing_plan.original_lengths),
+                list(prefix_sharing_runtime_state.prefix_sharing_plan.original_lengths),
                 diagnostic_tag,
             )
+
+        #########################################################
+        # STEP 7: compute loss & metrics
+        #########################################################
 
         if loss_function is not None:
             if profiler is not None:
@@ -361,10 +349,9 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
     import torch
     from contextlib import nullcontext
 
-    # Align with verl's native forward_step: move micro_batch to device first
-    # (the disable path bypasses the .to(device) in patched_forward_step, so we
-    # compensate here to avoid device mismatch for logits/temperature in
-    # prepare_model_outputs).
+    # Match native verl forward_step: move micro_batch to device first.
+    # The disable / no-sharing path skips the .to(device) in patched_forward_step;
+    # without it, logits/temperature can land on different devices in prepare_model_outputs.
     if hasattr(micro_batch, "to"):
         try:
             from verl.utils.device import get_device_id
@@ -373,13 +360,11 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
             pass
     model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-    # DIAG_DUMP: ON path dumps original full input_ids (suffix-only dump would
-    # miss prefix tokens)
+    # DIAG_DUMP: dump original full input_ids (suffix-only dumps miss prefix tokens).
     import os as _ps_diag_fwd_ids
     if _ps_diag_fwd_ids.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
         _dump_full_input_ids_only(micro_batch, "train")
 
-    autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     autocast_dtype = getattr(self, "_autocast_dtype", torch.float32)
     device_name = _read_device_name()
     autocast_ctx = (
@@ -394,11 +379,7 @@ def _call_original_like_engine(self: Any, micro_batch: Any, loss_function: Any, 
 
     profiler = ProfilerScope.current()
     if profiler is not None:
-        forward_phase = (
-            profiler.PHASE_FORWARD_OLD
-            if forward_only
-            else profiler.PHASE_FORWARD
-        )
+        forward_phase = profiler.PHASE_FORWARD_OLD if forward_only else profiler.PHASE_FORWARD
         profiler.start_phase(forward_phase)
 
     with autocast_ctx:
@@ -470,17 +451,13 @@ def _restore_engine_model_output(model_output: dict[str, Any]) -> dict[str, Any]
     except Exception:
         entropy_from_logits = None
 
-    from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
-    from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-    from prefix_sharing.integrations.verl_fsdp import restore_prefix_sharing_outputs_2d
-
     restored = restore_via_2d_unfold_verl080(
         model_output,
         logprobs_from_logits,
         entropy_from_logits,
     )
     log_probs = restored.get("log_probs")
-    if log_probs is not None and not _is_nested_tensor(log_probs):
+    if log_probs is not None and not is_nested_tensor(log_probs):
         return restore_prefix_sharing_outputs_2d(restored, logprobs_from_logits)
     return restored
 
@@ -540,7 +517,7 @@ def _read_temperature(micro_batch: Any) -> float:
 def _dump_full_input_ids_only(micro_batch: Any, tag: str) -> None:
     """Dump the original (full) input_ids before prefix sharing trimming.
 
-    The ON path dumps ``input_ids_train.pt`` from the ``trimmed_micro_batch``,
+    The ON path dumps ``input_ids_train.pt`` from the ``micro_batch_modified``,
     which has shared prefix tokens removed.  This helper saves the **original**
     ``micro_batch`` input_ids so that ``cmp_diag_verl080`` can compare the
     full input against the OFF baseline, rather than reporting 186+ differing
@@ -588,6 +565,16 @@ def patch_forward_backward_batch_for_diag_dump(
     def wrapped(self: Any, data: Any, loss_function: Any, forward_only: bool = False) -> Any:
         result = original_forward_backward_batch(self, data, loss_function, forward_only)
 
+        # 无条件清理 PrefixSharing runtime context：打印 audit 日志 + 关闭 KV store。
+        # 之前该清理被误关在 PREFIX_SHARING_DIAG_DUMP 条件块内，导致正常训练时
+        # audit 日志不输出、KV store 不 close（多步训练存在内存累积风险）。
+        if not forward_only:
+            cleanup_prefix_sharing_context = getattr(self.module, "_cleanup_prefix_sharing_context", None)
+            if cleanup_prefix_sharing_context is not None:
+                cleanup_prefix_sharing_context()
+                delattr(self.module, "_cleanup_prefix_sharing_context")
+
+        # 诊断 dump 专用：dump weight gradients + 清理 per-layer attention grad hooks。
         if not forward_only and os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             tag = "train" if self.module.training else "old"
             print(
@@ -599,16 +586,10 @@ def patch_forward_backward_batch_for_diag_dump(
 
             dump_weight_grads_verl080(self.module, tag)
 
-            # Clean up PrefixSharing context if the root backward hook did not fire.
-            ctx_cleanup = getattr(self.module, "_ps_ctx_cleanup", None)
-            if ctx_cleanup is not None:
-                ctx_cleanup()
-                delattr(self.module, "_ps_ctx_cleanup")
-
             # Remove per-layer attention gradient hooks.
             for module in self.module.modules():
                 try:
-                    del module._ps_ctx
+                    del module._prefix_sharing_context
                 except AttributeError:
                     pass
 
