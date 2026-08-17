@@ -2280,25 +2280,32 @@ PYTHONPATH=prefix-sharing pytest -q \
 - 需要固定数据和随机种子，形成可复现的精度对齐脚本。
 - optional GPU/NPU 环境测试不能作为每个本地 PR 的硬门槛，但 release 前必须复跑。
 
-### 6.4 Patch 与 import hook
+### 6.4 FSDP activation-checkpointing runtime context 生命周期
+
+- `origin/open-source` 已存在 FSDP PrefixSharing runtime context 生命周期缺口：`forward_only=True` 没有 backward 触发清理；普通训练在未开启诊断 dump 时也可能遗留 module 上的 prefix-sharing context。该问题起源于 activation-checkpointing 兼容改造，不是当前第三波重构引入。
+- 当前第三波重构以 `origin/open-source` 为行为基线闭环，不在本 PR 内修复此既有缺口；但所有新增或修改的测试不得掩盖它，也不得将其误归因为重构回归。
+- 后续应以独立修复 PR 处理：统一 ContextVar、store 与 attention module binding 的所有权和幂等 cleanup；覆盖普通训练、`forward_only`、activation-checkpointing recompute、异常路径及连续 micro-batch。
+- 在该独立修复完成前，FSDP 精度验证应固定 replay fixture，并明确记录所覆盖的执行模式；不得把单 micro-batch 的 ON/OFF 对齐外推为上述生命周期场景全部已验证。
+
+### 6.5 Patch 与 import hook
 
 - import hook 是否长期保留，需要等社区对 monkey patch 方式的反馈后再定。
 - 如果正式合入 verl，显式调用路径可能替代外部包 import auto patch。
 - 当前阶段必须保留 import auto patch，因为脚本化训练仍依赖 `VERL_USE_EXTERNAL_MODULES=prefix_sharing`。
 
-### 6.5 HybridAttention / Gated DeltaNet
+### 6.6 HybridAttention / Gated DeltaNet
 
 - 当前重构清理 Qwen3.5/GDN 专门化代码，不代表永久放弃 HybridAttention。
 - 后续需等待训练引擎侧真实接口稳定，再重新设计 activation/cache_param store。
 - 未来重新引入时，应以实际 mixer 类型命名，避免把 DeltaNet 泛化成所有 linear attention。
 
-### 6.6 Megatron / MCore / NPU
+### 6.7 Megatron / MCore / NPU
 
 - MCore path 保留 advanced/internal 定位。
 - NPU/MindSpeed/Megatron-Bridge 后续可继续支持，但不能阻塞 FSDP-first 开源主线。
 - 若后续重新提高 Megatron 优先级，需要单独补兼容矩阵、真实环境测试和文档。
 
-### 6.7 tools 与 diagnostics
+### 6.8 tools 与 diagnostics
 
 - tools 清理需要逐项判断，不能批量删除。
 - 保留工具必须补用途说明。
