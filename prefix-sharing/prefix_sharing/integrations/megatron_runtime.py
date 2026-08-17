@@ -28,7 +28,7 @@ def prefix_attention(
     """
     print("\n\n\nsuccess come into def prefix_attention\n\n\n")
 
-    # 读取并校验前缀共享上下文 prefix_sharing_context
+    # Read and validate the prefix sharing context
     prefix_sharing_context = current_prefix_sharing_context()
     if prefix_sharing_context is None:
         print("\n\n\nprefix_sharing_context is None\n\n\n")
@@ -40,7 +40,7 @@ def prefix_attention(
     if prefix_sharing_context.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    # 确保 QKV 符合 THD packing格式
+    # Ensure QKV conforms to the THD packing format
     packed_batch_layout = prefix_sharing_context.packed_batch_layout
     ensure_global_packed_token_lengths(
         {
@@ -52,10 +52,10 @@ def prefix_attention(
         context="attention hook",
     )
 
-    # QK位置编码
-    #   mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
+    # QK position encoding
+    #   mcore v0.16.1 RoPE requires cu_seqlens, mscale, cp_group, etc.
     #       returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
-    #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
+    #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x)
     cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
     cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
     mscale = _get_yarn_mscale(attention_module)
@@ -88,7 +88,7 @@ def prefix_attention(
         f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}"
     )
 
-    # 前缀共享：provider 存储激活值，reuser 拼接激活值
+    # Prefix sharing: provider stores activations, reuser concatenates activations
     attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
     expanded_key, expanded_value = attention_backend.build_kv(
         key,
@@ -106,7 +106,7 @@ def prefix_attention(
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
-    # 注意力计算
+    # Attention computation
     core_attn_out = attention_backend.attention(
         query,
         expanded_key,
@@ -161,15 +161,16 @@ def _apply_positioned_rope(
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
-    # 当 packed_position_ids 所需要的最大 position id 超过了 q_pos_emb / k_pos_emb 的当前长度时，
-    # 就需要对 q_pos_emb / k_pos_emb 进行扩展。
-    # THD 模式下生成的 pos_emb 仅覆盖 positions 0 .. max_seqlen_q-1 这段范围，
-    # 这个长度往往不够用，因为 prefix-sharing 会保留原始的 position_ids
-    #（例如后缀可能从 position 75 开始）。
+    # When the maximum position id required by packed_position_ids exceeds the
+    # current length of q_pos_emb / k_pos_emb, we need to extend them.
+    # In THD mode the generated pos_emb only covers positions 0 .. max_seqlen_q-1,
+    # which is often insufficient because prefix-sharing preserves the original
+    # position_ids (e.g. a suffix may start at position 75).
     #
-    # RoPE 具有线性性质：freqs[p] = p * inv_freq。
-    # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
-    # 从而生成缺失的高位置频率向量。
+    # RoPE is linear: freqs[p] = p * inv_freq.
+    # Therefore we can recover the step (i.e. inv_freq) via
+    # pos_emb[1] - pos_emb[0] and extrapolate the missing high-position
+    # frequency vectors.
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
@@ -239,10 +240,10 @@ def _apply_positioned_rope(
 
 
 def _unpack_rotary_pos_emb(rotary_pos_emb: Any) -> tuple[Any, Any]:
-    """解包 rotary_pos_emb，兼容 mcore 版本差异。
+    """Unpack rotary_pos_emb, compatible with mcore version differences.
 
     mcore 0.12.1 ~ 0.15.x: (q_pos_emb, k_pos_emb) tuple
-    mcore 0.16.1+:             单 tensor（Q/K 共用）
+    mcore 0.16.1+:         single tensor (shared by Q/K)
     """
     if isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2:
         return rotary_pos_emb[0], rotary_pos_emb[1]

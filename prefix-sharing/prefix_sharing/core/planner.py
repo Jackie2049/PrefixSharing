@@ -99,38 +99,38 @@ Range = tuple[int, int]
 class PrefixSharingPlan:
     """Complete framework-independent plan for a single micro-batch."""
 
-    # 基础标识信息
-    forward_id: int                              # 前向传播唯一标识
-    micro_batch_id: int                          # micro-batch序号
-    batch_size: int                              # 批次内序列数量
-    original_lengths: list[int]                   # 各序列原始长度
+    # Basic identifiers
+    forward_id: int                              # Unique forward pass identifier
+    micro_batch_id: int                          # Micro-batch index
+    batch_size: int                              # Number of sequences in the batch
+    original_lengths: list[int]                   # Original length of each sequence
 
-    # 前缀复用关系
-    reuse_specs: list[PrefixReuseSpec]           # 序列间复用关系规范
-    is_provider: list[bool]                      # 各序列是否为provider（被复用方）
-    provider_index: list[int]                    # 各序列的provider在batch中的索引
-    prefix_lens: list[int]                      # 各序列前缀长度（可共享部分）
-    suffix_lens: list[int]                      # 各序列后缀长度（需独立计算部分）
+    # Prefix reuse relationships
+    reuse_specs: list[PrefixReuseSpec]           # Inter-sequence reuse specifications
+    is_provider: list[bool]                      # Whether each sequence is a provider (reused side)
+    provider_index: list[int]                    # Provider index in batch for each sequence
+    prefix_lens: list[int]                      # Prefix length (shareable portion) for each sequence
+    suffix_lens: list[int]                      # Suffix length (independently computed portion) for each sequence
 
-    # THD格式下的序列长度管理
-    kept_lengths_q: list[int]                   # 裁剪后各序列的Q长度
-    expanded_lengths_kv: list[int]             # 扩展后各序列的KV长度（包含共享前缀）
-    cu_seqlens_q: list[int]                     # Q的累积序列长度（用于THD索引）
-    cu_seqlens_kv: list[int]                   # KV的累积序列长度（用于THD索引）
-    max_seqlen_q: int                          # Q的最大序列长度
-    max_seqlen_kv: int                         # KV的最大序列长度
+    # Sequence length management for THD format
+    kept_lengths_q: list[int]                   # Q length after trimming for each sequence
+    expanded_lengths_kv: list[int]             # KV length after expansion (including shared prefix) for each sequence
+    cu_seqlens_q: list[int]                     # Cumulative Q sequence lengths (for THD indexing)
+    cu_seqlens_kv: list[int]                   # Cumulative KV sequence lengths (for THD indexing)
+    max_seqlen_q: int                          # Maximum Q sequence length
+    max_seqlen_kv: int                         # Maximum KV sequence length
 
-    # 位置偏移（用于恢复原始位置信息）
-    q_position_offsets: list[int]               # Q相对于原始序列的位置偏移
-    kv_position_offsets: list[int]             # KV相对于原始序列的位置偏移
+    # Position offsets (for recovering original position information)
+    q_position_offsets: list[int]               # Q position offsets relative to original sequence
+    kv_position_offsets: list[int]             # KV position offsets relative to original sequence
 
-    # 裁剪保留范围（start, end）
-    input_keep_ranges: list[Range]              # input_ids保留范围
-    label_keep_ranges: list[Range]             # labels保留范围
-    loss_mask_keep_ranges: list[Range]         # loss_mask保留范围
+    # Trim keep ranges (start, end)
+    input_keep_ranges: list[Range]              # input_ids keep ranges
+    label_keep_ranges: list[Range]             # labels keep ranges
+    loss_mask_keep_ranges: list[Range]         # loss_mask keep ranges
 
-    # 恢复点信息（用于logprob恢复）
-    prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)  # reuser的suffix-first位置恢复规范
+    # Restore point information (for logprob restoration)
+    prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)  # Suffix-first position restore specs for reusers
 
     def __post_init__(self) -> None:
         expected = self.batch_size

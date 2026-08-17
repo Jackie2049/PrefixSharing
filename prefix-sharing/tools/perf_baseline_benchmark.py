@@ -694,16 +694,16 @@ def main():
                 result.conclusion = "prepare overhead acceptable at this scale"
         elif dim == "device":
             if result.build_kv_pct > 20:
-                result.conclusion = f"build_kv占attention {result.build_kv_pct:.0f}%; prealloc P0 confirmed"
+                result.conclusion = f"build_kv accounts for {result.build_kv_pct:.0f}% of attention; prealloc P0 confirmed"
             elif result.fa_prepare_ms > result.fa_kernel_ms * 0.5:
-                result.conclusion = "FA prepare接近或超过kernel; 输入整理优化P0"
+                result.conclusion = "FA prepare approaches or exceeds kernel time; input preparation optimization P0"
             else:
-                result.conclusion = f"FA kernel主导; build_kv占比{result.build_kv_pct:.0f}%可接受"
+                result.conclusion = f"FA kernel dominates; build_kv ratio {result.build_kv_pct:.0f}% acceptable"
         elif dim == "memory":
             if result.peak_hbm_enabled_mb >= result.peak_hbm_disabled_mb * 0.95:
-                result.conclusion = "PS enabled HBM接近baseline; expanded KV或scatter抵消收益"
+                result.conclusion = "PS enabled HBM close to baseline; expanded KV or scatter offsets gains"
             else:
-                result.conclusion = f"PS enabled节省 {result.peak_hbm_disabled_mb - result.peak_hbm_enabled_mb:.1f}MB HBM"
+                result.conclusion = f"PS enabled saves {result.peak_hbm_disabled_mb - result.peak_hbm_enabled_mb:.1f}MB HBM"
 
         results.append(result)
         record = {k: v for k, v in result.__dict__.items()}

@@ -1,17 +1,18 @@
 """Test E: Plan Representation Independent Benefit Verification.
 
-验证目的：拆清 detector 与 plan construction 各自占比，判定 list/dataclass
-紧凑化是否值得。
+Purpose: Separate detector vs plan construction timing contributions to determine
+whether compacting list/dataclass representations is worthwhile.
 
-方法：
-1. 独立计时 TriePrefixDetector.detect() vs PrefixSharingPlanner.plan_from_detection()
-2. 记录 plan_from_detection 内：list 字段数量/元素总数、dataclass 构造耗时、tracemalloc peak
-3. 覆盖 bs=32/64/128, prompt=256/1024/2048, sharing=one_provider/no_sharing/chain
-4. 50 runs 取 p50/p90/p99
+Method:
+1. Independently time TriePrefixDetector.detect() vs PrefixSharingPlanner.plan_from_detection()
+2. Record within plan_from_detection: list field count / total element count, dataclass
+   construction time, tracemalloc peak
+3. Cover bs=32/64/128, prompt=256/1024/2048, sharing=one_provider/no_sharing/chain
+4. 50 runs for p50/p90/p99
 
-判定规则（来自 impr-perf.md §1.4 测试 E）:
-- if plan_from_detection_ms 占 planner 总耗时低 → plan representation 降级
-- if 紧凑表示有稳定收益且不牺牲可读性 → 进入开发计划
+Decision rules (from impr-perf.md Section 1.4 Test E):
+- If plan_from_detection_ms is a low share of total planner time -> downgrade plan representation
+- If compact representation yields consistent gains without sacrificing readability -> add to dev plan
 """
 
 from __future__ import annotations
@@ -195,13 +196,13 @@ def run_test_e(
 
     # Decision logic from impr-perf.md
     if pfd_ratio < 0.2:
-        conclusion = f"plan_from_detection仅占planner{pfd_ratio:.0%}，非主要瓶颈，plan representation降级"
+        conclusion = f"plan_from_detection only accounts for {pfd_ratio:.0%} of planner, not a bottleneck; downgrade plan representation"
     elif pfd_ratio < 0.5:
-        conclusion = f"plan_from_detection占{pfd_ratio:.0%}，可适度优化但不紧迫"
+        conclusion = f"plan_from_detection accounts for {pfd_ratio:.0%}, moderate optimization possible but not urgent"
     elif pfd_ms_p50 > 50:
-        conclusion = f"plan_from_detection占{pfd_ratio:.0%}，绝对耗时{pfd_ms_p50:.1f}ms，紧凑化进入P0/P1"
+        conclusion = f"plan_from_detection accounts for {pfd_ratio:.0%}, absolute time {pfd_ms_p50:.1f}ms; compacting enters P0/P1"
     else:
-        conclusion = f"plan_from_detection占{pfd_ratio:.0%}，绝对耗时较低，暂不优化"
+        conclusion = f"plan_from_detection accounts for {pfd_ratio:.0%}, absolute time is low; no optimization needed for now"
 
     return {
         "device": "gpu_4090",

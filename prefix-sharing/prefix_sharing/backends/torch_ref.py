@@ -73,16 +73,16 @@ class TorchReferenceBackend:
     ) -> Any:
         batch_layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         
-        # QKV从batch拆分到单条序列，便于精度问题定位
+        # Split QKV from packed batch into individual sequences for precision debugging
         query_rows = _split_packed(query, batch_layout.padded_lengths)
         key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
         value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
 
-        # 逐条序列进行注意力计算
+        # Compute attention per sequence
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
             valid_length = batch_layout.valid_lengths[batch_index]
-            # padding不参与注意力计算
+            # Padding does not participate in attention computation
             q_valid = q_row[:valid_length]
             prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
             if valid_length == 0:
@@ -119,10 +119,12 @@ def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
-    # 用 ``F.scaled_dot_product_attention`` 替代手写 einsum+softmax：
-    # 在 bf16 autocast 下 ``torch.einsum`` 会被降到 bf16（即使输入已 .float()），
-    # 导致 softmax 精度严重劣化，误差在残差流里逐层放大；SDPA 不受 autocast 降精度
-    # 影响（内部 fp32 累加），与 HF attention 数值一致，且更快。Q/K/V 维持原 dtype。
+    # Use ``F.scaled_dot_product_attention`` instead of manual einsum+softmax:
+    # under bf16 autocast, ``torch.einsum`` gets downcast to bf16 (even when
+    # inputs are .float()), causing severe softmax precision degradation that
+    # amplifies through residual streams layer by layer. SDPA is unaffected by
+    # autocast downcasting (accumulates in fp32 internally), matches HF
+    # attention numerically, and is faster. Q/K/V retain their original dtype.
     import torch.nn.functional as _F
 
     scale = 1.0 / math.sqrt(q_row.shape[-1])
@@ -138,7 +140,8 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
     if q_row.dim() != 3:
         raise ValueError("TorchReferenceBackend attention expects packed rows with 2 or 3 dims")
 
-    # 适配 GQA：把 KV head 复制到与 Q head 数一致（SDPA 旧版本不支持原生 GQA）。
+    # GQA adaptation: replicate KV heads to match Q head count
+    # (older SDPA versions do not support native GQA).
     q_heads = q_row.shape[1]
     kv_heads = k_row.shape[1]
     if q_heads != kv_heads:
@@ -148,10 +151,10 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
         k_row = k_row.repeat_interleave(repeat, dim=1)
         v_row = v_row.repeat_interleave(repeat, dim=1)
 
-    # 行内布局 [L, H, D] -> SDPA 期望的 [B=1, H, L, D]
+    # Row layout [L, H, D] -> SDPA expected [B=1, H, L, D]
     q4 = q_row.transpose(0, 1).unsqueeze(0).contiguous()
     k4 = k_row.transpose(0, 1).unsqueeze(0).contiguous()
     v4 = v_row.transpose(0, 1).unsqueeze(0).contiguous()
     m4 = mask.unsqueeze(0).unsqueeze(0)             # [1, 1, Lq, Lk] bool
     out = _F.scaled_dot_product_attention(q4, k4, v4, attn_mask=m4, scale=scale)
-    return out.squeeze(0).transpose(0, 1)           # 回到 [Lq, H, D]
+    return out.squeeze(0).transpose(0, 1)           # Back to [Lq, H, D]

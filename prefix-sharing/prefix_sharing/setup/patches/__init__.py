@@ -1,4 +1,4 @@
-"""setup patches 目录。"""
+"""Setup patches package."""
 
 from prefix_sharing.setup.patch_installer import PatchSpec
 
