@@ -1,4 +1,4 @@
-# PrefixSharing: Sharing Prefix Activations for Efficient RL Training
+# PrefixSharing: Eliminating Prefix Redundancies for Efficient RL Training
 
 This is a Python module to reuse KV activations across sequence samples (or trajectories) during Forward/Backward pass of verl + Megatron-LM RL pipeline. 
 Redundant KV computation and memory of common prefix sub-sequences is commonly seen in GRPO-style / Step-wise /  Tree-wise rollout, while PrefixSharing eliminates them entirely and preserves gradient semantics.
